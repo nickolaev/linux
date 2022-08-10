@@ -12,6 +12,7 @@
 #include <linux/list.h>
 #include <linux/jhash.h>
 #include <linux/sock_diag.h>
+#include <net/sctp/sctp.h>
 #include <net/udp.h>
 
 struct bpf_stab {
@@ -525,6 +526,8 @@ static bool sock_map_redirect_allowed(const struct sock *sk)
 {
 	if (sk_is_tcp(sk))
 		return sk->sk_state != TCP_LISTEN;
+	else if (sk_is_sctp(sk))
+		return !(sctp_sstate(sk, LISTENING));
 	else
 		return sk->sk_state == TCP_ESTABLISHED;
 }
@@ -538,6 +541,8 @@ static bool sock_map_sk_state_allowed(const struct sock *sk)
 {
 	if (sk_is_tcp(sk))
 		return (1 << sk->sk_state) & (TCPF_ESTABLISHED | TCPF_LISTEN);
+	else if (sk_is_sctp(sk))
+		return (sctp_sstate(sk, ESTABLISHED)) && (sctp_sstate(sk, LISTENING));
 	return true;
 }
 

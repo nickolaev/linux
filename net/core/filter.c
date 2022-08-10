@@ -54,6 +54,7 @@
 #include <net/dst.h>
 #include <net/sock_reuseport.h>
 #include <net/busy_poll.h>
+#include <net/sctp/sctp.h>
 #include <net/tcp.h>
 #include <net/xfrm.h>
 #include <net/udp.h>
@@ -10963,6 +10964,8 @@ BPF_CALL_3(bpf_sk_lookup_assign, struct bpf_sk_lookup_kern *, ctx,
 		return -ESOCKTNOSUPPORT; /* reject non-RCU freed sockets */
 	if (unlikely(sk && sk_is_tcp(sk) && sk->sk_state != TCP_LISTEN))
 		return -ESOCKTNOSUPPORT; /* only accept TCP socket in LISTEN */
+	if (unlikely(sk && sk_is_sctp(sk) && !(sctp_sstate(sk, LISTENING))))
+		return -ESOCKTNOSUPPORT; /* only accept SCTP socket in LISTENING */
 	if (unlikely(sk && sk_is_udp(sk) && sk->sk_state != TCP_CLOSE))
 		return -ESOCKTNOSUPPORT; /* only accept UDP socket in CLOSE */
 
