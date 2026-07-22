@@ -12,7 +12,12 @@
 #include <linux/kexec.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#ifdef CONFIG_RISCV
+#include <asm/multikernel.h>
+#endif
+#ifdef CONFIG_X86
 #include <asm/apic.h>
+#endif
 #include "internal.h"
 
 /* Callback management */
@@ -98,7 +103,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
 	unsigned int head, next_head, tail;
-	int cpu;
+	int cpu, ret = 0;
 
 	if (!instance)
 		return -EINVAL;
@@ -162,13 +167,18 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 	cpu = find_first_bit(instance->cpus, NR_CPUS);
 
-	/* Send IPI directly to physical APIC ID
-	 * instance->cpus contains physical CPU IDs, use directly for APIC */
+	/* instance->cpus contains architecture physical CPU IDs. */
+#ifdef CONFIG_X86
 	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
 		       cpu);
+#elif defined(CONFIG_RISCV)
+	/* Publish the shared ring entry before notifying the remote hart. */
+	smp_mb();
+	ret = mk_riscv_send_ipi(cpu);
+#endif
 
 	mk_instance_put(instance);
-	return 0;
+	return ret;
 }
 
 static void mk_ipi_drain_ring(void)

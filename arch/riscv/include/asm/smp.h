@@ -105,6 +105,16 @@ static inline void riscv_ipi_set_virq_range(int virq, int nr)
 
 #endif /* CONFIG_SMP */
 
+static inline int arch_cpu_physical_id(int cpu)
+{
+	return cpuid_to_hartid_map(cpu);
+}
+
+static inline int arch_cpu_from_physical_id(int hartid)
+{
+	return riscv_hartid_to_cpuid(hartid);
+}
+
 #if defined(CONFIG_HOTPLUG_CPU) && (CONFIG_SMP)
 bool cpu_has_hotplug(unsigned int cpu);
 #else

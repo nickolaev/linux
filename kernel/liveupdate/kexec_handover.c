@@ -1562,7 +1562,6 @@ void __init mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	int err = 0;
 
 	pr_info("Multikernel KHO: processing FDT at 0x%llx (size: %llu)\n", fdt_phys, fdt_len);
-
 	/* Validate the input FDT */
 	fdt = early_memremap(fdt_phys, fdt_len);
 	if (!fdt) {
@@ -1689,6 +1688,10 @@ int kho_fill_kimage(struct kimage *image)
 	if (!kho_enable)
 		return 0;
 
+	/*
+	 * Multikernel images use a handover page allocated from their instance
+	 * pool. They do not use the host's global KHO FDT or scratch area.
+	 */
 	image->kho.fdt = virt_to_phys(kho_out.fdt);
 
 	scratch_size = sizeof(*kho_scratch) * kho_scratch_cnt;

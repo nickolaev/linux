@@ -201,6 +201,11 @@ secondary_start_sbi:
 SYM_CODE_END(_start)
 
 SYM_CODE_START(_start_kernel)
+#ifdef CONFIG_MULTIKERNEL
+	/* A stopped pool hart may retain instructions from its previous boot. */
+	fence.i
+#endif
+
 	/* Mask all interrupts */
 	csrw CSR_IE, zero
 	csrw CSR_IP, zero

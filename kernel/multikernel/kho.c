@@ -19,7 +19,9 @@
 #include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
+#ifdef CONFIG_X86
 #include <asm/apic.h>
+#endif
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -221,10 +223,12 @@ void __init mk_register_cpus_from_kho(void)
 
 	/* Register each CPU from the DTB */
 	for (i = 0; i < cpus_len / sizeof(fdt32_t); i++) {
+#ifdef CONFIG_X86
 		u32 apic_id = fdt32_to_cpu(cpus_prop[i]);
 
 		topology_register_apic(apic_id, CPU_ACPIID_INVALID, true);
 		pr_debug("Registered CPU APIC ID %u from KHO DTB\n", apic_id);
+#endif
 	}
 
 out:
@@ -745,6 +749,9 @@ early_initcall(mk_kho_restore_dtbs);
  */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
+#ifndef CONFIG_PCI
+	return false;
+#else
 	struct mk_pci_device *pci_dev;
 	u16 domain = pci_domain_nr(bus);
 	u8 bus_num = bus->number;
@@ -812,6 +819,7 @@ check_bridge:
 	}
 
 	return false;
+#endif
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 

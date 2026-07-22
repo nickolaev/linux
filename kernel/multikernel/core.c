@@ -14,12 +14,14 @@
 #include <linux/pci.h>
 #include <linux/vmalloc.h>
 #include <asm/multikernel.h>
+#ifdef CONFIG_X86
 #include <asm/cpu.h>
-#include <asm/irq_vectors.h>
+#endif
 #include <asm/page.h>
-#include <asm/processor.h>
 #include <asm/smp.h>
 #include "internal.h"
+
+static bool mk_force_halt_available;
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
@@ -1175,17 +1177,38 @@ struct mk_shutdown_ack_work {
 	int instance_id;
 };
 
+static int mk_wait_instance_stopped(struct mk_instance *instance)
+{
+	int phys_cpu;
+	int ret;
+
+	for_each_set_bit(phys_cpu, instance->cpus, NR_CPUS) {
+		ret = mk_wait_cpu_stopped(phys_cpu);
+		if (ret) {
+			pr_err("Instance %d CPU %d did not stop: %d\n",
+			       instance->id, phys_cpu, ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
 static void mk_shutdown_ack_work_fn(struct work_struct *work)
 {
 	struct mk_shutdown_ack_work *aw =
 		container_of(work, struct mk_shutdown_ack_work, work);
 	struct mk_instance *instance;
+	int ret;
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		pr_info("Instance %d (%s) halted, CPUs parked in pool\n",
-			instance->id, instance->name);
-		mk_instance_set_state(instance, MK_STATE_LOADED);
+		ret = mk_wait_instance_stopped(instance);
+		if (!ret) {
+			pr_info("Instance %d (%s) halted, CPUs parked in pool\n",
+				instance->id, instance->name);
+			mk_instance_set_state(instance, MK_STATE_LOADED);
+		}
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1300,8 +1323,11 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
-		mk_instance_set_state(instance, MK_STATE_LOADED);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
+		ret = mk_wait_instance_stopped(instance);
+		if (!ret) {
+			mk_instance_set_state(instance, MK_STATE_LOADED);
+			pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
+		}
 	}
 
 	mk_instance_put(instance);
@@ -1346,6 +1372,12 @@ int multikernel_force_halt_by_id(int mk_id)
 		return -EINVAL;
 	}
 
+	if (!mk_force_halt_available) {
+		pr_warn("Force halt is not supported on this architecture\n");
+		mk_instance_put(instance);
+		return -EOPNOTSUPP;
+	}
+
 	pr_info("Force halting multikernel instance %d via NMI\n", mk_id);
 
 	/* Queue shutdown message - NMI handler will check for this */
@@ -1378,6 +1410,8 @@ static int __init multikernel_init(void)
 	if (ret < 0) {
 		pr_warn("Failed to register NMI stop handler: %d (force halt unavailable)\n", ret);
 		/* Continue anyway - graceful shutdown still works */
+	} else {
+		mk_force_halt_available = true;
 	}
 
 	ret = mk_messaging_init();

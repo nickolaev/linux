@@ -416,6 +416,11 @@ void mk_force_stop_cpu(int phys_cpu)
 		__apic_send_IPI(logical_cpu, NMI_VECTOR);
 }
 EXPORT_SYMBOL_GPL(mk_force_stop_cpu);
+int mk_wait_cpu_stopped(int phys_cpu)
+{
+	return 0;
+}
+
 #endif /* CONFIG_MULTIKERNEL */
 
 static int __init nonmi_ipi_setup(char *str)

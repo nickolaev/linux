@@ -19,6 +19,7 @@
 #include <linux/libfdt.h>
 #include <linux/types.h>
 #include <linux/memblock.h>
+#include <linux/multikernel.h>
 #include <asm/setup.h>
 
 static int riscv_kexec_elf_load(struct kimage *image, struct elfhdr *ehdr,
@@ -70,6 +71,7 @@ static int elf_find_pbase(struct kimage *image, unsigned long kernel_len,
 	const struct elf_phdr *phdr;
 	unsigned long lowest_paddr = ULONG_MAX;
 	unsigned long lowest_vaddr = ULONG_MAX;
+	struct mk_memory_region *region;
 
 	for (i = 0; i < ehdr->e_phnum; i++) {
 		phdr = &elf_info->proghdrs[i];
@@ -86,6 +88,20 @@ static int elf_find_pbase(struct kimage *image, unsigned long kernel_len,
 	kbuf.image = image;
 	kbuf.buf_min = lowest_paddr;
 	kbuf.buf_max = ULONG_MAX;
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		if (!image->mk_instance ||
+		    !list_is_singular(&image->mk_instance->memory_regions)) {
+			pr_err("RISC-V multikernel requires one contiguous memory region\n");
+			return -EOPNOTSUPP;
+		}
+
+		region = list_first_entry(&image->mk_instance->memory_regions,
+					  struct mk_memory_region, list);
+		image->multikernel_pool_start = region->res.start;
+		image->multikernel_pool_end = region->res.end;
+		kbuf.buf_min = image->multikernel_pool_start;
+		kbuf.buf_max = image->multikernel_pool_end;
+	}
 
 	/*
 	 * Current riscv boot protocol requires 2MB alignment for
@@ -102,6 +118,8 @@ static int elf_find_pbase(struct kimage *image, unsigned long kernel_len,
 		*old_pbase = lowest_paddr;
 		*new_pbase = kbuf.mem;
 		image->start = ehdr->e_entry - lowest_vaddr + kbuf.mem;
+		if (image->type == KEXEC_TYPE_MULTIKERNEL)
+			image->mk_kernel_entry = image->start;
 	}
 	return ret;
 }
