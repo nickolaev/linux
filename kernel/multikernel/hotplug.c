@@ -23,7 +23,6 @@
 #include <linux/mmzone.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
-#include <asm/apic.h>
 #include "internal.h"
 
 static const char mk_mem_resource_name[] = "System RAM (multikernel)";
@@ -609,6 +608,7 @@ static int mk_handle_mem_remove(struct mk_mem_resource_payload *payload, u32 pay
  * PCI Device Hotplug Operations
  */
 
+#ifdef CONFIG_PCI
 static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 			    const char *driver_override, u32 flags)
 {
@@ -741,6 +741,19 @@ static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
 
 	return 0;
 }
+
+#else
+static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
+			    const char *driver_override, u32 flags)
+{
+	return -EOPNOTSUPP;
+}
+
+static int mk_do_device_remove(u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+#endif
 
 struct mk_device_hotplug_work {
 	struct work_struct work;

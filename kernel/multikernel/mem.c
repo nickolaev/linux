@@ -11,6 +11,8 @@
 #include <linux/mutex.h>
 #include <linux/genalloc.h>
 #include <linux/io.h>
+#include <linux/init.h>
+#include <linux/memblock.h>
 #include <linux/multikernel.h>
 
 #include "internal.h"
@@ -28,6 +30,31 @@ struct resource multikernel_res = {
 static struct gen_pool *multikernel_pool;
 
 static DEFINE_MUTEX(multikernel_mem_mutex);
+
+static phys_addr_t multikernel_boot_pool_start;
+static size_t multikernel_boot_pool_size;
+
+static int __init early_multikernel_pool(char *param)
+{
+	char *end;
+	phys_addr_t start;
+	size_t size;
+
+	size = memparse(param, &end);
+	if (!size || *end != '@')
+		return -EINVAL;
+	start = memparse(end + 1, &end);
+	if (*end || !start || !PAGE_ALIGNED(start) || !PAGE_ALIGNED(size))
+		return -EINVAL;
+	if (memblock_reserve(start, size))
+		return -ENOMEM;
+	multikernel_boot_pool_start = start;
+	multikernel_boot_pool_size = size;
+	pr_info("Multikernel pool: reserved %pa+%zx from command line\n",
+		&start, size);
+	return 0;
+}
+early_param("mkkernel_pool", early_multikernel_pool);
 
 /**
  * multikernel_alloc() - Allocate memory from multikernel pool
@@ -466,3 +493,12 @@ out:
 	mutex_unlock(&multikernel_mem_mutex);
 	return ret;
 }
+
+static int __init multikernel_boot_pool_init(void)
+{
+	if (!multikernel_boot_pool_size)
+		return 0;
+	return multikernel_add_pool_memory(multikernel_boot_pool_start,
+					   multikernel_boot_pool_size);
+}
+core_initcall(multikernel_boot_pool_init);
