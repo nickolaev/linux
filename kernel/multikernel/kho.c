@@ -15,6 +15,7 @@
 #include <linux/multikernel.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/smp.h>
 #ifdef CONFIG_KEXEC_HANDOVER
 #include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
@@ -28,6 +29,23 @@
 #endif
 
 #ifdef CONFIG_KEXEC_HANDOVER
+
+static int __init mk_kho_validate_fdt(const void *fdt)
+{
+	int ret;
+
+	ret = fdt_check_header(fdt);
+	if (ret)
+		return ret;
+	if (fdt_totalsize(fdt) > PAGE_SIZE)
+		return -FDT_ERR_TRUNCATED;
+
+	ret = fdt_node_check_compatible(fdt, 0, MK_FDT_COMPATIBLE);
+	if (ret)
+		return ret < 0 ? ret : -FDT_ERR_BADVALUE;
+
+	return 0;
+}
 
 /*
  * Global root instance representing the current kernel.
@@ -107,6 +125,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
  */
 int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
 {
+	int target_cpu;
 	int ret = 0;
 
 	if (!root_instance->ipi_data) {
@@ -116,10 +135,17 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
 
 	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
 		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
+	target_cpu = arch_cpu_physical_id(smp_processor_id());
+	if (target_cpu < 0 || target_cpu >= CONFIG_NR_CPUS) {
+		pr_err("Invalid host CPU %d for preserved IPI buffer\n",
+		       target_cpu);
+		return -ENODEV;
+	}
 
 	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
 	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
 	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
+	ret |= fdt_property_u32(fdt, "target-cpu", target_cpu);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -194,13 +220,18 @@ void __init mk_register_cpus_from_kho(void)
 	const void *dtb_data;
 	int dtb_len;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_kho_get_fdt_phys();
 	if (!fdt_phys)
 		return;
 
 	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
 	if (!kho_fdt)
 		return;
+
+	if (mk_kho_validate_fdt(kho_fdt)) {
+		pr_warn("Ignoring invalid multikernel KHO FDT\n");
+		goto out;
+	}
 
 	mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
 	if (mk_node < 0)
@@ -485,8 +516,10 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	int host_ipi_node;
 	const fdt64_t *phys_prop;
 	const fdt32_t *pages_prop;
+	const fdt32_t *cpu_prop;
 	phys_addr_t host_ipi_phys = 0;
 	u32 host_ipi_pages = 0;
+	u32 host_target_cpu = CONFIG_NR_CPUS;
 	size_t host_ipi_size = 0;
 	int len;
 
@@ -505,10 +538,16 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 		host_ipi_pages = fdt32_to_cpu(*pages_prop);
 		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 	}
+	cpu_prop = fdt_getprop(kho_fdt, host_ipi_node, "target-cpu", &len);
+	if (cpu_prop && len == sizeof(*cpu_prop))
+		host_target_cpu = fdt32_to_cpu(*cpu_prop);
 
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
+	/* The bitmap stores architecture physical CPU IDs, not logical CPUs. */
+	if (!host_ipi_phys || !host_ipi_pages ||
+	    host_target_cpu >= CONFIG_NR_CPUS) {
+		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u, target=%u)\n",
+			(unsigned long long)host_ipi_phys, host_ipi_pages,
+			host_target_cpu);
 		return NULL;
 	}
 
@@ -516,8 +555,7 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	if (!host_instance)
 		return NULL;
 
-	/* Set CPU 0 as default target for host IPIs (physical ID) */
-	set_bit(0, host_instance->cpus);
+	set_bit(host_target_cpu, host_instance->cpus);
 
 	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
 	if (!host_instance->ipi_data) {
@@ -532,7 +570,8 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
 		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
 		host_ipi_pages);
-	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
+	pr_info("Registered host instance (ID 0) for spawn→host communication on CPU %u\n",
+		host_target_cpu);
 
 	return host_instance;
 }
@@ -549,8 +588,9 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 int __init mk_kho_restore_dtbs(void)
 {
 	void *dtb_virt;
+	const void *dtb_data;
 	int dtb_len;
-	int ret, cpu;
+	int mk_node, ret, cpu;
 	struct mk_instance *instance, *host_instance;
 	struct mk_dt_config config;
 	int instance_id;
@@ -558,7 +598,7 @@ int __init mk_kho_restore_dtbs(void)
 	const void *kho_fdt = NULL;
 	phys_addr_t fdt_phys;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_kho_get_fdt_phys();
 	if (!fdt_phys) {
 		pr_info("No KHO FDT available for multikernel DTB restoration\n");
 
@@ -570,6 +610,12 @@ int __init mk_kho_restore_dtbs(void)
 		/* Initially, root has all online CPUs (physical IDs) */
 		for_each_online_cpu(cpu) {
 			u32 phys_cpu_id = arch_cpu_physical_id(cpu);
+
+			if (phys_cpu_id >= NR_CPUS) {
+				pr_err("Hart ID %u exceeds multikernel CPU bitmap size %u\n",
+				       phys_cpu_id, NR_CPUS);
+				continue;
+			}
 			set_bit(phys_cpu_id, instance->cpus);
 		}
 		pr_info("Root instance initialized with CPUs (physical): %*pbl\n",
@@ -590,14 +636,21 @@ int __init mk_kho_restore_dtbs(void)
 		return -EFAULT;
 	}
 
-	int mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	ret = mk_kho_validate_fdt(kho_fdt);
+	if (ret) {
+		pr_err("Invalid multikernel KHO FDT: %d\n", ret);
+		ret = -EINVAL;
+		goto cleanup_fdt;
+	}
+
+	mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
 	if (mk_node < 0) {
 		pr_info("No multikernel node found in KHO FDT\n");
 		ret = 0;
 		goto cleanup_fdt;
 	}
 
-	const void *dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
 		pr_info("No dtb-data property found in multikernel node\n");
 		ret = 0;
@@ -827,7 +880,7 @@ bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	struct mk_platform_device *plat_dev;
 
-	if (!root_instance->dtb_data)
+	if (!root_instance || !root_instance->dtb_data)
 		return true;
 
 	if (!root_instance->platform_devices_valid)

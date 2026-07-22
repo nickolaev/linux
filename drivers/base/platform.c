@@ -1432,6 +1432,14 @@ static int platform_probe(struct device *_dev)
 	int ret;
 
 	/*
+	 * A platform device may be registered before a spawned kernel restores
+	 * its KHO device allowlist.  Recheck ownership when the driver binds so
+	 * devices retained by another kernel are never probed.
+	 */
+	if (!mk_platform_device_allowed(dev->name, NULL))
+		return -EPERM;
+
+	/*
 	 * A driver registered using platform_driver_probe() cannot be bound
 	 * again later because the probe function usually lives in __init code
 	 * and so is gone. For these drivers .probe is set to
