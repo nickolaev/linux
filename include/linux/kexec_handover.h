@@ -69,8 +69,8 @@ void mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len);
 /* Multikernel kexec finalization */
 int mk_kexec_finalize(struct kimage *target_image);
 
-/* KHO FDT access */
-phys_addr_t kho_get_fdt_phys(void);
+/* Multikernel KHO FDT access */
+phys_addr_t mk_kho_get_fdt_phys(void);
 #else
 static inline bool kho_is_enabled(void)
 {
@@ -156,7 +156,7 @@ static inline int mk_kexec_finalize(struct kimage *target_image)
 	return -EOPNOTSUPP;
 }
 
-static inline phys_addr_t kho_get_fdt_phys(void)
+static inline phys_addr_t mk_kho_get_fdt_phys(void)
 {
 	return 0;
 }

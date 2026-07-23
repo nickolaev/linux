@@ -302,6 +302,7 @@ int __init mk_messaging_init(void);
 void mk_messaging_cleanup(void);
 
 struct resource;
+struct pci_bus;
 
 extern phys_addr_t multikernel_alloc(size_t size);
 extern void multikernel_free(phys_addr_t addr, size_t size);
@@ -711,7 +712,9 @@ int mk_instance_set_kexec_active(int mk_id);
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
+int mk_wait_cpu_stopped(int phys_cpu);
 bool cpu_is_multikernel_pool(unsigned int cpu);
+void mk_set_pool_cpu(int cpu, bool is_pool);
 bool mk_has_pending_shutdown(void);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
@@ -730,6 +733,8 @@ static inline bool cpu_is_multikernel_pool(unsigned int cpu)
 {
 	return false;
 }
+
+static inline void mk_set_pool_cpu(int cpu, bool is_pool) { }
 #endif
 
 /**

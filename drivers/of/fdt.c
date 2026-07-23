@@ -931,8 +931,10 @@ static void __init early_init_dt_check_kho(void)
 		return;
 
 	if (!of_flat_dt_get_addr_size(node, "linux,kho-scratch",
-				      &scratch_start, &scratch_size))
+				      &scratch_start, &scratch_size)) {
+		mk_kho_populate(fdt_start, fdt_size);
 		return;
+	}
 
 	kho_populate(fdt_start, fdt_size, scratch_start, scratch_size);
 }

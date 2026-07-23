@@ -12,7 +12,12 @@
 #include <linux/kexec.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
+#ifdef CONFIG_RISCV
+#include <asm/multikernel.h>
+#endif
+#ifdef CONFIG_X86
 #include <asm/apic.h>
+#endif
 #include "internal.h"
 
 /* Callback management */
@@ -20,6 +25,27 @@ static struct mk_ipi_handler *mk_handlers;
 static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lock);
 
 static void mk_ipi_drain_ring(void);
+
+static int mk_ipi_notify(struct mk_instance *instance)
+{
+	int cpu = find_first_bit(instance->cpus, NR_CPUS);
+
+	if (cpu >= NR_CPUS)
+		return -ENODEV;
+
+	/* instance->cpus contains architecture physical CPU IDs. */
+#ifdef CONFIG_X86
+	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
+		       cpu);
+	return 0;
+#elif defined(CONFIG_RISCV)
+	/* Publish shared-ring updates before notifying the remote hart. */
+	smp_mb();
+	return mk_riscv_send_ipi(cpu);
+#else
+	return -EOPNOTSUPP;
+#endif
+}
 
 /**
  * multikernel_register_handler - Register a callback for multikernel IPI
@@ -98,7 +124,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
 	unsigned int head, next_head, tail;
-	int cpu;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
@@ -136,8 +162,15 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		if (next_head == tail) {
 			pr_warn("IPI ring buffer full for instance %d (head=%u, tail=%u)\n",
 				instance_id, head, tail);
+			/*
+			 * A burst can fill the ring while notifications coalesce.
+			 * Kick the consumer even though this message cannot be
+			 * queued, otherwise every later sender can keep returning
+			 * -ENOSPC without giving the consumer another interrupt.
+			 */
+			ret = mk_ipi_notify(instance);
 			mk_instance_put(instance);
-			return -ENOSPC;
+			return ret ? ret : -ENOSPC;
 		}
 
 		/* Try to claim this slot atomically */
@@ -159,16 +192,10 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	 * be looking at it; everything above must be visible first.
 	 */
 	smp_store_release(&slot->data_size, data_size);
-
-	cpu = find_first_bit(instance->cpus, NR_CPUS);
-
-	/* Send IPI directly to physical APIC ID
-	 * instance->cpus contains physical CPU IDs, use directly for APIC */
-	apic_icr_write(APIC_DM_FIXED | APIC_DEST_PHYSICAL | MULTIKERNEL_VECTOR,
-		       cpu);
+	ret = mk_ipi_notify(instance);
 
 	mk_instance_put(instance);
-	return 0;
+	return ret;
 }
 
 static void mk_ipi_drain_ring(void)

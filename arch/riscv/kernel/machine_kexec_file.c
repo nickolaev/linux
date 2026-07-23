@@ -267,6 +267,15 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 	kbuf.image = image;
 	kbuf.buf_min = kernel_start + kernel_len;
 	kbuf.buf_max = ULONG_MAX;
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		/*
+		 * The relocated ELF reservation already protects the kernel.  Extra
+		 * payloads may use any other free page in the instance pool, including
+		 * the alignment gap below the kernel image.
+		 */
+		kbuf.buf_min = image->multikernel_pool_start;
+		kbuf.buf_max = image->multikernel_pool_end;
+	}
 
 #ifdef CONFIG_CRASH_DUMP
 	/* Add elfcorehdr */
@@ -351,6 +360,24 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 		goto out;
 	}
 
+	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		int chosen = fdt_path_offset(fdt, "/chosen");
+		unsigned long pool_start = image->multikernel_pool_start;
+		unsigned long pool_size = image->multikernel_pool_end -
+					  pool_start + 1;
+
+		if (chosen < 0 || pool_start == ULONG_MAX || !pool_size) {
+			ret = -EINVAL;
+			goto out_free_fdt;
+		}
+		fdt_delprop(fdt, chosen, "linux,usable-memory-range");
+		ret = fdt_appendprop_addrrange(fdt, 0, chosen,
+					       "linux,usable-memory-range",
+					       pool_start, pool_size);
+		if (ret)
+			goto out_free_fdt;
+	}
+
 	fdt_pack(fdt);
 	kbuf.buffer = fdt;
 	kbuf.bufsz = kbuf.memsz = fdt_totalsize(fdt);
@@ -362,6 +389,7 @@ int load_extra_segments(struct kimage *image, unsigned long kernel_start,
 		pr_err("Error add DTB kbuf ret=%d\n", ret);
 		goto out_free_fdt;
 	}
+	image->arch.fdt_addr = kbuf.mem;
 	/* Cache the fdt buffer address for memory cleanup */
 	image->arch.fdt = fdt;
 	kexec_dprintk("Loaded device tree at 0x%lx\n", kbuf.mem);

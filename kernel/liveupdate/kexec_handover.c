@@ -1356,14 +1356,16 @@ struct kho_in {
 static struct kho_in kho_in = {
 };
 
+static phys_addr_t mk_kho_fdt_phys;
+
 static const void *kho_get_fdt(void)
 {
 	return kho_in.fdt_phys ? phys_to_virt(kho_in.fdt_phys) : NULL;
 }
 
-phys_addr_t kho_get_fdt_phys(void)
+phys_addr_t mk_kho_get_fdt_phys(void)
 {
-	return kho_in.fdt_phys;
+	return mk_kho_fdt_phys;
 }
 
 /**
@@ -1562,6 +1564,16 @@ void __init mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	int err = 0;
 
 	pr_info("Multikernel KHO: processing FDT at 0x%llx (size: %llu)\n", fdt_phys, fdt_len);
+#ifdef CONFIG_RISCV
+	/*
+	 * RISC-V scans /chosen before early_ioremap_setup(), so the handover
+	 * page cannot be mapped yet.  Record it now and validate it from the
+	 * multikernel early initcall after the fixmap is available.
+	 */
+	mk_kho_fdt_phys = fdt_phys;
+	pr_info("Multikernel KHO: deferred FDT validation until early init\n");
+	return;
+#endif
 
 	/* Validate the input FDT */
 	fdt = early_memremap(fdt_phys, fdt_len);
@@ -1586,6 +1598,7 @@ void __init mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len)
 
 	kho_in.fdt_phys = fdt_phys;
 	kho_in.scratch_phys = 0;
+	mk_kho_fdt_phys = fdt_phys;
 
 	pr_info("Multikernel KHO: successfully populated FDT data\n");
 
@@ -1689,6 +1702,10 @@ int kho_fill_kimage(struct kimage *image)
 	if (!kho_enable)
 		return 0;
 
+	/*
+	 * Multikernel images use a handover page allocated from their instance
+	 * pool. They do not use the host's global KHO FDT or scratch area.
+	 */
 	image->kho.fdt = virt_to_phys(kho_out.fdt);
 
 	scratch_size = sizeof(*kho_scratch) * kho_scratch_cnt;

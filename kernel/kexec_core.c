@@ -1679,6 +1679,7 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+#ifndef CONFIG_RISCV
 	struct mk_ident_pgtable *ident_pgt = NULL;
 	struct mk_spawn_context *spawn_ctx = NULL;
 	phys_addr_t spawn_ctx_phys;
@@ -1686,6 +1687,7 @@ int multikernel_kexec_by_id(int mk_id)
 	unsigned long trampoline_phys;
 	void *park_va = NULL;
 	unsigned long park_phys = 0;
+#endif
 	int cpu = -1;
 	int i, rc;
 
@@ -1740,11 +1742,27 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	rc = mk_kexec_finalize(mk_image);
-	if (rc)
-		pr_warn("KHO finalization failed: %d\n", rc);
-	else
-		pr_info("KHO finalized for multikernel instance\n");
+	if (rc) {
+		pr_err("KHO finalization failed: %d\n", rc);
+		goto unlock;
+	}
+	pr_info("KHO finalized for multikernel instance\n");
 
+#ifdef CONFIG_RISCV
+	if (mk_image->kho.ipi) {
+		instance->ipi_phys = mk_image->kho.ipi;
+		instance->ipi_data = phys_to_virt(mk_image->kho.ipi);
+	}
+	if (instance->ipi_data)
+		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+	rc = mk_spawn_cpu(instance, cpu, NULL);
+	if (!rc) {
+		rc = mk_instance_set_kexec_active(mk_image->mk_id);
+		if (rc)
+			pr_warn("Failed to set instance %d as active: %d\n",
+				mk_image->mk_id, rc);
+	}
+#else
 	/* Reuse spawn resources if already allocated (re-spawn case) */
 	if (instance->ident_pgt) {
 		ident_pgt = instance->ident_pgt;
@@ -1858,8 +1876,10 @@ int multikernel_kexec_by_id(int mk_id)
 		instance->trampoline_va = trampoline_va;
 		instance->park_va = park_va;
 	}
+#endif
 
 unlock:
+#ifndef CONFIG_RISCV
 	if (rc) {
 		if (ident_pgt && !instance->ident_pgt)
 			mk_free_identity_pgtable(ident_pgt);
@@ -1868,6 +1888,7 @@ unlock:
 		if (park_va && !instance->park_va)
 			mk_instance_free(instance, park_va, PAGE_SIZE);
 	}
+#endif
 	kexec_unlock();
 	return rc;
 }
