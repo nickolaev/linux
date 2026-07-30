@@ -36,6 +36,20 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size);
 int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
+
+/* pci.c */
+int mk_pci_lease_system_init(void);
+void mk_pci_lease_system_cleanup(void);
+void mk_pci_lease_instance_init(struct mk_instance *instance);
+int mk_pci_assign_devices(struct mk_instance *instance,
+			  const struct list_head *requested_devices,
+			  int requested_count);
+int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			 u8 devfn);
+int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			   u8 devfn);
+int mk_pci_release_assignments(struct mk_instance *instance);
+int mk_instance_force_halt(struct mk_instance *instance);
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 extern struct mutex mk_overlay_mutex;

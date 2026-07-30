@@ -272,6 +272,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mk_pci_lease_instance_init(instance);
 	INIT_LIST_HEAD(&instance->platform_devices);
 	kref_init(&instance->refcount);
 

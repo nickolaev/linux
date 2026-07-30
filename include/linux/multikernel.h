@@ -634,6 +634,8 @@ struct mk_instance {
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+	/* Host-only live PCI assignment leases (private elements). */
+	struct list_head pci_assignments;
 
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */

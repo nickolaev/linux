@@ -1570,6 +1570,8 @@ out:
 int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		       const char *driver_override, u32 flags)
 {
+	if (!root_instance)
+		return -ENODEV;
 	struct mk_device_resource_payload payload = {
 		.domain = domain,
 		.bus = bus,
@@ -1652,6 +1654,8 @@ out:
  */
 int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 {
+	if (!root_instance)
+		return -ENODEV;
 	struct mk_device_resource_payload payload = {
 		.domain = domain,
 		.bus = bus,
