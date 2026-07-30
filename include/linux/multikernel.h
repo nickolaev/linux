@@ -707,14 +707,14 @@ struct mk_instance *mk_instance_get(struct mk_instance *instance);
 void __noreturn mk_halt_to_pool(void);
 
 /**
- * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
- * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory size and CPU assignment
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
+ * @instance: Empty instance to populate
+ * @config: Parsed memory, CPU, PCI, and platform resource configuration
  *
- * Allocates the specified memory size from the multikernel pool, creates
- * memory regions, and copies CPU assignment.
+ * Reserves every configured resource class or returns all resources acquired
+ * by the attempt. A failure never leaves a partially populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 				  const struct mk_dt_config *config);
