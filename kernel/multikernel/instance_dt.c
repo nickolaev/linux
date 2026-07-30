@@ -405,6 +405,9 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	INIT_LIST_HEAD(&instance->pci_devices);
 	instance->pci_devices_valid = false;
 	instance->pci_device_count = 0;
+	INIT_LIST_HEAD(&instance->pci_host_bridges);
+	instance->pci_host_bridges_valid = false;
+	instance->pci_host_bridge_count = 0;
 	INIT_LIST_HEAD(&instance->platform_devices);
 	instance->platform_devices_valid = false;
 	instance->platform_device_count = 0;
@@ -452,25 +455,30 @@ static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 	instance->pci_devices_valid = true;
 
 	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		dst_dev = kmemdup(src_dev, sizeof(*dst_dev), GFP_KERNEL);
 		if (!dst_dev) {
 			pr_err("Failed to allocate PCI device entry\n");
 			return -ENOMEM;
 		}
 
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
-
+		INIT_LIST_HEAD(&dst_dev->list);
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;
 	}
 
 	pr_info("Copied %d PCI devices to root instance\n", instance->pci_device_count);
 	return 0;
+}
+
+static int __init mk_copy_pci_host_bridges(const struct mk_dt_config *config,
+					       struct mk_instance *instance)
+{
+	return mk_pci_host_bridges_clone(&instance->pci_host_bridges,
+					 &instance->pci_host_bridge_count,
+					 &instance->pci_host_bridges_valid,
+					 &config->pci_host_bridges,
+					 config->pci_host_bridge_count,
+					 config->pci_host_bridges_valid);
 }
 
 static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
@@ -771,6 +779,12 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_devices;
 	}
 
+	ret = mk_copy_pci_host_bridges(&config, instance);
+	if (ret) {
+		pr_err("Failed to copy PCI host bridge metadata: %d\n", ret);
+		goto cleanup_devices;
+	}
+
 	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy platform devices: %d\n", ret);
@@ -797,6 +811,9 @@ int __init mk_instance_restore_from_manifest(void)
 	return 0;
 
 cleanup_devices:
+	mk_pci_host_bridges_free(&instance->pci_host_bridges,
+				 &instance->pci_host_bridge_count,
+				 &instance->pci_host_bridges_valid);
 	if (instance->pci_devices_valid) {
 		struct mk_pci_device *pci_dev, *tmp_pci;
 		list_for_each_entry_safe(pci_dev, tmp_pci, &instance->pci_devices, list) {
@@ -827,89 +844,6 @@ cleanup_fdt:
 
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
 early_initcall(mk_instance_restore_from_manifest);
-
-/**
- * mk_pci_should_probe - Check if PCI probing should occur at all
- * @bus: PCI bus
- * @devfn: device/function number
- *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist.
- *
- * Returns: true if probing should proceed, false to skip entirely
- */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(bus);
-	u8 bus_num = bus->number;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
-	u8 hdr_type;
-
-	if (!root_instance)
-		return true;
-
-	if (!root_instance->dtb_data)
-		return true;
-
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
-		return false;
-
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain != domain)
-			continue;
-
-		/* Exact location match - always allow */
-		if (pci_dev->bus == bus_num &&
-		    pci_dev->slot == slot &&
-		    pci_dev->func == func)
-			return true;
-	}
-
-	/*
-	 * Check if any whitelisted device is on a downstream bus.
-	 * If so, this might be a bridge in the path to that device.
-	 */
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
-			goto check_bridge;
-	}
-	return false;
-
-check_bridge:
-	/*
-	 * There's a whitelisted device on a downstream bus. Check if this
-	 * is a bridge that serves it.
-	 */
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
-
-		if (is_bridge) {
-			u8 secondary_bus = 0, subordinate_bus = 0;
-
-			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
-			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
-
-			/*
-			 * Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive).
-			 */
-			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
-				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-					if (pci_dev->domain == domain &&
-					    pci_dev->bus >= secondary_bus &&
-					    pci_dev->bus <= subordinate_bus)
-						return true;
-				}
-			}
-		}
-	}
-
-	return false;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
