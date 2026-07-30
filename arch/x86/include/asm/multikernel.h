@@ -54,7 +54,7 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
  * from a page written by the host while running on CPUs parked by (possibly
  * differently built) spawn kernels.
  *
- * The fields fall into two classes that must not be mixed up:
+ * The fields fall into three classes that must not be mixed up:
  *
  *  - Anchor fields (self_phys, park_phys, park_cr3, ctrl_phys,
  *    ctrl_size): the context's own identity, written once when the
@@ -62,9 +62,13 @@ static inline int arch_cpu_from_physical_id(u64 phys_id)
  *    CPU on halt or offline, so they must stay valid for the context's
  *    whole lifetime.
  *
- *  - Dispatch fields (everything else): the wake mailbox, rewritten for
- *    every publication and staged into registers by the CPU that claims
- *    it. Reparking gets its own repark_* dispatch fields precisely so a
+ *  - Primary boot fields (boot_* and bp): written before the boot CPU is
+ *    released and consumed while that kernel initializes. Secondary and
+ *    repark publications do not rewrite them.
+ *
+ *  - Dispatch fields (the remaining fixed-size fields): the wake mailbox,
+ *    rewritten for every publication and staged into registers by the CPU
+ *    that claims it. Reparking gets its own repark_* dispatch fields so a
  *    repark publication never overwrites the anchor: the two used to
  *    share fields, and a repark left the anchor pointing at another
  *    kernel's park area, which triple-faulted the next halt.
@@ -80,6 +84,10 @@ struct mk_spawn_context {
 	unsigned long gs_base;		/* Per-CPU GS base (for secondary) */
 	unsigned long stack;		/* Stack pointer (for secondary) */
 	unsigned long spawn_cr3;	/* Spawn kernel's CR3 (for secondary CPU final switch) */
+	unsigned long boot_lps;		/* Host delay loops per second */
+	unsigned long boot_cpu_khz;	/* Host CPU frequency calibration */
+	unsigned long boot_tsc_khz;	/* Host TSC frequency calibration */
+	unsigned long boot_apic_hz;	/* Host local APIC timer frequency */
 	unsigned long park_phys;	/* Pool park code page (host owned, never reloaded) */
 	unsigned long park_cr3;		/* Page table parked CPUs run on (host owned) */
 	unsigned long repark_park_phys;	/* REPARK dispatch: park page to move to */
