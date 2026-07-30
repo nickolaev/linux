@@ -1229,6 +1229,21 @@ out:
 	return ret;
 }
 
+static int mk_memory_change_allowed(struct mk_instance *instance)
+{
+	bool iommu_active;
+
+	mutex_lock(&instance->resource_mutex);
+	iommu_active = mk_pci_iommu_lease_active_locked(instance);
+	mutex_unlock(&instance->resource_mutex);
+	if (!iommu_active)
+		return 0;
+
+	pr_err("Cannot change memory for instance %d while an IOMMU lease is active\n",
+	       instance->id);
+	return -EBUSY;
+}
+
 /**
  * mk_send_mem_add - Add memory to instance
  * @instance_id: Target instance ID
@@ -1265,6 +1280,11 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
 		return -ENODEV;
+	ret = mk_memory_change_allowed(target_instance);
+	if (ret) {
+		mk_instance_put(target_instance);
+		return ret;
+	}
 
 	/* For non-running instances, allocate memory from pool and add to instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {
@@ -1331,6 +1351,11 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
 		return -ENODEV;
+	ret = mk_memory_change_allowed(target_instance);
+	if (ret) {
+		mk_instance_put(target_instance);
+		return ret;
+	}
 
 	/* For non-running instances, just remove the memory region from the instance */
 	if (target_instance->state != MK_STATE_ACTIVE) {
