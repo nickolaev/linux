@@ -66,6 +66,20 @@ Workflow
    ``device-remove``, and destroy the instance with ``instance-remove``
    once it is stopped.
 
+SR-IOV Assignment Boundary
+===========================
+
+SR-IOV assignment is intended for cooperative spawned kernels. Filtering
+configuration-space access and enumerating only assigned BDFs prevents
+accidental access; it is not a security boundary against a privileged kernel
+that deliberately issues configuration cycles or maps host physical windows.
+
+The host keeps exclusive leases for assigned VFs. Assignment fails unless the
+device is an SR-IOV VF whose identity and ownership can be validated. Host
+drivers remain bound while a VF is merely in the pool and are detached only
+while committing a lease. Nested kernels cannot establish this host-owned
+lifecycle and therefore cannot lease PCI devices to their children.
+
 Instance States
 ===============
 

@@ -406,7 +406,7 @@ static int mk_baseline_initialize_cpus(const struct mk_cpu_set *requested)
 static int mk_baseline_initialize_devices(struct list_head *pci_list)
 {
 	struct mk_pci_device *pci_dev;
-	int ret, failed = 0, moved = 0;
+	int ret, failed = 0, available = 0;
 
 	if (list_empty(pci_list)) {
 		pr_debug("No PCI devices in baseline to move into the pool\n");
@@ -414,24 +414,25 @@ static int mk_baseline_initialize_devices(struct list_head *pci_list)
 	}
 
 	list_for_each_entry(pci_dev, pci_list, list) {
-		ret = mk_pool_device_add(pci_dev->domain, pci_dev->bus,
-					 PCI_DEVFN(pci_dev->slot, pci_dev->func),
-					 pci_dev->alias);
+		ret = mk_root_add_pci_device(pci_dev->domain, pci_dev->bus,
+					     PCI_DEVFN(pci_dev->slot, pci_dev->func),
+					     pci_dev->alias);
 		if (ret) {
-			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not moved into the pool: %d\n",
+			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x unavailable for the pool: %d\n",
 				pci_dev->vendor, pci_dev->device, pci_dev->domain,
 				pci_dev->bus, pci_dev->slot, pci_dev->func, ret);
 			failed++;
 			continue;
 		}
 
-		moved++;
+		available++;
 	}
 
 	if (failed > 0)
-		pr_warn("Failed to move %d PCI devices into the pool\n", failed);
+		pr_warn("Failed to inventory %d PCI devices for the pool\n", failed);
 
-	pr_info("Moved %d PCI devices into the multikernel pool\n", moved);
+	pr_info("Inventoried %d PCI devices; host drivers remain bound until assignment\n",
+		available);
 
 	return 0;
 }

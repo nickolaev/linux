@@ -407,6 +407,8 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	int ret;
+
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -424,6 +426,13 @@ int mk_instance_destroy(struct mk_instance *instance)
 		pr_err("Cannot remove instance '%s' (ID: %d) with loaded kernel. Unload it first.\n",
 		       instance->name, instance->id);
 		return -EBUSY;
+	}
+
+	ret = mk_instance_release_resources(instance);
+	if (ret) {
+		pr_err("Cannot remove instance '%s' (ID: %d): resource release failed: %d\n",
+		       instance->name, instance->id, ret);
+		return ret;
 	}
 
 	list_del(&instance->list);
