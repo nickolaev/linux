@@ -1258,6 +1258,7 @@ EXPORT_SYMBOL_GPL(kho_restore_free);
  *
  * Returns: 0 on success, negative error code on failure
  */
+#ifdef CONFIG_MULTIKERNEL
 int mk_kexec_finalize(struct kimage *target_image)
 {
 	void *fdt;
@@ -1340,6 +1341,7 @@ int mk_kexec_finalize(struct kimage *target_image)
 		target_image->mk_id, fdt_totalsize(fdt));
 	return 0;
 }
+#endif /* CONFIG_MULTIKERNEL */
 
 int kho_finalize(void)
 {
@@ -1572,6 +1574,7 @@ void __init kho_memory_init(void)
  * regular KHO, multikernel doesn't use scratch areas and has a different
  * FDT format with 'multikernel-v1' compatibility.
  */
+#ifdef CONFIG_MULTIKERNEL
 void __init mk_kho_populate(phys_addr_t fdt_phys, u64 fdt_len)
 {
 	void *fdt = NULL;
@@ -1611,6 +1614,7 @@ out:
 	if (err)
 		pr_warn("Multikernel KHO: disabling multikernel revival\n");
 }
+#endif /* CONFIG_MULTIKERNEL */
 
 void __init kho_populate(phys_addr_t fdt_phys, u64 fdt_len,
 			 phys_addr_t scratch_phys, u64 scratch_len)
