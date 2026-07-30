@@ -12,7 +12,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 				      int resources_node, size_t dtb_size);
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
-void mk_instance_release_resources(struct mk_instance *instance);
+int mk_instance_release_resources(struct mk_instance *instance);
 
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,
@@ -40,7 +40,7 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			 u8 devfn);
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
-void mk_pci_release_assignments(struct mk_instance *instance);
+int mk_pci_release_assignments(struct mk_instance *instance);
 int mk_instance_force_halt(struct mk_instance *instance);
 
 /* overlay.c */

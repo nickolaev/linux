@@ -239,6 +239,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	struct kernfs_node *kn;
 	struct mk_dt_config config;
 	void *dtb_copy;
+	int release_ret;
 	int ret;
 	int allocated_id;
 
@@ -335,7 +336,16 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	kfree(instance->dtb_data);
 	instance->dtb_data = NULL;
 err_free_resources:
-	mk_instance_release_resources(instance);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret) {
+		pr_crit("Retaining failed instance '%s' because PCI cleanup failed: %d\n",
+			name, release_ret);
+		list_add_tail(&instance->list, &mk_instance_list);
+		kernfs_activate(kn);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mk_dt_config_free(&config);
+		return release_ret;
+	}
 err_free_idr:
 	idr_remove(&mk_instance_idr, instance->id);
 err_remove_dir:
@@ -437,6 +447,8 @@ static int mk_kernfs_rmdir(struct kernfs_node *kn)
  */
 int mk_instance_destroy(struct mk_instance *instance)
 {
+	int ret;
+
 	lockdep_assert_held(&mk_instance_mutex);
 
 	if (!instance) {
@@ -454,6 +466,14 @@ int mk_instance_destroy(struct mk_instance *instance)
 		pr_err("Cannot remove instance '%s' (ID: %d) with loaded kernel. Unload it first.\n",
 		       instance->name, instance->id);
 		return -EBUSY;
+	}
+
+	ret = mk_instance_release_resources(instance);
+	if (ret) {
+		pr_crit("Cannot remove instance '%s' while PCI cleanup is unsafe: %d\n",
+			instance->name, ret);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		return ret;
 	}
 
 	list_del(&instance->list);

@@ -26,17 +26,20 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 	mk_instance_return_cpus(instance, instance->cpus);
 }
 
-static void mk_instance_return_pci_devices(struct mk_instance *instance)
+static int mk_instance_return_pci_devices(struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev, *pci_tmp;
 	int returned_count = 0;
+	int ret;
 
 	if (!instance || instance == root_instance || instance->id == 0)
-		return;
+		return 0;
 
-	mk_pci_release_assignments(instance);
+	ret = mk_pci_release_assignments(instance);
+	if (ret)
+		return ret;
 	if (!instance->pci_devices_valid)
-		return;
+		return 0;
 
 	if (!root_instance) {
 		pr_warn("Cannot return PCI devices from instance %d (%s): no root instance\n",
@@ -64,6 +67,7 @@ cleanup:
 	}
 	instance->pci_device_count = 0;
 	instance->pci_devices_valid = false;
+	return 0;
 }
 static void mk_instance_return_platform_devices(struct mk_instance *instance)
 {
@@ -105,28 +109,35 @@ cleanup:
 	instance->platform_devices_valid = false;
 }
 
-void mk_instance_release_resources(struct mk_instance *instance)
+int mk_instance_release_resources(struct mk_instance *instance)
 {
-	if (!instance || instance == root_instance || instance->id == 0)
-		return;
+	int ret;
 
+	if (!instance || instance == root_instance || instance->id == 0)
+		return 0;
+
+	ret = mk_instance_return_pci_devices(instance);
+	if (ret)
+		return ret;
 	mk_instance_return_platform_devices(instance);
 	mk_pci_host_bridges_free(&instance->pci_host_bridges,
 				 &instance->pci_host_bridge_count,
 				 &instance->pci_host_bridges_valid);
-	mk_instance_return_pci_devices(instance);
 	mk_instance_return_all_cpus(instance);
 	mk_instance_free_memory(instance);
+	return 0;
 }
 
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance =
 		container_of(kref, struct mk_instance, refcount);
+	int ret;
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
-	mk_instance_release_resources(instance);
+	ret = mk_instance_release_resources(instance);
+	WARN_ON_ONCE(ret);
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->dtb_data);
 	kfree(instance->name);
@@ -813,6 +824,7 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 			       const struct mk_dt_config *config)
 {
 	const char *failed_resource;
+	int release_ret;
 	int ret;
 
 	if (!config || !instance || !instance->cpus) {
@@ -878,7 +890,9 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 rollback:
 	pr_err("Failed to reserve %s resources for instance %d (%s): %d\n",
 	       failed_resource, instance->id, instance->name, ret);
-	mk_instance_release_resources(instance);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret)
+		return release_ret;
 	return ret;
 }
 /**
