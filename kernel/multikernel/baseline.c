@@ -174,6 +174,9 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	}
 	instance->pci_device_count = 0;
 	instance->pci_devices_valid = false;
+	mk_pci_host_bridges_free(&instance->pci_host_bridges,
+				 &instance->pci_host_bridge_count,
+				 &instance->pci_host_bridges_valid);
 
 	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
 		list_del(&plat_dev->list);
@@ -590,6 +593,15 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 	ret = mk_baseline_parse_memory(fdt, resources_node, root_instance);
 	if (ret) {
 		pr_err("Failed to parse baseline memory: %d\n", ret);
+		return ret;
+	}
+
+	ret = mk_dt_parse_pci_host_bridges(fdt, resources_node,
+					   &root_instance->pci_host_bridges,
+					   &root_instance->pci_host_bridge_count,
+					   &root_instance->pci_host_bridges_valid);
+	if (ret) {
+		pr_err("Failed to parse baseline PCI host bridges: %d\n", ret);
 		return ret;
 	}
 

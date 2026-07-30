@@ -143,6 +143,9 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_all_cpus(instance);
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
+	mk_pci_host_bridges_free(&instance->pci_host_bridges,
+				 &instance->pci_host_bridge_count,
+				 &instance->pci_host_bridges_valid);
 	mk_instance_free_memory(instance);
 
 	mk_cpu_set_free(instance->cpus);
@@ -937,6 +940,29 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 		       instance->id, instance->name, ret);
 		/* Don't fail the whole operation for PCI reservation failure */
 		pr_warn("Continuing without PCI device assignment\n");
+	}
+
+	/* Copy descriptive PCI host bridge metadata; it is never transferred. */
+	if (config->pci_host_bridges_valid && config->pci_host_bridge_count > 0) {
+		ret = mk_pci_host_bridges_clone(&instance->pci_host_bridges,
+						&instance->pci_host_bridge_count,
+						&instance->pci_host_bridges_valid,
+						&config->pci_host_bridges,
+						config->pci_host_bridge_count, true);
+	} else if (root_instance) {
+		ret = mk_pci_host_bridges_clone(&instance->pci_host_bridges,
+						&instance->pci_host_bridge_count,
+						&instance->pci_host_bridges_valid,
+						&root_instance->pci_host_bridges,
+						root_instance->pci_host_bridge_count,
+						root_instance->pci_host_bridges_valid);
+	} else {
+		ret = 0;
+	}
+	if (ret) {
+		pr_err("Failed to copy PCI host bridge metadata for instance %d (%s): %d\n",
+		       instance->id, instance->name, ret);
+		return ret;
 	}
 
 	/* Reserve platform device resources */

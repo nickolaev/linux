@@ -14,6 +14,8 @@
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
+struct pci_bus;
+struct pci_dev;
 
 /**
  * Physical CPU identifiers
@@ -399,6 +401,12 @@ struct mk_memory_region {
  * Represents a single PCI device that should be accessible to an instance.
  * Format: vendor:device@domain:bus:slot.func
  */
+#define MK_PCI_RESOURCE_COUNT 6
+struct mk_pci_resource {
+	u64 start;
+	u64 end;
+	u64 flags;
+};
 struct mk_pci_device {
 	char name[64];     /* Device name from DTB (e.g., "enp9s0_dev") */
 	u16 vendor;        /* PCI vendor ID */
@@ -407,8 +415,29 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	struct mk_pci_resource resources[MK_PCI_RESOURCE_COUNT];
+	bool resources_valid;
 	struct list_head list;  /* Link to device list */
 };
+
+/**
+ * PCI host bridge configuration-space descriptor
+ *
+ * Describes an ECAM window for a PCI segment and inclusive bus range. This is
+ * platform metadata shared with an instance, not an assignable device.
+ */
+struct mk_pci_host_bridge {
+	u16 segment;
+	u8 bus_start;
+	u8 bus_end;
+	u64 ecam_base;
+	struct list_head list;
+};
+
+#define MK_MAX_PCI_HOST_BRIDGES 16
+int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
+				      struct mk_pci_host_bridge *bridges,
+				      size_t capacity);
 
 /**
  * Platform device specification
@@ -450,13 +479,18 @@ struct mk_dt_config {
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
 
+	/* PCI host bridge metadata */
+	struct list_head pci_host_bridges;
+	int pci_host_bridge_count;
+	bool pci_host_bridges_valid;
+
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[7];                 /* Reduced due to added fields */
+	u32 reserved[4];
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -488,6 +522,11 @@ struct mk_instance {
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+
+	/* PCI host bridge metadata (descriptive, never transferred) */
+	struct list_head pci_host_bridges;
+	int pci_host_bridge_count;
+	bool pci_host_bridges_valid;
 
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
@@ -754,6 +793,9 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device probe filtering against the instance's allowlist */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
+				  u16 *vendor, u16 *device);
+void mk_pci_restore_resources(struct pci_dev *dev);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
