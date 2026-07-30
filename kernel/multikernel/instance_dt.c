@@ -426,6 +426,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mk_pci_lease_instance_init(instance);
 	instance->pci_devices_valid = false;
 	instance->pci_device_count = 0;
 	INIT_LIST_HEAD(&instance->platform_devices);
