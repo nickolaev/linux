@@ -26,16 +26,20 @@ static void mk_instance_return_all_cpus(struct mk_instance *instance)
 	mk_instance_return_cpus(instance, instance->cpus);
 }
 
-static void mk_instance_return_pci_devices(struct mk_instance *instance)
+static int mk_instance_return_pci_devices(struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev, *pci_tmp;
 	int returned_count = 0;
+	int ret;
 
-	if (!instance || !instance->pci_devices_valid)
-		return;
+	if (!instance || instance == root_instance || instance->id == 0)
+		return 0;
 
-	if (instance == root_instance || instance->id == 0)
-		return;
+	ret = mk_pci_release_assignments(instance);
+	if (ret)
+		return ret;
+	if (!instance->pci_devices_valid)
+		return 0;
 
 	if (!root_instance) {
 		pr_warn("Cannot return PCI devices from instance %d (%s): no root instance\n",
@@ -78,6 +82,7 @@ cleanup:
 	}
 	instance->pci_device_count = 0;
 	instance->pci_devices_valid = false;
+	return 0;
 }
 
 static void mk_instance_return_platform_devices(struct mk_instance *instance)
@@ -122,11 +127,14 @@ cleanup:
 
 int mk_instance_release_resources(struct mk_instance *instance)
 {
+	int ret;
 
 	if (!instance || instance == root_instance || instance->id == 0)
 		return 0;
 
-	mk_instance_return_pci_devices(instance);
+	ret = mk_instance_return_pci_devices(instance);
+	if (ret)
+		return ret;
 	mk_instance_return_platform_devices(instance);
 	mk_instance_return_all_cpus(instance);
 	mk_instance_free_memory(instance);
@@ -135,7 +143,8 @@ int mk_instance_release_resources(struct mk_instance *instance)
 
 static void mk_instance_release(struct kref *kref)
 {
-	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	struct mk_instance *instance =
+		container_of(kref, struct mk_instance, refcount);
 	int ret;
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
@@ -1174,8 +1183,9 @@ static bool mk_instance_resources_empty(const struct mk_instance *instance)
 int mk_instance_reserve_resources(struct mk_instance *instance,
 			       const struct mk_dt_config *config)
 {
-	int ret;
 	const char *failed_resource;
+	int release_ret;
+	int ret;
 
 	if (!config || !instance || !instance->cpus) {
 		pr_err("Invalid parameters to mk_instance_reserve_resources\n");
@@ -1212,7 +1222,9 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 rollback:
 	pr_err("Failed to reserve %s resources for instance %d (%s): %d\n",
 	       failed_resource, instance->id, instance->name, ret);
-	mk_instance_release_resources(instance);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret)
+		return release_ret;
 	return ret;
 }
 /**
