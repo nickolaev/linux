@@ -15,7 +15,7 @@
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
 struct pci_bus;
-struct pci_dev;
+struct pci_ops;
 
 /**
  * Physical CPU identifiers
@@ -789,10 +789,10 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device probe filtering against the instance's allowlist */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
+			 const struct pci_ops *ops);
 bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
 				  u16 *vendor, u16 *device);
-void mk_pci_restore_resources(struct pci_dev *dev);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -840,7 +840,9 @@ static inline void mk_kimage_free(struct kimage *image, void *virt_addr,
 				  size_t size)
 {
 }
-static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
+
+static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
+				       const struct pci_ops *ops)
 {
 	return true;
 }
