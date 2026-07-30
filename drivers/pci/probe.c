@@ -22,7 +22,6 @@
 #include <linux/irqdomain.h>
 #include <linux/pm_runtime.h>
 #include <linux/bitfield.h>
-#include <linux/multikernel.h>
 #include "pci.h"
 
 #define CARDBUS_LATENCY_TIMER	176	/* secondary latency timer */
@@ -2622,14 +2621,6 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 {
 	struct pci_dev *dev;
 	u32 l;
-
-	/*
-	 * For multikernel spawns, check if we should even probe this location
-	 * BEFORE any config space access. This prevents hardware conflicts
-	 * when the host kernel is also using PCI devices.
-	 */
-	if (IS_ENABLED(CONFIG_MULTIKERNEL) && !mk_pci_should_probe(bus, devfn))
-		return NULL;
 
 	/*
 	 * Create pwrctrl device (if required) for the PCI device to handle the

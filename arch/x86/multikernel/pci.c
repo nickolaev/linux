@@ -21,6 +21,47 @@ struct mk_mmcfg_snapshot {
 	size_t count;
 };
 
+static struct pci_ops mk_pci_native_ops;
+
+static bool mk_pci_identity_read(struct pci_bus *bus, unsigned int devfn,
+				 int where, int size, u32 *value)
+{
+	u16 vendor, device;
+	u32 identity;
+	u32 mask;
+
+	if (where < PCI_VENDOR_ID || where + size > PCI_COMMAND ||
+	    !mk_pci_get_assigned_identity(bus, devfn, &vendor, &device))
+		return false;
+
+	identity = vendor | (u32)device << 16;
+	mask = size == sizeof(identity) ? ~0U : (1U << (size * 8)) - 1;
+	*value = (identity >> (where * 8)) & mask;
+	return true;
+}
+
+static int mk_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
+		       int size, u32 *value)
+{
+	if (!mk_pci_should_probe(bus, devfn, &mk_pci_native_ops)) {
+		*value = ~0U;
+		return PCIBIOS_DEVICE_NOT_FOUND;
+	}
+	if (mk_pci_identity_read(bus, devfn, where, size, value))
+		return PCIBIOS_SUCCESSFUL;
+
+	return mk_pci_native_ops.read(bus, devfn, where, size, value);
+}
+
+static int mk_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
+			int size, u32 value)
+{
+	if (!mk_pci_should_probe(bus, devfn, &mk_pci_native_ops))
+		return PCIBIOS_DEVICE_NOT_FOUND;
+
+	return mk_pci_native_ops.write(bus, devfn, where, size, value);
+}
+
 #ifdef CONFIG_PCI_MMCONFIG
 static int mk_mmcfg_snapshot_region(const struct pci_mmcfg_region *region,
 				    void *data)
@@ -98,6 +139,9 @@ static int __init x86_multikernel_pci_arch_init(void)
 
 	raw_pci_ops = &pci_mmcfg;
 	raw_pci_ext_ops = &pci_mmcfg;
+	mk_pci_native_ops = pci_root_ops;
+	pci_root_ops.read = mk_pci_read;
+	pci_root_ops.write = mk_pci_write;
 	pr_notice("Multikernel selected ECAM for PCI config access\n");
 
 	return 0;
