@@ -10,6 +10,7 @@
 #include <linux/kobject.h>
 #include <linux/kernfs.h>
 #include <linux/ioport.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
@@ -619,6 +620,8 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Serializes memory topology changes with PCI assignment leases. */
+	struct mutex resource_mutex;
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */

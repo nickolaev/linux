@@ -42,6 +42,7 @@ int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
+bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance);
 int mk_pci_assign_devices(struct mk_instance *instance,
 			  const struct list_head *requested_devices,
 			  int requested_count);
