@@ -122,6 +122,23 @@ Phase 2: Kernel Loading (Kexec Integration)
    - Restore the instance's DTB and recreate the instance structure
    - Re-reserve the same memory and CPU resources
 
+SR-IOV Assignment Boundary
+==========================
+
+SR-IOV assignment is intended for cooperative spawned kernels.  Filtering
+configuration-space access and enumerating only assigned BDFs prevents
+accidental access by those kernels; it is not a security boundary against a
+privileged kernel that deliberately issues configuration cycles or maps host
+physical windows.  The host-owned IOMMU domain is the boundary that constrains
+device-initiated DMA.
+
+The host fails assignment closed unless it can establish the complete device
+lifecycle: the device is an SR-IOV VF in a singleton IOMMU group, reset is
+available, MSI or MSI-X programming remains isolated and host-owned, and one
+coherent host-owned IOMMU domain covers the assigned memory.  Reset, interrupt,
+or DMA teardown uncertainty leaves the instance failed rather than returning
+the VF to use.
+
 Device Tree Format
 ==================
 
