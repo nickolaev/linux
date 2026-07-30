@@ -135,7 +135,7 @@ void mk_pci_host_bridges_free(struct list_head *bridges, int *count,
 }
 
 int mk_pci_host_bridges_clone(struct list_head *dst, int *dst_count,
-			      bool *dst_valid, const struct list_head *src,
+				 bool *dst_valid, const struct list_head *src,
 				 int src_count, bool src_valid)
 {
 	const struct mk_pci_host_bridge *src_bridge;
@@ -1130,6 +1130,11 @@ static int mk_dt_emit_pci_host_bridges(void *fdt,
 	struct mk_pci_host_bridge discovered[MK_MAX_PCI_HOST_BRIDGES];
 	const struct mk_pci_host_bridge *bridge;
 	int discovered_count, index, ret;
+
+	if (!instance->pci_devices_valid)
+		return -EINVAL;
+	if (!instance->pci_device_count)
+		return 0;
 
 	discovered_count =
 		mk_arch_snapshot_pci_host_bridges(instance, discovered,

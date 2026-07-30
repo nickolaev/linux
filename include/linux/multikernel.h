@@ -945,17 +945,17 @@ int __init mk_instance_restore_from_manifest(void);
  */
 
 /**
- * mk_pci_should_probe() - Check if PCI probing should occur at a location
+ * mk_pci_get_assigned_identity() - Check and identify an assigned PCI function
  * @bus: PCI bus
  * @devfn: PCI device/function number
+ * @vendor: optional assigned vendor ID output
+ * @device: optional assigned device ID output
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist, avoiding hardware conflicts on bare metal.
+ * Synthetic roots make assigned functions directly discoverable. Only exact
+ * assignment metadata matches may access config space; physical bridges and
+ * all other functions remain inaccessible.
  *
- * Returns: true if probing should proceed, false to skip entirely
- *
- * Declared above with the CONFIG_MULTIKERNEL stubs.
+ * Returns: true for an exact assignment metadata match, false otherwise
  */
 
 /**

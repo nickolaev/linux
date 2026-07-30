@@ -8,12 +8,16 @@
 
 #include <linux/init.h>
 #include <linux/multikernel.h>
+#include <linux/panic.h>
 #include <linux/pci.h>
 
 #include <asm/multikernel.h>
+#include <asm/pci.h>
 #include <asm/pci_x86.h>
+#include <asm/topology.h>
 #include <asm/x86_init.h>
 
+#ifdef CONFIG_PCI_MMCONFIG
 struct mk_mmcfg_snapshot {
 	const struct mk_instance *instance;
 	struct mk_pci_host_bridge *bridges;
@@ -22,16 +26,29 @@ struct mk_mmcfg_snapshot {
 };
 
 static struct pci_ops mk_pci_native_ops;
+static bool mk_pci_roots_ready;
 
-static bool mk_pci_identity_read(struct pci_bus *bus, unsigned int devfn,
-				 int where, int size, u32 *value)
+static bool mk_mmcfg_snapshot_contains(const struct mk_mmcfg_snapshot *snapshot,
+				       u16 segment, u8 bus)
 {
-	u16 vendor, device;
+	size_t index;
+
+	for (index = 0; index < snapshot->count; index++) {
+		if (snapshot->bridges[index].segment == segment &&
+		    snapshot->bridges[index].bus_start == bus)
+			return true;
+	}
+
+	return false;
+}
+
+static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
+				 u32 *value)
+{
 	u32 identity;
 	u32 mask;
 
-	if (where < PCI_VENDOR_ID || where + size > PCI_COMMAND ||
-	    !mk_pci_get_assigned_identity(bus, devfn, &vendor, &device))
+	if (where < PCI_VENDOR_ID || where + size > PCI_COMMAND)
 		return false;
 
 	identity = vendor | (u32)device << 16;
@@ -43,11 +60,13 @@ static bool mk_pci_identity_read(struct pci_bus *bus, unsigned int devfn,
 static int mk_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
 		       int size, u32 *value)
 {
-	if (!mk_pci_should_probe(bus, devfn, &mk_pci_native_ops)) {
+	u16 vendor, device;
+
+	if (!mk_pci_get_assigned_identity(bus, devfn, &vendor, &device)) {
 		*value = ~0U;
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
-	if (mk_pci_identity_read(bus, devfn, where, size, value))
+	if (mk_pci_identity_read(vendor, device, where, size, value))
 		return PCIBIOS_SUCCESSFUL;
 
 	return mk_pci_native_ops.read(bus, devfn, where, size, value);
@@ -56,13 +75,12 @@ static int mk_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
 static int mk_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
 			int size, u32 value)
 {
-	if (!mk_pci_should_probe(bus, devfn, &mk_pci_native_ops))
+	if (!mk_pci_get_assigned_identity(bus, devfn, NULL, NULL))
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
 	return mk_pci_native_ops.write(bus, devfn, where, size, value);
 }
 
-#ifdef CONFIG_PCI_MMCONFIG
 static int mk_mmcfg_snapshot_region(const struct pci_mmcfg_region *region,
 				    void *data)
 {
@@ -74,18 +92,20 @@ static int mk_mmcfg_snapshot_region(const struct pci_mmcfg_region *region,
 		    device->bus < region->start_bus ||
 		    device->bus > region->end_bus)
 			continue;
+		if (mk_mmcfg_snapshot_contains(snapshot, device->domain,
+					       device->bus))
+			continue;
 		if (snapshot->count == snapshot->capacity)
 			return -ENOSPC;
 
 		snapshot->bridges[snapshot->count].segment = region->segment;
-		snapshot->bridges[snapshot->count].bus_start = region->start_bus;
-		snapshot->bridges[snapshot->count].bus_end = region->end_bus;
+		snapshot->bridges[snapshot->count].bus_start = device->bus;
+		snapshot->bridges[snapshot->count].bus_end = device->bus;
 		snapshot->bridges[snapshot->count].ecam_base = region->address;
-		pr_info("Multikernel publishing ECAM segment %04x [bus %02x-%02x] base %#llx\n",
-			region->segment, region->start_bus, region->end_bus,
+		pr_info("Multikernel publishing synthetic PCI root %04x:%02x ECAM base %#llx\n",
+			region->segment, device->bus,
 			(unsigned long long)region->address);
 		snapshot->count++;
-		break;
 	}
 
 	return 0;
@@ -95,6 +115,7 @@ int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
 				      struct mk_pci_host_bridge *bridges,
 				      size_t capacity)
 {
+	const struct mk_pci_device *device;
 	struct mk_mmcfg_snapshot snapshot = {
 		.instance = instance,
 		.bridges = bridges,
@@ -107,34 +128,65 @@ int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
 		return 0;
 
 	ret = pci_mmcfg_walk_regions(mk_mmcfg_snapshot_region, &snapshot);
-	return ret ?: snapshot.count;
+	if (ret)
+		return ret;
+
+	list_for_each_entry(device, &instance->pci_devices, list) {
+		if (mk_mmcfg_snapshot_contains(&snapshot, device->domain,
+					       device->bus))
+			continue;
+		pr_err("Multikernel has no ECAM window for assigned PCI bus %04x:%02x\n",
+		       device->domain, device->bus);
+		return -ENOENT;
+	}
+
+	return snapshot.count;
 }
 
 static int __init x86_multikernel_pci_arch_init(void)
 {
 	const struct mk_pci_host_bridge *bridge;
+	int bridge_count = 0;
 
 	if (!root_instance || !root_instance->pci_host_bridges_valid ||
 	    !root_instance->pci_host_bridge_count) {
 		pr_err("Multikernel has no restored PCI host bridge metadata\n");
-		return 1;
+		return 0;
 	}
 	if (!list_empty(&pci_mmcfg_list)) {
 		pr_err("Multikernel PCI host bridge list was not empty before restore\n");
-		return 1;
+		return 0;
+	}
+
+	list_for_each_entry(bridge, &root_instance->pci_host_bridges, list) {
+		if (bridge->bus_start != bridge->bus_end) {
+			pr_err("Multikernel PCI root %04x:[%02x-%02x] exposes shared bridge topology\n",
+			       bridge->segment, bridge->bus_start,
+			       bridge->bus_end);
+			return 0;
+		}
+		bridge_count++;
+	}
+	if (bridge_count != root_instance->pci_host_bridge_count) {
+		pr_err("Multikernel PCI root count mismatch: expected %d, restored %d\n",
+		       root_instance->pci_host_bridge_count, bridge_count);
+		return 0;
 	}
 
 	list_for_each_entry(bridge, &root_instance->pci_host_bridges, list) {
 		if (!pci_mmconfig_add(bridge->segment, bridge->bus_start,
-				      bridge->bus_end, bridge->ecam_base))
-			return 1;
-		pr_notice("Multikernel restored ECAM segment %04x [bus %02x-%02x] base %#llx\n",
-			  bridge->segment, bridge->bus_start, bridge->bus_end,
+				      bridge->bus_end, bridge->ecam_base)) {
+			pr_err("Multikernel failed to register synthetic PCI root %04x:%02x\n",
+			       bridge->segment, bridge->bus_start);
+			return 0;
+		}
+		pr_notice("Multikernel restored synthetic PCI root %04x:%02x ECAM base %#llx\n",
+			  bridge->segment, bridge->bus_start,
 			  (unsigned long long)bridge->ecam_base);
 	}
 	if (!pci_mmcfg_arch_init()) {
 		pr_err("Multikernel failed to map restored PCI ECAM windows\n");
-		return 1;
+		return 0;
 	}
 
 	raw_pci_ops = &pci_mmcfg;
@@ -142,8 +194,68 @@ static int __init x86_multikernel_pci_arch_init(void)
 	mk_pci_native_ops = pci_root_ops;
 	pci_root_ops.read = mk_pci_read;
 	pci_root_ops.write = mk_pci_write;
+	mk_pci_roots_ready = true;
 	pr_notice("Multikernel selected ECAM for PCI config access\n");
 
+	return 0;
+}
+
+static int __init mk_pci_scan_root(const struct mk_pci_host_bridge *bridge)
+{
+	struct pci_sysdata *sd;
+	struct pci_bus *bus;
+	LIST_HEAD(resources);
+
+	if (bridge->segment && !pci_domains_supported) {
+		pr_err("Multikernel cannot scan PCI root %04x:%02x without domain support\n",
+		       bridge->segment, bridge->bus_start);
+		return -EOPNOTSUPP;
+	}
+	if (pci_find_bus(bridge->segment, bridge->bus_start)) {
+		pr_err("Multikernel PCI root %04x:%02x already exists\n",
+		       bridge->segment, bridge->bus_start);
+		return -EEXIST;
+	}
+
+	sd = kzalloc(sizeof(*sd), GFP_KERNEL);
+	if (!sd)
+		return -ENOMEM;
+	sd->domain = bridge->segment;
+	sd->node = x86_pci_root_bus_node(bridge->bus_start);
+	x86_pci_root_bus_resources(bridge->bus_start, &resources);
+	bus = pci_scan_root_bus(NULL, bridge->bus_start, &pci_root_ops, sd,
+				&resources);
+	if (!bus) {
+		pci_free_resource_list(&resources);
+		kfree(sd);
+		return -ENOMEM;
+	}
+	pci_bus_add_devices(bus);
+	pr_notice("Multikernel scanned synthetic PCI root %04x:%02x\n",
+		  bridge->segment, bridge->bus_start);
+	return 0;
+}
+
+static int __init x86_multikernel_pci_init(void)
+{
+	const struct mk_pci_host_bridge *bridge;
+	int ret;
+
+	if (!root_instance)
+		panic("Multikernel lost restored instance metadata");
+	if (!root_instance->pci_device_count)
+		return 0;
+	if (!root_instance->pci_devices_valid || !mk_pci_roots_ready)
+		panic("Multikernel synthetic PCI roots are unavailable");
+
+	list_for_each_entry(bridge, &root_instance->pci_host_bridges, list) {
+		ret = mk_pci_scan_root(bridge);
+		if (ret)
+			panic("Multikernel failed to scan synthetic PCI root %04x:%02x: %d",
+			      bridge->segment, bridge->bus_start, ret);
+	}
+
+	/* Suppress legacy bus 0 probing after every assigned root is present. */
 	return 0;
 }
 #else
@@ -157,7 +269,12 @@ int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
 static int __init x86_multikernel_pci_arch_init(void)
 {
 	pr_err("Multikernel PCI requires CONFIG_PCI_MMCONFIG\n");
-	return 1;
+	return 0;
+}
+
+static int __init x86_multikernel_pci_init(void)
+{
+	return 0;
 }
 #endif
 
@@ -165,5 +282,5 @@ void __init x86_multikernel_pci_platform_init(void)
 {
 	pci_probe = PCI_PROBE_MMCONF | PCI_PROBE_NOEARLY;
 	x86_init.pci.arch_init = x86_multikernel_pci_arch_init;
-	x86_init.pci.init = pci_legacy_init;
+	x86_init.pci.init = x86_multikernel_pci_init;
 }
