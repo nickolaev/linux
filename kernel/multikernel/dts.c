@@ -21,6 +21,7 @@
 #include <linux/sizes.h>
 #include <linux/cpumask.h>
 #include <linux/multikernel.h>
+#include <asm/multikernel.h>
 
 #include "internal.h"
 

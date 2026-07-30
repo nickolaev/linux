@@ -439,9 +439,6 @@ struct mk_pci_host_bridge {
 };
 
 #define MK_MAX_PCI_HOST_BRIDGES 16
-int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
-				      struct mk_pci_host_bridge *bridges,
-				      size_t capacity);
 
 /**
  * Platform device specification

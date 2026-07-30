@@ -171,6 +171,7 @@ void __init x86_early_init_platform_quirks(void)
 		break;
 	case X86_SUBARCH_MULTIKERNEL:
 		multikernel_setup_calibration();
+		x86_multikernel_pci_platform_init();
 		x86_platform.legacy.devices.pnpbios = 0;
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		x86_platform.legacy.rtc = 0;

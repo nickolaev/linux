@@ -190,6 +190,10 @@ extern struct pci_mmcfg_region *__init pci_mmconfig_add(int segment, int start,
 
 extern struct list_head pci_mmcfg_list;
 
+typedef int (*pci_mmcfg_region_cb)(const struct pci_mmcfg_region *region,
+				   void *data);
+int pci_mmcfg_walk_regions(pci_mmcfg_region_cb callback, void *data);
+
 #define PCI_MMCFG_BUS_OFFSET(bus)      ((bus) << 20)
 
 /*
