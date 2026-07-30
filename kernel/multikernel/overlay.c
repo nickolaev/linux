@@ -1300,8 +1300,24 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx, const void *fdt)
 
 	for (i = 0; i < nr; i++) {
 		ret = mk_overlay_apply_fragment(tx, fdt, frags[i].node);
-		if (ret)
+		if (ret) {
+			int rollback_ret;
+
+			/*
+			 * A later fragment may depend on state created by an earlier
+			 * one.  Undo every completed fragment before reporting the
+			 * transaction failure so the visible state stays atomic.
+			 */
+			while (--i >= 0) {
+				rollback_ret =
+					mk_overlay_rollback_fragment(tx, fdt,
+								     frags[i].node);
+				if (rollback_ret)
+					pr_err("Overlay tx%d: failed to undo fragment@%x: %d\n",
+					       tx->id, frags[i].unit, rollback_ret);
+			}
 			break;
+		}
 	}
 
 	kfree(frags);
