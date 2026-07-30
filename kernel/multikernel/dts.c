@@ -140,26 +140,45 @@ int mk_pci_host_bridges_clone(struct list_head *dst, int *dst_count,
 {
 	const struct mk_pci_host_bridge *src_bridge;
 	struct mk_pci_host_bridge *dst_bridge;
+	int ret = -EINVAL;
 
 	mk_pci_host_bridges_free(dst, dst_count, dst_valid);
-	if (!src_valid || src_count == 0)
+	if (src_count < 0)
+		return -EINVAL;
+	if (!src_valid) {
+		if (src_count || !list_empty(src))
+			return -EINVAL;
 		return 0;
+	}
+	if (!src_count) {
+		if (!list_empty(src))
+			return -EINVAL;
+		return 0;
+	}
+	if (list_empty(src))
+		return -EINVAL;
 
 	*dst_valid = true;
 	list_for_each_entry(src_bridge, src, list) {
-		dst_bridge = kmemdup(src_bridge, sizeof(*dst_bridge), GFP_KERNEL);
+		dst_bridge = kmemdup(src_bridge, sizeof(*dst_bridge),
+				     GFP_KERNEL);
 		if (!dst_bridge) {
-			mk_pci_host_bridges_free(dst, dst_count, dst_valid);
-			return -ENOMEM;
+			ret = -ENOMEM;
+			goto error;
 		}
 		INIT_LIST_HEAD(&dst_bridge->list);
 		list_add_tail(&dst_bridge->list, dst);
 		(*dst_count)++;
 	}
 
+	if (*dst_count != src_count)
+		goto error;
 	return 0;
-}
 
+error:
+	mk_pci_host_bridges_free(dst, dst_count, dst_valid);
+	return ret;
+}
 int mk_dt_parse_pci_host_bridges(const void *fdt, int resources_node,
 				 struct list_head *bridges, int *count,
 				 bool *valid)

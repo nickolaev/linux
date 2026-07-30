@@ -11,6 +11,7 @@
 #include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/multikernel.h>
+#include "internal.h"
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg {
@@ -191,8 +192,9 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
  *
  * Returns 0 on success, negative error code on failure
  */
-int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
-		    void *payload, u32 payload_len)
+static int __mk_send_message(struct mk_instance *instance, int instance_id,
+			     u32 msg_type, u32 subtype, void *payload,
+			     u32 payload_len)
 {
 	struct mk_message *msg;
 	size_t total_size;
@@ -224,7 +226,11 @@ int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		memcpy(msg->payload, payload, payload_len);
 
 	/* Send via IPI using the message type as IPI type */
-	ret = multikernel_send_ipi_data(instance_id, msg, total_size, msg_type);
+	if (instance)
+		ret = mk_send_ipi_data(instance, msg, total_size, msg_type);
+	else
+		ret = multikernel_send_ipi_data(instance_id, msg, total_size,
+						msg_type);
 
 	/* Clean up temporary buffer */
 	kfree(msg);
@@ -238,6 +244,22 @@ int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		 msg_type, subtype, payload_len, instance_id);
 
 	return 0;
+}
+
+int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
+				u32 subtype, void *payload, u32 payload_len)
+{
+	if (!instance)
+		return -EINVAL;
+	return __mk_send_message(instance, instance->id, msg_type, subtype,
+				 payload, payload_len);
+}
+
+int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
+		    void *payload, u32 payload_len)
+{
+	return __mk_send_message(NULL, instance_id, msg_type, subtype, payload,
+				 payload_len);
 }
 EXPORT_SYMBOL(mk_send_message);
 

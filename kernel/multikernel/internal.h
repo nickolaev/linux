@@ -5,6 +5,13 @@ extern struct idr mk_instance_idr;
 extern struct list_head mk_instance_list;
 extern struct mk_instance *root_instance;
 
+/* ipi.c */
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type);
+/* messaging.c */
+int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
+				u32 subtype, void *payload, u32 payload_len);
+
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
 extern struct kernfs_node *mk_instances_kn;
@@ -12,6 +19,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 				      int resources_node, size_t dtb_size);
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
+int mk_instance_release_resources(struct mk_instance *instance);
 
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,
@@ -26,6 +34,31 @@ int mk_pci_host_bridges_clone(struct list_head *dst, int *dst_count,
 				 int src_count, bool src_valid);
 void mk_pci_host_bridges_free(struct list_head *bridges, int *count,
 			      bool *valid);
+
+/* CPU ownership serialization: transaction must be acquired before ownership. */
+void mk_cpu_transaction_lock(void);
+void mk_cpu_transaction_unlock(void);
+void mk_cpu_ownership_lock(void);
+void mk_cpu_ownership_unlock(void);
+void mk_cpu_ownership_assert_held(void);
+
+/* pci.c */
+int mk_pci_lease_system_init(void);
+void mk_pci_lease_system_cleanup(void);
+void mk_pci_lease_instance_init(struct mk_instance *instance);
+bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance);
+int mk_pci_assign_devices(struct mk_instance *instance,
+			  const struct list_head *requested_devices,
+			  int requested_count);
+int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			 u8 devfn);
+int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			   u8 devfn);
+int mk_pci_release_assignments(struct mk_instance *instance);
+
+/* Caller must hold instance->resource_mutex. */
+void mk_pci_quiesce_instance_irqs(struct mk_instance *instance);
+int mk_instance_force_halt(struct mk_instance *instance);
 
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;

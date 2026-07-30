@@ -10,6 +10,7 @@
 #include <linux/kobject.h>
 #include <linux/kernfs.h>
 #include <linux/ioport.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
@@ -534,6 +535,8 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Serializes memory topology changes with PCI assignment leases. */
+	struct mutex resource_mutex;
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -549,6 +552,8 @@ struct mk_instance {
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+	/* Host-only live PCI assignment leases (private elements). */
+	struct list_head pci_assignments;
 
 	/* PCI host bridge metadata (descriptive, never transferred) */
 	struct list_head pci_host_bridges;
@@ -742,14 +747,14 @@ struct mk_instance *mk_instance_get(struct mk_instance *instance);
 void __noreturn mk_halt_to_pool(void);
 
 /**
- * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
- * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory size and CPU assignment
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
+ * @instance: Empty instance to populate
+ * @config: Parsed memory, CPU, PCI, and platform resource configuration
  *
- * Allocates the specified memory size from the multikernel pool, creates
- * memory regions, and copies CPU assignment.
+ * Reserves every configured resource class or returns all resources acquired
+ * by the attempt. A failure never leaves a partially populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 				  const struct mk_dt_config *config);
@@ -840,6 +845,7 @@ void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+int mk_pci_prepare_instance_start(struct mk_instance *instance);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {

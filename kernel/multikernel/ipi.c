@@ -149,7 +149,7 @@ EXPORT_SYMBOL(multikernel_unregister_handler);
 
 /**
  * multikernel_send_ipi_data - Send data to another CPU via IPI
- * @instance_id: Target multikernel instance ID
+ * @instance: Target multikernel instance
  * @data: Pointer to data to send
  * @data_size: Size of data
  * @type: User-defined type identifier
@@ -159,25 +159,24 @@ EXPORT_SYMBOL(multikernel_unregister_handler);
  *
  * Returns 0 on success, negative error code on failure
  */
-int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, unsigned long type)
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type)
 {
 	struct mk_ipi_data *slot;
-	struct mk_instance *instance = mk_instance_find(instance_id);
 	struct mk_ipi_ring *ring;
 	mk_phys_cpu_t target;
+	int instance_id;
 	int ret;
 
 	if (!instance)
 		return -EINVAL;
-	if (data_size > MK_MAX_DATA_SIZE) {
-		mk_instance_put(instance);
+	instance_id = instance->id;
+	if (data_size > MK_MAX_DATA_SIZE)
 		return -EINVAL;
-	}
 
 	target = mk_cpu_set_first(instance->cpus);
 	if (target == MK_PHYS_CPU_INVALID) {
 		pr_err("Instance %d has no CPUs to receive the IPI\n", instance_id);
-		mk_instance_put(instance);
 		return -ENODEV;
 	}
 
@@ -196,7 +195,6 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 	if (!instance->ipi_data) {
 		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
-		mk_instance_put(instance);
 		return -ENODEV;
 	}
 
@@ -212,7 +210,6 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		printk_deferred(KERN_WARNING
 				"multikernel: IPI ring full for instance %d\n",
 				instance_id);
-		mk_instance_put(instance);
 		return ret;
 	}
 
@@ -227,8 +224,21 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 	atomic_set_release(&slot->state, MK_IPI_SLOT_READY);
 	mk_arch_send_ipi(target);
 
-	mk_instance_put(instance);
 	return 0;
+}
+
+int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,
+			      unsigned long type)
+{
+	struct mk_instance *instance;
+	int ret;
+
+	instance = mk_instance_find(instance_id);
+	if (!instance)
+		return -EINVAL;
+	ret = mk_send_ipi_data(instance, data, data_size, type);
+	mk_instance_put(instance);
+	return ret;
 }
 
 static void mk_ipi_drain_ring(void)
