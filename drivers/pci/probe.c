@@ -22,9 +22,7 @@
 #include <linux/irqdomain.h>
 #include <linux/pm_runtime.h>
 #include <linux/bitfield.h>
-#ifdef CONFIG_MULTIKERNEL
 #include <linux/multikernel.h>
-#endif
 #include "pci.h"
 
 #define CARDBUS_LATENCY_TIMER	176	/* secondary latency timer */
