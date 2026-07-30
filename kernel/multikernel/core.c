@@ -82,13 +82,13 @@ cleanup:
 
 static void mk_instance_return_platform_devices(struct mk_instance *instance)
 {
-	struct mk_platform_device *plat_dev, *plat_tmp;
-	int returned_count = 0;
+	struct mk_platform_device *device, *tmp;
+	int returned = 0;
 
-	if (!instance || !instance->platform_devices_valid)
+	if (!instance || instance == root_instance || instance->id == 0)
 		return;
-
-	if (instance == root_instance || instance->id == 0)
+	if (!instance->platform_devices_valid &&
+	    list_empty(&instance->platform_devices))
 		return;
 
 	if (!root_instance) {
@@ -97,60 +97,65 @@ static void mk_instance_return_platform_devices(struct mk_instance *instance)
 		goto cleanup;
 	}
 
-	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
-		struct mk_platform_device *root_dev;
-
-		root_dev = kzalloc(sizeof(*root_dev), GFP_KERNEL);
-		if (!root_dev) {
-			pr_warn("Failed to allocate platform device entry for root instance\n");
-			continue;
-		}
-
-		*root_dev = *plat_dev;
-		INIT_LIST_HEAD(&root_dev->list);
-
-		list_add_tail(&root_dev->list, &root_instance->platform_devices);
+	list_for_each_entry_safe(device, tmp, &instance->platform_devices,
+				 list) {
+		list_move_tail(&device->list,
+			       &root_instance->platform_devices);
 		root_instance->platform_device_count++;
 		root_instance->platform_devices_valid = true;
-
-		pr_debug("Returned platform device '%s' from instance %d to root\n",
-			 root_dev->name, instance->id);
-
-		returned_count++;
+		returned++;
 	}
 
-	if (returned_count > 0) {
+	if (returned)
 		pr_info("Returned %d platform devices from instance %d (%s) to root instance\n",
-			returned_count, instance->id, instance->name);
-	}
+			returned, instance->id, instance->name);
 
 cleanup:
-	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
-		list_del(&plat_dev->list);
-		kfree(plat_dev);
+	list_for_each_entry_safe(device, tmp, &instance->platform_devices,
+				 list) {
+		list_del(&device->list);
+		kfree(device);
 	}
 	instance->platform_device_count = 0;
 	instance->platform_devices_valid = false;
 }
 
+int mk_instance_release_resources(struct mk_instance *instance)
+{
+	const char *failed_resource;
+	int ret;
+
+	if (!instance || instance == root_instance || instance->id == 0)
+		return 0;
+
+	ret = mk_instance_return_pci_devices(instance);
+	if (ret)
+		return ret;
+	mk_instance_return_platform_devices(instance);
+	mk_instance_return_all_cpus(instance);
+	mk_instance_free_memory(instance);
+	return 0;
+}
+
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	int ret;
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
 		instance->id, instance->name);
 
-	mk_instance_return_all_cpus(instance);
-	mk_instance_return_pci_devices(instance);
-	mk_instance_return_platform_devices(instance);
-	mk_instance_free_memory(instance);
-
+	ret = mk_instance_release_resources(instance);
+	if (WARN_ON_ONCE(ret)) {
+		pr_crit("Retaining multikernel instance %d (%s) after resource release failed: %d\n",
+			instance->id, instance->name, ret);
+		return;
+	}
 	mk_cpu_set_free(instance->cpus);
 	kfree(instance->dtb_data);
 	kfree(instance->name);
 	kfree(instance);
 }
-
 /**
  * Instance reference counting
  */
@@ -471,9 +476,9 @@ static int mk_instance_reserve_cpus(struct mk_instance *instance,
 				    const struct mk_dt_config *config)
 {
 	if (!config->cpus) {
-		pr_warn("No CPU configuration for instance %d (%s)\n",
-			instance->id, instance->name);
-		return 0;
+		pr_err("No CPU configuration for instance %d (%s)\n",
+		       instance->id, instance->name);
+		return -ENOMEM;
 	}
 
 	return mk_instance_transfer_cpus(instance, config->cpus);
@@ -561,13 +566,25 @@ static int mk_instance_transfer_pci_devices(struct mk_instance *instance,
 static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 					   const struct mk_dt_config *config)
 {
-	if (!config->pci_devices_valid || config->pci_device_count == 0) {
+	if (!config->pci_devices_valid) {
+		if (config->pci_device_count ||
+		    !list_empty(&config->pci_devices))
+			return -EINVAL;
+		instance->pci_devices_valid = true;
+		return 0;
+	}
+
+	if (!config->pci_device_count) {
+		if (!list_empty(&config->pci_devices))
+			return -EINVAL;
 		instance->pci_devices_valid = true;
 		instance->pci_device_count = 0;
 		pr_debug("No PCI devices to reserve for instance %d (%s)\n",
 			 instance->id, instance->name);
 		return 0;
 	}
+	if (list_empty(&config->pci_devices))
+		return -EINVAL;
 
 	return mk_instance_transfer_pci_devices(instance,
 						&config->pci_devices,
@@ -575,86 +592,111 @@ static int mk_instance_reserve_pci_devices(struct mk_instance *instance,
 }
 
 static int mk_instance_transfer_platform_devices(struct mk_instance *instance,
-						 const struct list_head *requested_devices,
-						 int requested_count)
+				 const struct list_head *requested_devices,
+				 int requested_count)
 {
-	struct mk_platform_device *req_dev, *root_dev, *tmp;
+	struct mk_platform_device *requested, *other, *root_device;
+	int actual_count = 0;
 	int transferred = 0;
-	int not_found = 0;
-	bool found;
 
 	if (!root_instance || !root_instance->platform_devices_valid) {
 		pr_err("No root instance or platform devices not initialized\n");
 		return -EINVAL;
 	}
+	if (requested_count <= 0 || list_empty(requested_devices))
+		return -EINVAL;
 
-	if (requested_count == 0 || list_empty(requested_devices)) {
-		pr_info("No platform devices requested for instance %d (%s)\n",
-			instance->id, instance->name);
+	list_for_each_entry(requested, requested_devices, list) {
+		actual_count++;
+		list_for_each_entry(other, requested_devices, list) {
+			if (other == requested)
+				break;
+			if (!strcmp(other->name, requested->name)) {
+				pr_err("Platform device %s is requested more than once\n",
+				       requested->name);
+				return -EINVAL;
+			}
+		}
+
+		root_device = NULL;
+		list_for_each_entry(other, &root_instance->platform_devices,
+				    list) {
+			if (!strcmp(other->name, requested->name)) {
+				root_device = other;
+				break;
+			}
+		}
+		if (!root_device) {
+			pr_err("Platform device %s not available in root pool\n",
+			       requested->name);
+			return -ENOENT;
+		}
+	}
+
+	if (actual_count != requested_count) {
+		pr_err("Platform device count mismatch: metadata=%d list=%d\n",
+		       requested_count, actual_count);
+		return -EINVAL;
+	}
+
+	list_for_each_entry(requested, requested_devices, list) {
+		root_device = NULL;
+		list_for_each_entry(other, &root_instance->platform_devices,
+				    list) {
+			if (!strcmp(other->name, requested->name)) {
+				root_device = other;
+				break;
+			}
+		}
+		if (!root_device)
+			goto rollback;
+
+		list_move_tail(&root_device->list,
+			       &instance->platform_devices);
+		root_instance->platform_device_count--;
+		instance->platform_device_count++;
+		transferred++;
+	}
+
+	instance->platform_devices_valid = true;
+	pr_info("Transferred %d platform devices from root to instance %d (%s)\n",
+		transferred, instance->id, instance->name);
+	return 0;
+
+rollback:
+	pr_err("Platform inventory changed during reservation for instance %d\n",
+	       instance->id);
+	mk_instance_return_platform_devices(instance);
+	return -EIO;
+}
+
+static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
+				 const struct mk_dt_config *config)
+{
+	if (!config->platform_devices_valid) {
+		if (config->platform_device_count ||
+		    !list_empty(&config->platform_devices))
+			return -EINVAL;
 		instance->platform_devices_valid = true;
 		return 0;
 	}
 
-	list_for_each_entry(req_dev, requested_devices, list) {
-		found = false;
-		list_for_each_entry(root_dev, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
-				found = true;
-				break;
-			}
-		}
-		if (!found) {
-			pr_err("Platform device '%s' not available in root pool\n",
-			       req_dev->name);
-			not_found++;
-		}
-	}
-
-	if (not_found > 0) {
-		pr_err("Instance %d (%s): %d platform devices not available\n",
-		       instance->id, instance->name, not_found);
-		return -ENOENT;
-	}
-
-	list_for_each_entry(req_dev, requested_devices, list) {
-		list_for_each_entry_safe(root_dev, tmp, &root_instance->platform_devices, list) {
-			if (strcmp(root_dev->name, req_dev->name) == 0) {
-				list_del(&root_dev->list);
-				list_add_tail(&root_dev->list, &instance->platform_devices);
-				root_instance->platform_device_count--;
-				instance->platform_device_count++;
-				transferred++;
-
-				pr_debug("Transferred platform device '%s' to instance %d\n",
-					 root_dev->name, instance->id);
-				break;
-			}
-		}
-	}
-
-	instance->platform_devices_valid = true;
-	pr_info("Transferred %d platform devices from root to instance %d (%s), root pool remaining: %d devices\n",
-		transferred, instance->id, instance->name, root_instance->platform_device_count);
-
-	return 0;
-}
-
-static int mk_instance_reserve_platform_devices(struct mk_instance *instance,
-						const struct mk_dt_config *config)
-{
-	if (!config->platform_devices_valid || config->platform_device_count == 0) {
+	if (!config->platform_device_count) {
+		if (!list_empty(&config->platform_devices))
+			return -EINVAL;
 		instance->platform_devices_valid = true;
 		instance->platform_device_count = 0;
 		pr_debug("No platform devices to reserve for instance %d (%s)\n",
 			 instance->id, instance->name);
 		return 0;
 	}
+	if (list_empty(&config->platform_devices))
+		return -EINVAL;
 
 	return mk_instance_transfer_platform_devices(instance,
 						     &config->platform_devices,
 						     config->platform_device_count);
 }
-
 /**
  * mk_instance_add_pci_device - Add a single PCI device to an instance
  * @instance: Target instance
@@ -963,67 +1005,72 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		 instance->id, instance->name);
 }
 
+static bool mk_instance_resources_empty(const struct mk_instance *instance)
+{
+	return list_empty(&instance->memory_regions) &&
+	       !instance->instance_pool && !instance->region_count &&
+	       mk_cpu_set_empty(instance->cpus) &&
+	       list_empty(&instance->pci_devices) &&
+	       list_empty(&instance->pci_assignments) &&
+	       !instance->pci_device_count &&
+	       list_empty(&instance->platform_devices) &&
+	       !instance->platform_device_count;
+}
+
 /**
- * mk_instance_reserve_resources() - Reserve memory and CPU resources for an instance
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
  * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory regions and CPU assignment
+ * @config: Parsed resource configuration
  *
- * Reserves all memory regions specified in the device tree configuration,
- * makes them children of the main multikernel_res, and copies CPU assignment.
+ * Each resource class is acquired only after the preceding class succeeds.
+ * Any error returns every acquired resource to the root instance in reverse
+ * order, so callers never observe a partially populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 			       const struct mk_dt_config *config)
 {
 	int ret;
 
-	if (!config || !instance) {
+	if (!config || !instance || !instance->cpus) {
 		pr_err("Invalid parameters to mk_instance_reserve_resources\n");
 		return -EINVAL;
 	}
+	if (!mk_instance_resources_empty(instance)) {
+		pr_err("Instance %d (%s) already owns resources\n",
+		       instance->id, instance->name);
+		return -EBUSY;
+	}
 
-	/* Free any existing memory regions first */
-	mk_instance_free_memory(instance);
-
-	/* Reserve memory regions */
+	failed_resource = "memory";
 	ret = mk_instance_reserve_memory(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve memory regions for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		return ret;
-	}
+	if (ret)
+		goto rollback;
 
-	/* Reserve CPU resources */
+	failed_resource = "CPU";
 	ret = mk_instance_reserve_cpus(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve CPU resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for CPU reservation failure */
-		pr_warn("Continuing without CPU assignment\n");
-	}
+	if (ret)
+		goto rollback;
 
-	/* Reserve PCI device resources */
-	ret = mk_instance_reserve_pci_devices(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve PCI device resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for PCI reservation failure */
-		pr_warn("Continuing without PCI device assignment\n");
-	}
-
-	/* Reserve platform device resources */
+	failed_resource = "platform device";
 	ret = mk_instance_reserve_platform_devices(instance, config);
-	if (ret) {
-		pr_err("Failed to reserve platform device resources for instance %d (%s): %d\n",
-		       instance->id, instance->name, ret);
-		/* Don't fail the whole operation for platform reservation failure */
-		pr_warn("Continuing without platform device assignment\n");
-	}
+	if (ret)
+		goto rollback;
+
+	failed_resource = "PCI device";
+	ret = mk_instance_reserve_pci_devices(instance, config);
+	if (ret)
+		goto rollback;
 
 	return 0;
-}
 
+rollback:
+	pr_err("Failed to reserve %s resources for instance %d (%s): %d\n",
+	       failed_resource, instance->id, instance->name, ret);
+	mk_instance_release_resources(instance);
+	return ret;
+}
 /**
  * Per-instance memory pool management
  */
