@@ -337,7 +337,7 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 	kfree(instance->dtb_data);
 	instance->dtb_data = NULL;
 err_free_resources:
-	mk_instance_free_memory(instance);
+	mk_instance_release_resources(instance);
 err_free_idr:
 	idr_remove(&mk_instance_idr, instance->id);
 err_remove_dir:
