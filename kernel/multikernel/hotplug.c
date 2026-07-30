@@ -1304,117 +1304,66 @@ out:
 }
 
 /**
- * mk_send_device_add - Add PCI device to instance and wait for completion
+ * mk_send_device_add - Assign a PCI device to an instance
  * @instance_id: Target instance ID
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
- * @driver_override: Target driver name for binding (can be NULL)
- * @flags: Additional flags
+ * @driver_override: Target driver name for a root-kernel add
+ * @flags: Additional root-kernel add flags
  *
- * For local instance, executes addition synchronously.
- * For remote instance, sends IPI and waits for ACK response.
- * For instances that are not yet running (MK_STATE_READY/LOADED),
- * adds device to instance's device list.
+ * Remote assignment changes are permitted only while the target instance is
+ * ready. Active instances must be stopped and returned to ready state first.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		       const char *driver_override, u32 flags)
 {
-	struct mk_device_resource_payload payload = {
-		.domain = domain,
-		.bus = bus,
-		.devfn = devfn,
-		.flags = flags,
-		.sender_instance_id = root_instance->id
-	};
-	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
-	u32 resource_id;
 
-	if (driver_override)
-		strscpy(payload.driver_override, driver_override, sizeof(payload.driver_override));
-	else
-		payload.driver_override[0] = '\0';
-
-	resource_id = (domain << 16) | (bus << 8) | devfn;
-
+	if (!root_instance)
+		return -ENODEV;
 	if (instance_id == root_instance->id)
-		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
+		return mk_do_device_add(domain, bus, devfn, driver_override,
+					flags);
 
 	target_instance = mk_instance_find(instance_id);
 	if (!target_instance)
 		return -ENODEV;
 
-	if (target_instance->state != MK_STATE_ACTIVE) {
-		ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
-		goto out;
+	if (target_instance->state != MK_STATE_READY) {
+		pr_err("PCI assignment changes require instance %d to be ready\n",
+		       instance_id);
+		ret = -EBUSY;
+	} else {
+		ret = mk_instance_add_pci_device(target_instance, domain, bus,
+						 devfn);
 	}
-
-	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
-	if (!pending) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_ADD,
-			      &payload, sizeof(payload));
-	if (ret < 0) {
-		mk_msg_pending_wait(pending, 0);
-		goto out;
-	}
-
-	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
-		goto out;
-
-	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
-	if (ret < 0) {
-		pr_warn("Device added to target but failed to update tracking: %d\n", ret);
-	}
-
-	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
-		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
-
-	ret = 0;
-out:
 	mk_instance_put(target_instance);
 	return ret;
 }
 
 /**
- * mk_send_device_remove - Remove PCI device from instance and wait for completion
+ * mk_send_device_remove - Release a PCI device from an instance
  * @instance_id: Target instance ID
  * @domain: PCI domain
  * @bus: PCI bus
  * @devfn: PCI device and function (combined)
  *
- * For local instance, executes removal synchronously.
- * For remote instance, sends IPI and waits for ACK response.
- * For instances that are not yet running (MK_STATE_READY/LOADED),
- * removes device from instance's device list.
+ * Remote assignment changes are permitted only while the target instance is
+ * ready. Active instances must be stopped and returned to ready state first.
  *
  * Returns: 0 on success, negative error code on failure
  */
 int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 {
-	struct mk_device_resource_payload payload = {
-		.domain = domain,
-		.bus = bus,
-		.devfn = devfn,
-		.flags = 0,
-		.sender_instance_id = root_instance->id
-	};
-	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
 	int ret;
-	u32 resource_id;
 
-	payload.driver_override[0] = '\0';
-	resource_id = (domain << 16) | (bus << 8) | devfn;
-
+	if (!root_instance)
+		return -ENODEV;
 	if (instance_id == root_instance->id)
 		return mk_do_device_remove(domain, bus, devfn);
 
@@ -1422,38 +1371,14 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	if (!target_instance)
 		return -ENODEV;
 
-	if (target_instance->state != MK_STATE_ACTIVE) {
-		ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
-		goto out;
+	if (target_instance->state != MK_STATE_READY) {
+		pr_err("PCI assignment changes require instance %d to be ready\n",
+		       instance_id);
+		ret = -EBUSY;
+	} else {
+		ret = mk_instance_remove_pci_device(target_instance, domain, bus,
+						    devfn);
 	}
-
-	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE, resource_id);
-	if (!pending) {
-		ret = -ENOMEM;
-		goto out;
-	}
-
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_REMOVE,
-			      &payload, sizeof(payload));
-	if (ret < 0) {
-		mk_msg_pending_wait(pending, 0);
-		goto out;
-	}
-
-	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
-		goto out;
-
-	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
-	if (ret < 0) {
-		pr_warn("Device removed from target but failed to update tracking: %d\n", ret);
-	}
-
-	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully removed from instance %d\n",
-		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
-
-	ret = 0;
-out:
 	mk_instance_put(target_instance);
 	return ret;
 }

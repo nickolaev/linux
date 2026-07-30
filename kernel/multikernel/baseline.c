@@ -493,54 +493,54 @@ static int mk_baseline_initialize_devices(const struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev;
 	struct pci_dev *dev;
-	int failed = 0, unbound = 0;
+	int failed = 0;
+	int available = 0;
 
-	if (instance->pci_device_count == 0) {
-		pr_debug("No PCI devices in baseline to unbind\n");
+	if (!instance->pci_device_count) {
+		pr_debug("No PCI devices in the multikernel pool\n");
 		return 0;
 	}
 
-	pr_info("Unbinding %d PCI devices for multikernel pool\n",
+	pr_info("Validating %d PCI devices for the multikernel pool\n",
 		instance->pci_device_count);
 
+	pci_lock_rescan_remove();
 	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		dev = pci_get_domain_bus_and_slot(pci_dev->domain, pci_dev->bus,
-						  PCI_DEVFN(pci_dev->slot, pci_dev->func));
+		dev = pci_get_domain_bus_and_slot(pci_dev->domain,
+						  pci_dev->bus,
+						  PCI_DEVFN(pci_dev->slot,
+							    pci_dev->func));
 		if (!dev) {
 			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not found in system\n",
-				pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				pci_dev->bus, pci_dev->slot, pci_dev->func);
+				pci_dev->vendor, pci_dev->device,
+				pci_dev->domain, pci_dev->bus,
+				pci_dev->slot, pci_dev->func);
 			failed++;
 			continue;
 		}
 
-		if (!dev->driver) {
-			pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x already unbound\n",
-				 pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				 pci_dev->bus, pci_dev->slot, pci_dev->func);
-			pci_dev_put(dev);
-			unbound++;
-			continue;
+		if (dev->vendor != pci_dev->vendor ||
+		    dev->device != pci_dev->device ||
+		    pci_dev_is_disconnected(dev) ||
+		    !pci_device_is_present(dev)) {
+			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x is not available\n",
+				pci_dev->vendor, pci_dev->device,
+				pci_dev->domain, pci_dev->bus,
+				pci_dev->slot, pci_dev->func);
+			failed++;
+		} else {
+			available++;
 		}
-
-		const char *driver_name = dev->driver->name;
-
-		device_release_driver(&dev->dev);
-
-		pr_info("Unbound PCI device %04x:%04x@%04x:%02x:%02x.%x (was: %s) for multikernel pool\n",
-			pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			pci_dev->bus, pci_dev->slot, pci_dev->func,
-			driver_name);
-
 		pci_dev_put(dev);
-		unbound++;
 	}
+	pci_unlock_rescan_remove();
 
-	if (failed > 0) {
-		pr_warn("Failed to find %d PCI devices in system\n", failed);
-	}
+	if (failed)
+		pr_warn("%d PCI devices in the multikernel pool are unavailable\n",
+			failed);
 
-	pr_info("Successfully unbound %d PCI devices for multikernel pool\n", unbound);
+	pr_info("Validated %d PCI devices; host drivers remain bound until assignment\n",
+		available);
 	return 0;
 }
 

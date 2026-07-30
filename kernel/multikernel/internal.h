@@ -27,6 +27,20 @@ int mk_pci_host_bridges_clone(struct list_head *dst, int *dst_count,
 void mk_pci_host_bridges_free(struct list_head *bridges, int *count,
 			      bool *valid);
 
+/* pci.c */
+int mk_pci_lease_system_init(void);
+void mk_pci_lease_system_cleanup(void);
+void mk_pci_lease_instance_init(struct mk_instance *instance);
+int mk_pci_assign_devices(struct mk_instance *instance,
+			  const struct list_head *requested_devices,
+			  int requested_count);
+int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			 u8 devfn);
+int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
+			   u8 devfn);
+void mk_pci_release_assignments(struct mk_instance *instance);
+int mk_instance_force_halt(struct mk_instance *instance);
+
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 int mk_overlay_init(void);
