@@ -176,7 +176,9 @@ void __init x86_early_init_platform_quirks(void)
 		 * the PIT - which belongs to the host - and then request
 		 * legacy IRQ0, which can never reach an instance CPU that
 		 * has neither a PIC nor an IO-APIC. Ticks come from the
-		 * local APIC timer via setup_percpu_clockev() instead.
+		 * local APIC timer initialized by setup_percpu_clockev().
+		 * Keeping global_clock_event unset bypasses LAPIC timer
+		 * verification, whose fallback path requires legacy IRQ0.
 		 */
 		x86_init.timers.timer_init = x86_init_noop;
 		x86_init.timers.wallclock_init = x86_init_noop;
