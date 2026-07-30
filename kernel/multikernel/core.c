@@ -122,7 +122,6 @@ cleanup:
 
 int mk_instance_release_resources(struct mk_instance *instance)
 {
-	const char *failed_resource;
 	int ret;
 
 	if (!instance || instance == root_instance || instance->id == 0)
@@ -139,7 +138,8 @@ int mk_instance_release_resources(struct mk_instance *instance)
 
 static void mk_instance_release(struct kref *kref)
 {
-	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
+	struct mk_instance *instance =
+		container_of(kref, struct mk_instance, refcount);
 	int ret;
 
 	pr_info("Releasing multikernel instance %d (%s), returning resources to root\n",
@@ -1031,6 +1031,8 @@ static bool mk_instance_resources_empty(const struct mk_instance *instance)
 int mk_instance_reserve_resources(struct mk_instance *instance,
 			       const struct mk_dt_config *config)
 {
+	const char *failed_resource;
+	int release_ret;
 	int ret;
 
 	if (!config || !instance || !instance->cpus) {
@@ -1068,7 +1070,9 @@ int mk_instance_reserve_resources(struct mk_instance *instance,
 rollback:
 	pr_err("Failed to reserve %s resources for instance %d (%s): %d\n",
 	       failed_resource, instance->id, instance->name, ret);
-	mk_instance_release_resources(instance);
+	release_ret = mk_instance_release_resources(instance);
+	if (release_ret)
+		return release_ret;
 	return ret;
 }
 /**
