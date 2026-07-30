@@ -32,6 +32,7 @@ void mk_pci_host_bridges_free(struct list_head *bridges, int *count,
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
+bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance);
 int mk_pci_assign_devices(struct mk_instance *instance,
 			  const struct list_head *requested_devices,
 			  int requested_count);
