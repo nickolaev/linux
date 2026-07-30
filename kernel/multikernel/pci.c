@@ -184,6 +184,20 @@ static struct notifier_block mk_pci_bus_notifier = {
 	.notifier_call = mk_pci_bus_notify,
 };
 
+static void
+mk_pci_release_bound_driver(struct mk_pci_assignment *assignment)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mk_pci_active_lock, flags);
+	assignment->expected_unbind = true;
+	spin_unlock_irqrestore(&mk_pci_active_lock, flags);
+	device_release_driver(&assignment->vf->dev);
+	spin_lock_irqsave(&mk_pci_active_lock, flags);
+	assignment->expected_unbind = false;
+	spin_unlock_irqrestore(&mk_pci_active_lock, flags);
+}
+
 #if IS_ENABLED(CONFIG_IOMMU_API)
 #define MK_PCI_ASSIGNMENT_DRIVER_NAME "multikernel-pci-assignment"
 
@@ -341,6 +355,43 @@ static void mk_pci_iommu_unmap_regions(struct mk_pci_assignment *assignment)
 	assignment->iommu_mapped_regions = 0;
 }
 
+static int
+mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
+{
+	struct pci_dev *vf = assignment->vf;
+	bool transactions_drained;
+	int ret;
+
+	if (!mk_pci_device_live(vf))
+		return 0;
+
+	/*
+	 * Releasing DMA ownership restores the group's default domain. Stop new
+	 * DMA first, drain requests already issued, and reset the VF while the
+	 * assignment domain still contains any stragglers.
+	 */
+	pci_clear_master(vf);
+	transactions_drained = pci_wait_for_pending_transaction(vf);
+	ret = pcie_reset_flr(vf, false);
+	if (!ret)
+		return 0;
+	if (ret == -ENOTTY && transactions_drained)
+		return 0;
+
+	if (!transactions_drained)
+		pr_err("Timed out draining DMA from assigned VF %s\n",
+		       pci_name(vf));
+	if (ret != -ENOTTY)
+		pr_err("Failed to reset assigned VF %s: %d\n",
+		       pci_name(vf), ret);
+
+	/*
+	 * Keep the assignment domain attached when the device cannot be made
+	 * safe. The lease owner can retry teardown after the instance halts.
+	 */
+	return ret == -ENOTTY ? -ETIMEDOUT : ret;
+}
+
 static void
 __mk_pci_iommu_deactivate_assignment(struct mk_pci_assignment *assignment)
 {
@@ -496,29 +547,35 @@ static int mk_pci_iommu_assignment_probe(struct pci_dev *pdev,
 static void mk_pci_iommu_assignment_remove(struct pci_dev *pdev)
 {
 	struct mk_pci_assignment *assignment = pci_get_drvdata(pdev);
+	int ret;
 
-	if (assignment && assignment->vf == pdev) {
-		mk_pci_iommu_deactivate_assignment(assignment);
+	if (!assignment || assignment->vf != pdev)
+		return;
+
+	if (READ_ONCE(assignment->expected_unbind)) {
 		pci_set_drvdata(pdev, NULL);
+		return;
 	}
+
+	ret = mk_pci_quiesce_assignment(assignment);
+	if (ret) {
+		pr_crit("Keeping IOMMU containment for %s after unsafe driver removal: %d\n",
+			pci_name(pdev), ret);
+		mk_pci_schedule_failure(assignment);
+	} else {
+		mk_pci_iommu_deactivate_assignment(assignment);
+	}
+	pci_set_drvdata(pdev, NULL);
 }
 
-static int
-mk_pci_iommu_restore_host_binding(struct mk_pci_assignment *assignment)
+static int mk_pci_restore_host_binding(struct mk_pci_assignment *assignment)
 {
 	struct pci_dev *vf = assignment->vf;
 	const char *override = assignment->host_driver_override ?: "";
-	unsigned long flags;
 	int ret = 0;
 
 	if (vf->dev.driver == &mk_pci_assignment_driver.driver) {
-		spin_lock_irqsave(&mk_pci_active_lock, flags);
-		assignment->expected_unbind = true;
-		spin_unlock_irqrestore(&mk_pci_active_lock, flags);
-		device_release_driver(&vf->dev);
-		spin_lock_irqsave(&mk_pci_active_lock, flags);
-		assignment->expected_unbind = false;
-		spin_unlock_irqrestore(&mk_pci_active_lock, flags);
+		mk_pci_release_bound_driver(assignment);
 	} else if (vf->dev.driver) {
 		pr_err("Cannot release assignment driver from %s: device is bound to %s\n",
 		       pci_name(vf), vf->dev.driver->name);
@@ -533,6 +590,24 @@ mk_pci_iommu_restore_host_binding(struct mk_pci_assignment *assignment)
 			return ret;
 		assignment->iommu_override_active = false;
 	}
+
+	mk_pci_iommu_deactivate_assignment(assignment);
+	if (assignment->host_driver && mk_pci_device_live(vf)) {
+		if (!vf->dev.driver) {
+			ret = device_driver_attach(assignment->host_driver, &vf->dev);
+			if (ret) {
+				pr_err("Failed to restore driver %s to %s: %d\n",
+				       assignment->host_driver->name,
+				       pci_name(vf), ret);
+				return ret;
+			}
+		} else if (vf->dev.driver != assignment->host_driver) {
+			pr_err("Cannot restore driver %s to %s: device is bound to %s\n",
+			       assignment->host_driver->name, pci_name(vf),
+			       vf->dev.driver->name);
+			return -EBUSY;
+		}
+	}
 	return 0;
 }
 
@@ -546,6 +621,17 @@ static void mk_pci_iommu_system_cleanup(void)
 	pci_unregister_driver(&mk_pci_assignment_driver);
 }
 #else
+static int
+mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
+{
+	return 0;
+}
+
+static void
+mk_pci_iommu_deactivate_assignment(struct mk_pci_assignment *assignment)
+{
+}
+
 static int mk_pci_iommu_prepare_assignment(struct mk_pci_assignment *assignment)
 {
 	pr_err("Cannot assign %s without CONFIG_IOMMU_API\n",
@@ -562,8 +648,7 @@ static void mk_pci_iommu_release_assignment(struct mk_pci_assignment *assignment
 {
 }
 
-static int
-mk_pci_iommu_restore_host_binding(struct mk_pci_assignment *assignment)
+static int mk_pci_restore_host_binding(struct mk_pci_assignment *assignment)
 {
 	return 0;
 }
@@ -701,15 +786,10 @@ static int mk_pci_commit_assignment(struct mk_pci_assignment *assignment)
 
 	spin_lock_irqsave(&mk_pci_active_lock, flags);
 	list_add_tail(&assignment->active_node, &mk_pci_active_assignments);
-	assignment->expected_unbind = true;
 	spin_unlock_irqrestore(&mk_pci_active_lock, flags);
 
 	if (assignment->host_driver)
-		device_release_driver(&vf->dev);
-
-	spin_lock_irqsave(&mk_pci_active_lock, flags);
-	assignment->expected_unbind = false;
-	spin_unlock_irqrestore(&mk_pci_active_lock, flags);
+		mk_pci_release_bound_driver(assignment);
 
 	if (vf->dev.driver)
 		return -EBUSY;
@@ -746,8 +826,18 @@ static int mk_pci_release_assignment(struct mk_pci_assignment *assignment)
 	struct mk_instance *instance = assignment->instance;
 	struct pci_dev *vf = assignment->vf;
 	unsigned long flags;
-	int binding_ret;
-	int ret = 0;
+	int ret;
+
+	if (!assignment->assigned)
+		goto release_resources;
+
+	ret = mk_pci_quiesce_assignment(assignment);
+	if (ret)
+		return ret;
+
+	ret = mk_pci_restore_host_binding(assignment);
+	if (ret)
+		return ret;
 
 	spin_lock_irqsave(&mk_pci_active_lock, flags);
 	if (!list_empty(&assignment->active_node))
@@ -760,27 +850,9 @@ static int mk_pci_release_assignment(struct mk_pci_assignment *assignment)
 		assignment->assigned = false;
 	}
 
+release_resources:
 	mk_pci_iommu_release_assignment(assignment);
 	cancel_work_sync(&assignment->failure_work);
-	binding_ret = mk_pci_iommu_restore_host_binding(assignment);
-	if (binding_ret)
-		ret = binding_ret;
-
-	if (!binding_ret && assignment->host_driver && mk_pci_device_live(vf)) {
-		if (!vf->dev.driver) {
-			ret = device_driver_attach(assignment->host_driver,
-						   &vf->dev);
-			if (ret)
-				pr_err("Failed to restore driver %s to %s: %d\n",
-				       assignment->host_driver->name,
-				       pci_name(vf), ret);
-		} else if (vf->dev.driver != assignment->host_driver) {
-			pr_err("Cannot restore driver %s to %s: device is bound to %s\n",
-			       assignment->host_driver->name, pci_name(vf),
-			       vf->dev.driver->name);
-			ret = -EBUSY;
-		}
-	}
 
 	if (assignment->inventory_moved && root_instance) {
 		list_move_tail(&assignment->inventory->list,
@@ -801,19 +873,28 @@ static int mk_pci_release_assignment(struct mk_pci_assignment *assignment)
 	pci_dev_put(vf);
 	kfree(assignment);
 
-	return ret;
+	return 0;
 }
 
-static void mk_pci_rollback_transaction(struct list_head *transaction)
+static int mk_pci_rollback_transaction(struct list_head *transaction)
 {
-	struct mk_pci_assignment *assignment;
+	struct mk_pci_assignment *assignment, *tmp;
+	int rollback_ret = 0;
+	int ret;
 
-	while (!list_empty(transaction)) {
-		assignment = list_last_entry(transaction,
-					     struct mk_pci_assignment,
-					     transaction_node);
-		mk_pci_release_assignment(assignment);
+	list_for_each_entry_safe_reverse(assignment, tmp, transaction,
+					 transaction_node) {
+		ret = mk_pci_release_assignment(assignment);
+		if (!ret)
+			continue;
+		pr_crit("Failed to roll back PCI assignment for %s: %d\n",
+			pci_name(assignment->vf), ret);
+		list_del_init(&assignment->transaction_node);
+		if (!rollback_ret)
+			rollback_ret = ret;
 	}
+
+	return rollback_ret;
 }
 
 static int mk_pci_commit_transaction(struct list_head *transaction)
@@ -860,6 +941,7 @@ int mk_pci_assign_devices(struct mk_instance *instance,
 	LIST_HEAD(transaction);
 	int prepared = 0;
 	int ret = 0;
+	int rollback_ret;
 
 	if (!instance || instance == root_instance || !requested_devices ||
 	    requested_count < 0)
@@ -890,7 +972,9 @@ int mk_pci_assign_devices(struct mk_instance *instance,
 	goto out;
 
 rollback:
-	mk_pci_rollback_transaction(&transaction);
+	rollback_ret = mk_pci_rollback_transaction(&transaction);
+	if (rollback_ret)
+		ret = rollback_ret;
 out:
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
@@ -904,6 +988,7 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 	struct mk_pci_device *inventory;
 	LIST_HEAD(transaction);
 	int ret;
+	int rollback_ret;
 
 	if (!instance || instance == root_instance)
 		return -EINVAL;
@@ -936,7 +1021,9 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 	goto out;
 
 rollback:
-	mk_pci_rollback_transaction(&transaction);
+	rollback_ret = mk_pci_rollback_transaction(&transaction);
+	if (rollback_ret)
+		ret = rollback_ret;
 out:
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
@@ -980,7 +1067,6 @@ int mk_pci_release_assignments(struct mk_instance *instance)
 {
 	struct mk_pci_assignment *assignment;
 	int ret = 0;
-	int release_ret;
 
 	if (!instance || instance == root_instance)
 		return 0;
@@ -992,9 +1078,12 @@ int mk_pci_release_assignments(struct mk_instance *instance)
 		assignment = list_last_entry(&instance->pci_assignments,
 					     struct mk_pci_assignment,
 					     instance_node);
-		release_ret = mk_pci_release_assignment(assignment);
-		if (release_ret && !ret)
-			ret = release_ret;
+		ret = mk_pci_release_assignment(assignment);
+		if (ret) {
+			pr_crit("Instance %d retains unsafe PCI lease for %s: %d\n",
+				instance->id, pci_name(assignment->vf), ret);
+			break;
+		}
 	}
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
