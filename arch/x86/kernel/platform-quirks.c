@@ -135,6 +135,7 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		break;
 	case X86_SUBARCH_MULTIKERNEL:
+		x86_multikernel_pci_platform_init();
 		x86_platform.legacy.devices.pnpbios = 0;
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		x86_platform.legacy.rtc = 0;
