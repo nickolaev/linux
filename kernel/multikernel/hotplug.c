@@ -645,8 +645,7 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 	}
 
 	if (driver_override && driver_override[0]) {
-		ret = driver_set_override(&pdev->dev, &pdev->driver_override,
-					  driver_override, strlen(driver_override));
+		ret = device_set_driver_override(&pdev->dev, driver_override);
 		if (ret < 0) {
 			pr_err("Multikernel hotplug: Failed to set driver override to %s: %d\n",
 			       driver_override, ret);
