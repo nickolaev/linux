@@ -792,6 +792,7 @@ void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+int mk_pci_prepare_instance_start(struct mk_instance *instance);
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
