@@ -1740,6 +1740,18 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	/*
+	 * Stop and reset every leased VF before rewriting instance memory. A
+	 * force-halted kernel may have left bus mastering enabled and DMA in
+	 * flight into the image that is about to be reused.
+	 */
+	rc = mk_pci_prepare_instance_start(instance);
+	if (rc) {
+		pr_err("Failed to prepare PCI assignments for instance %d restart: %d\n",
+		       mk_id, rc);
+		goto unlock;
+	}
+
+	/*
 	 * Booting consumes the image: the spawn kernel writes its .data and
 	 * patches its own text, so the copy in instance memory is spent once
 	 * it has run. Re-copy it from the source buffers kept at load time,

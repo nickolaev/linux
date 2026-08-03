@@ -392,6 +392,38 @@ mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
 	return ret == -ENOTTY ? -ETIMEDOUT : ret;
 }
 
+static int
+mk_pci_reset_assignment_for_start(struct mk_pci_assignment *assignment)
+{
+	struct pci_dev *vf = assignment->vf;
+	int ret;
+
+	if (!assignment->assigned || !assignment->iommu_attached)
+		return -EINVAL;
+	if (!mk_pci_device_live(vf))
+		return -ENODEV;
+
+	/*
+	 * A stopped instance may have left DMA active. Keep its restrictive
+	 * domain attached while stopping new requests, draining old ones, and
+	 * resetting device state before the instance image is reused.
+	 */
+	pci_clear_master(vf);
+	if (!pci_wait_for_pending_transaction(vf)) {
+		pr_err("Timed out draining assigned VF %s before instance restart\n",
+		       pci_name(vf));
+		return -ETIMEDOUT;
+	}
+
+	ret = pcie_reset_flr(vf, false);
+	if (ret) {
+		pr_err("Failed to reset assigned VF %s before instance restart: %d\n",
+		       pci_name(vf), ret);
+		return ret == -ENOTTY ? -EOPNOTSUPP : ret;
+	}
+	return 0;
+}
+
 static void
 __mk_pci_iommu_deactivate_assignment(struct mk_pci_assignment *assignment)
 {
@@ -622,6 +654,12 @@ static void mk_pci_iommu_system_cleanup(void)
 }
 #else
 static int
+mk_pci_reset_assignment_for_start(struct mk_pci_assignment *assignment)
+{
+	return -EOPNOTSUPP;
+}
+
+static int
 mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
 {
 	return 0;
@@ -710,6 +748,13 @@ mk_pci_prepare_assignment(struct mk_instance *instance,
 	if (!mk_pci_device_live(vf) || !mk_pci_device_live(physfn)) {
 		pci_dev_put(vf);
 		return -ENODEV;
+	}
+	ret = pcie_reset_flr(vf, true);
+	if (ret) {
+		pr_err("PCI assignment requires FLR for safe instance restart, rejecting %s\n",
+		       pci_name(vf));
+		pci_dev_put(vf);
+		return -EOPNOTSUPP;
 	}
 
 	if (pci_is_dev_assigned(vf) ||
@@ -1084,6 +1129,29 @@ int mk_pci_release_assignments(struct mk_instance *instance)
 				instance->id, pci_name(assignment->vf), ret);
 			break;
 		}
+	}
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
+}
+
+int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	struct mk_pci_assignment *assignment;
+	int ret = 0;
+
+	if (!instance || instance == root_instance)
+		return -EINVAL;
+
+	mutex_lock(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	list_for_each_entry(assignment, &instance->pci_assignments,
+			    instance_node) {
+		ret = mk_pci_reset_assignment_for_start(assignment);
+		if (ret)
+			break;
 	}
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
