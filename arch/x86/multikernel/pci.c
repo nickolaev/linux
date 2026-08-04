@@ -15,7 +15,8 @@
 #include <asm/pci_x86.h>
 #include <asm/x86_init.h>
 
-static struct pci_ops mk_pci_native_ops;
+static const struct pci_raw_ops *mk_pci_native_raw_ops;
+static const struct pci_raw_ops *mk_pci_native_raw_ext_ops;
 static bool mk_pci_roots_ready;
 #define MK_PCI_ENUM_RETRIES	3
 #define MK_PCI_ENUM_RETRY_MS	20
@@ -34,38 +35,81 @@ static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
 	return true;
 }
 
-static int mk_pci_read(struct pci_bus *bus, unsigned int devfn, int where,
-		       int size, u32 *value)
+static int mk_pci_raw_read(const struct pci_raw_ops *native,
+			   unsigned int domain, unsigned int bus,
+			   unsigned int devfn, int where, int size,
+			   u32 *value)
 {
 	u16 vendor, device;
 
-	if (!mk_pci_get_assigned_identity(bus, devfn, &vendor, &device)) {
+	if (!mk_pci_get_assigned_identity_bdf(domain, bus, devfn, &vendor,
+					      &device)) {
 		*value = ~0U;
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
 	if (mk_pci_identity_read(vendor, device, where, size, value))
 		return PCIBIOS_SUCCESSFUL;
-	return mk_pci_native_ops.read(bus, devfn, where, size, value);
+	return native->read(domain, bus, devfn, where, size, value);
 }
 
-static int mk_pci_write(struct pci_bus *bus, unsigned int devfn, int where,
-			int size, u32 value)
+static int mk_pci_raw_write(const struct pci_raw_ops *native,
+			    unsigned int domain, unsigned int bus,
+			    unsigned int devfn, int where, int size,
+			    u32 value)
 {
-	if (!mk_pci_get_assigned_identity(bus, devfn, NULL, NULL))
+	if (!mk_pci_get_assigned_identity_bdf(domain, bus, devfn, NULL, NULL))
 		return PCIBIOS_DEVICE_NOT_FOUND;
-	return mk_pci_native_ops.write(bus, devfn, where, size, value);
+	return native->write(domain, bus, devfn, where, size, value);
 }
 
+static int mk_pci_read(unsigned int domain, unsigned int bus,
+		       unsigned int devfn, int where, int size, u32 *value)
+{
+	return mk_pci_raw_read(mk_pci_native_raw_ops, domain, bus, devfn,
+			       where, size, value);
+}
+
+static int mk_pci_write(unsigned int domain, unsigned int bus,
+			unsigned int devfn, int where, int size, u32 value)
+{
+	return mk_pci_raw_write(mk_pci_native_raw_ops, domain, bus, devfn,
+				where, size, value);
+}
+
+static int mk_pci_ext_read(unsigned int domain, unsigned int bus,
+			   unsigned int devfn, int where, int size, u32 *value)
+{
+	return mk_pci_raw_read(mk_pci_native_raw_ext_ops, domain, bus, devfn,
+			       where, size, value);
+}
+
+static int mk_pci_ext_write(unsigned int domain, unsigned int bus,
+			    unsigned int devfn, int where, int size, u32 value)
+{
+	return mk_pci_raw_write(mk_pci_native_raw_ext_ops, domain, bus, devfn,
+				where, size, value);
+}
+
+static const struct pci_raw_ops mk_pci_filtered_raw_ops = {
+	.read = mk_pci_read,
+	.write = mk_pci_write,
+};
+
+static const struct pci_raw_ops mk_pci_filtered_raw_ext_ops = {
+	.read = mk_pci_ext_read,
+	.write = mk_pci_ext_write,
+};
 static int __init x86_multikernel_pci_arch_init(void)
 {
 	if (!root_instance || !root_instance->pci_devices_valid)
 		return 0;
 
-	mk_pci_native_ops = pci_root_ops;
-	pci_root_ops.read = mk_pci_read;
-	pci_root_ops.write = mk_pci_write;
+	mk_pci_native_raw_ops = raw_pci_ops;
+	mk_pci_native_raw_ext_ops = raw_pci_ext_ops;
+	raw_pci_ops = &mk_pci_filtered_raw_ops;
+	raw_pci_ext_ops = &mk_pci_filtered_raw_ext_ops;
 	mk_pci_roots_ready = true;
-	pr_notice("Multikernel selected filtered PCI config access\n");
+	pr_notice("Multikernel selected filtered raw PCI config access\n");
 	return 0;
 }
 
