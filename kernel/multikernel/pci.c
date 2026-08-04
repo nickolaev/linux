@@ -1247,7 +1247,8 @@ void mk_pci_lease_system_cleanup(void)
 	mk_pci_iommu_system_cleanup();
 }
 
-static struct mk_pci_device *mk_pci_find_assigned(struct pci_bus *bus, int devfn)
+static struct mk_pci_device *
+mk_pci_find_assigned_bdf(u16 domain, u8 bus, u8 devfn)
 {
 	if (!root_instance || root_instance->id == 0 ||
 	    !root_instance->dtb_data ||
@@ -1255,22 +1256,33 @@ static struct mk_pci_device *mk_pci_find_assigned(struct pci_bus *bus, int devfn
 		return NULL;
 
 	return mk_pci_find_device_bdf(&root_instance->pci_devices,
-				      pci_domain_nr(bus), bus->number, devfn);
+				      domain, bus, devfn);
+}
+
+static struct mk_pci_device *mk_pci_find_assigned(struct pci_bus *bus, int devfn)
+{
+	return mk_pci_find_assigned_bdf(pci_domain_nr(bus), bus->number, devfn);
 }
 
 /**
- * mk_pci_get_assigned_identity - Get the identity presented to an instance
- * @bus: PCI bus
+ * mk_pci_get_assigned_identity_bdf - Get an assigned function's identity
+ * @domain: PCI domain number
+ * @bus: PCI bus number
  * @devfn: device/function number
  * @vendor: assigned Vendor ID
  * @device_id: assigned Device ID
  *
  * Returns: true when assignment metadata contains an exact location match.
  */
-bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
-				  u16 *vendor, u16 *device_id)
+bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				      unsigned int devfn, u16 *vendor,
+				      u16 *device_id)
 {
-	struct mk_pci_device *device = mk_pci_find_assigned(bus, devfn);
+	struct mk_pci_device *device;
+
+	if (domain != (u16)domain || bus != (u8)bus || devfn != (u8)devfn)
+		return false;
+	device = mk_pci_find_assigned_bdf(domain, bus, devfn);
 
 	if (!device)
 		return false;
