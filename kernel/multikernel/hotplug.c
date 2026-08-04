@@ -943,7 +943,8 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
  * message subtype.
  */
 static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
-				    void *payload, u32 payload_len, void *ctx)
+				    void *payload, u32 payload_len,
+				    mk_phys_cpu_t sender_cpu, void *ctx)
 {
 	int ret = 0;
 
