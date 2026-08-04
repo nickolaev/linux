@@ -20,7 +20,6 @@
 struct pci_bus;
 
 struct pci_bus;
-struct pci_ops;
 
 /**
  * Physical CPU identifiers
@@ -847,11 +846,10 @@ int mk_instance_abort_spawn(struct mk_instance *instance);
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
-/* Device probe filtering against the instance's allowlist */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
-			 const struct pci_ops *ops);
-bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
-				  u16 *vendor, u16 *device);
+/* Device filtering against the instance metadata */
+bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				      unsigned int devfn, u16 *vendor,
+				      u16 *device);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -904,11 +902,6 @@ static inline void mk_kimage_free(struct kimage *image, void *virt_addr,
 {
 }
 
-static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
-				       const struct pci_ops *ops)
-{
-	return true;
-}
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
@@ -1008,19 +1001,22 @@ int __init mk_instance_restore_from_manifest(void);
  */
 
 /**
- * PCI Device Enforcement Functions
+ * PCI Device Filtering Functions
  */
 
 /**
- * mk_pci_get_assigned_identity() - Check and identify an assigned PCI function
- * @bus: PCI bus
+ * mk_pci_get_assigned_identity_bdf() - Identify an assigned PCI function
+ * @domain: PCI domain number
+ * @bus: PCI bus number
  * @devfn: PCI device/function number
  * @vendor: optional assigned vendor ID output
  * @device: optional assigned device ID output
  *
- * Synthetic roots make assigned functions directly discoverable. Only exact
- * assignment metadata matches may access config space; physical bridges and
- * all other functions remain inaccessible.
+ * The raw x86 PCI configuration wrappers use this BDF-only lookup before
+ * reaching their hardware backend. Synthetic roots make assigned functions
+ * directly discoverable. A privileged spawn kernel can bypass those wrappers,
+ * so this check prevents accidental access rather than isolating a hostile
+ * kernel.
  *
  * Returns: true for an exact assignment metadata match, false otherwise
  */
