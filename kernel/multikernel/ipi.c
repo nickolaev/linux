@@ -296,6 +296,11 @@ advance_tail:
 	}
 }
 
+void mk_poll_ipi_messages(void)
+{
+	mk_ipi_drain_ring();
+}
+
 /**
  * multikernel_interrupt_handler - Handle the multikernel IPI
  *

@@ -7,6 +7,7 @@
  */
 
 #include <linux/init.h>
+#include <linux/ktime.h>
 #include <linux/multikernel.h>
 #include <linux/panic.h>
 #include <linux/pci.h>
@@ -25,9 +26,130 @@ struct mk_mmcfg_snapshot {
 	size_t count;
 };
 
-static const struct pci_raw_ops *mk_pci_native_raw_ops;
-static const struct pci_raw_ops *mk_pci_native_raw_ext_ops;
 static bool mk_pci_roots_ready;
+static atomic64_t mk_pci_request_id = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_count = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
+static LIST_HEAD(mk_pci_cfg_pending);
+static DEFINE_RAW_SPINLOCK(mk_pci_cfg_pending_lock);
+static struct mk_instance *mk_pci_host_instance;
+
+struct mk_pci_cfg_pending {
+	struct list_head node;
+	u64 request_id;
+	s32 status;
+	u32 value;
+	bool done;
+};
+
+static bool mk_pci_message_from_host(mk_phys_cpu_t sender_cpu)
+{
+	return mk_pci_host_instance &&
+		mk_cpu_set_contains(mk_pci_host_instance->cpus, sender_cpu);
+}
+
+static void mk_pci_cfg_response_handler(u32 msg_type, u32 subtype,
+					void *payload, u32 payload_len,
+					mk_phys_cpu_t sender_cpu, void *ctx)
+{
+	struct mk_pci_cfg_response *response = payload;
+	struct mk_pci_cfg_pending *pending;
+	unsigned long flags;
+
+	if (msg_type != MK_MSG_PCI || subtype != MK_PCI_CFG_RESPONSE ||
+	    !mk_pci_message_from_host(sender_cpu) ||
+	    payload_len != sizeof(*response))
+		return;
+
+	raw_spin_lock_irqsave(&mk_pci_cfg_pending_lock, flags);
+	list_for_each_entry(pending, &mk_pci_cfg_pending, node) {
+		if (pending->request_id != response->request_id)
+			continue;
+		pending->status = response->status;
+		pending->value = response->value;
+		/* Publish the response fields before waking the polling CPU. */
+		smp_store_release(&pending->done, true);
+		break;
+	}
+	raw_spin_unlock_irqrestore(&mk_pci_cfg_pending_lock, flags);
+}
+
+static void mk_pci_record_latency(u64 start)
+{
+	u64 elapsed = ktime_get_mono_fast_ns() - start;
+	u64 old_max = atomic64_read(&mk_pci_cfg_max_ns);
+
+	atomic64_inc(&mk_pci_cfg_count);
+	atomic64_add(elapsed, &mk_pci_cfg_total_ns);
+	while (elapsed > old_max) {
+		u64 previous = atomic64_cmpxchg(&mk_pci_cfg_max_ns, old_max,
+						 elapsed);
+
+		if (previous == old_max)
+			break;
+		old_max = previous;
+	}
+}
+
+static int mk_pci_remote_config(unsigned int domain, unsigned int bus,
+				unsigned int devfn, int where, int size,
+				bool write, u32 *value)
+{
+	struct mk_pci_cfg_request request = {
+		.request_id = atomic64_inc_return(&mk_pci_request_id),
+		.sender_instance_id = root_instance ? root_instance->id : -1,
+		.domain = domain,
+		.bus = bus,
+		.devfn = devfn,
+		.reg = where,
+		.len = size,
+		.write = write,
+		.value = *value,
+	};
+	struct mk_pci_cfg_pending pending = {
+		.request_id = request.request_id,
+		.status = PCIBIOS_SET_FAILED,
+		.value = ~0U,
+	};
+	unsigned long flags;
+	u64 start = ktime_get_mono_fast_ns();
+	u64 deadline = start + NSEC_PER_SEC;
+	int ret;
+
+	raw_spin_lock_irqsave(&mk_pci_cfg_pending_lock, flags);
+	list_add_tail(&pending.node, &mk_pci_cfg_pending);
+	raw_spin_unlock_irqrestore(&mk_pci_cfg_pending_lock, flags);
+
+	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_CFG_REQUEST,
+			      &request, sizeof(request));
+	if (ret)
+		goto out;
+
+	/* Pairs with the response handler's publication of status and value. */
+	while (!smp_load_acquire(&pending.done)) {
+		mk_poll_ipi_messages();
+		if (ktime_get_mono_fast_ns() >= deadline) {
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+		cpu_relax();
+	}
+	ret = pending.status;
+	if (!write)
+		*value = pending.value;
+	mk_pci_record_latency(start);
+out:
+	raw_spin_lock_irqsave(&mk_pci_cfg_pending_lock, flags);
+	list_del(&pending.node);
+	raw_spin_unlock_irqrestore(&mk_pci_cfg_pending_lock, flags);
+	if (ret < 0) {
+		pr_err_ratelimited("Multikernel PCI config request timed out or failed to send: %d\n",
+				   ret);
+		return PCIBIOS_SET_FAILED;
+	}
+	return ret;
+}
 
 static bool mk_mmcfg_snapshot_contains(const struct mk_mmcfg_snapshot *snapshot,
 				       u16 segment, u8 bus)
@@ -58,8 +180,7 @@ static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
 	return true;
 }
 
-static int mk_pci_raw_read(const struct pci_raw_ops *native,
-			   unsigned int domain, unsigned int bus,
+static int mk_pci_raw_read(unsigned int domain, unsigned int bus,
 			   unsigned int devfn, int where, int size,
 			   u32 *value)
 {
@@ -73,46 +194,43 @@ static int mk_pci_raw_read(const struct pci_raw_ops *native,
 	if (mk_pci_identity_read(vendor, device, where, size, value))
 		return PCIBIOS_SUCCESSFUL;
 
-	return native->read(domain, bus, devfn, where, size, value);
+	return mk_pci_remote_config(domain, bus, devfn, where, size, false,
+				    value);
 }
 
-static int mk_pci_raw_write(const struct pci_raw_ops *native,
-			    unsigned int domain, unsigned int bus,
+static int mk_pci_raw_write(unsigned int domain, unsigned int bus,
 			    unsigned int devfn, int where, int size,
 			    u32 value)
 {
 	if (!mk_pci_get_assigned_identity_bdf(domain, bus, devfn, NULL, NULL))
 		return PCIBIOS_DEVICE_NOT_FOUND;
 
-	return native->write(domain, bus, devfn, where, size, value);
+	return mk_pci_remote_config(domain, bus, devfn, where, size, true,
+				    &value);
 }
 
 static int mk_pci_read(unsigned int domain, unsigned int bus,
 		       unsigned int devfn, int where, int size, u32 *value)
 {
-	return mk_pci_raw_read(mk_pci_native_raw_ops, domain, bus, devfn,
-			       where, size, value);
+	return mk_pci_raw_read(domain, bus, devfn, where, size, value);
 }
 
 static int mk_pci_write(unsigned int domain, unsigned int bus,
 			unsigned int devfn, int where, int size, u32 value)
 {
-	return mk_pci_raw_write(mk_pci_native_raw_ops, domain, bus, devfn,
-				where, size, value);
+	return mk_pci_raw_write(domain, bus, devfn, where, size, value);
 }
 
 static int mk_pci_ext_read(unsigned int domain, unsigned int bus,
 			   unsigned int devfn, int where, int size, u32 *value)
 {
-	return mk_pci_raw_read(mk_pci_native_raw_ext_ops, domain, bus, devfn,
-			       where, size, value);
+	return mk_pci_raw_read(domain, bus, devfn, where, size, value);
 }
 
 static int mk_pci_ext_write(unsigned int domain, unsigned int bus,
 			    unsigned int devfn, int where, int size, u32 value)
 {
-	return mk_pci_raw_write(mk_pci_native_raw_ext_ops, domain, bus, devfn,
-				where, size, value);
+	return mk_pci_raw_write(domain, bus, devfn, where, size, value);
 }
 
 static const struct pci_raw_ops mk_pci_filtered_raw_ops = {
@@ -197,6 +315,11 @@ static int __init x86_multikernel_pci_arch_init(void)
 		pr_err("Multikernel has no restored PCI host bridge metadata\n");
 		return 0;
 	}
+	mk_pci_host_instance = mk_instance_find(0);
+	if (!mk_pci_host_instance) {
+		pr_err("Multikernel has no restored host instance for PCI control\n");
+		return 0;
+	}
 	if (!list_empty(&pci_mmcfg_list)) {
 		pr_err("Multikernel PCI host bridge list was not empty before restore\n");
 		return 0;
@@ -232,11 +355,14 @@ static int __init x86_multikernel_pci_arch_init(void)
 		pr_err("Multikernel failed to map restored PCI ECAM windows\n");
 		return 0;
 	}
+	if (mk_register_msg_handler(MK_MSG_PCI, mk_pci_cfg_response_handler,
+				    NULL)) {
+		pr_err("Multikernel failed to register PCI control-plane response handler\n");
+		return 0;
+	}
 
 	raw_pci_ops = &pci_mmcfg;
 	raw_pci_ext_ops = &pci_mmcfg;
-	mk_pci_native_raw_ops = raw_pci_ops;
-	mk_pci_native_raw_ext_ops = raw_pci_ext_ops;
 	raw_pci_ops = &mk_pci_filtered_raw_ops;
 	raw_pci_ext_ops = &mk_pci_filtered_raw_ext_ops;
 	mk_pci_roots_ready = true;
@@ -298,6 +424,13 @@ static int __init x86_multikernel_pci_init(void)
 		if (ret)
 			panic("Multikernel failed to scan synthetic PCI root %04x:%02x: %d",
 			      bridge->segment, bridge->bus_start, ret);
+	}
+	if (atomic64_read(&mk_pci_cfg_count)) {
+		u64 count = atomic64_read(&mk_pci_cfg_count);
+
+		pr_notice("Multikernel PCI control plane: %llu config requests, average %llu ns, max %llu ns\n",
+			  count, atomic64_read(&mk_pci_cfg_total_ns) / count,
+			  atomic64_read(&mk_pci_cfg_max_ns));
 	}
 
 	/* Suppress legacy bus 0 probing after every assigned root is present. */
