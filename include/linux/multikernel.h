@@ -321,6 +321,7 @@ void mk_reply_scan(struct mk_shared_data *shared);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -348,6 +349,10 @@ void mk_reply_scan(struct mk_shared_data *shared);
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
 
+/* Host-mediated PCI control-plane subtypes */
+#define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+
 /**
  * Core message structure
  */
@@ -369,6 +374,28 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+};
+
+struct mk_pci_cfg_request {
+	u64 request_id;
+	u64 lifecycle_epoch;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 reg;
+	u8 len;
+	u8 write;
+	u32 value;
+	u32 reply_slot;
+	u32 reply_reserved;
+	u64 reply_generation;
+};
+
+struct mk_pci_cfg_response {
+	u64 request_id;
+	s32 status;
+	u32 value;
 };
 
 /* IRQ control flags */

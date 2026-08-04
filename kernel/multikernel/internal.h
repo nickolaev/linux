@@ -27,6 +27,9 @@ int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
 			    mk_phys_cpu_t target, void *data,
 			    size_t data_size, unsigned long type);
 void mk_poll_ipi_messages(void);
+int mk_reply_publish_route_locked(struct mk_instance *instance,
+				  const struct mk_reply_handle *reply,
+				  s32 status, u32 value);
 
 /* messaging.c */
 int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,

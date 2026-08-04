@@ -379,8 +379,9 @@ int mk_reply_begin_execute(struct mk_instance *instance,
 	return -ESTALE;
 }
 
-int mk_reply_publish(struct mk_instance *instance,
-		     const struct mk_reply_handle *reply, s32 status, u32 value)
+int mk_reply_publish_route_locked(struct mk_instance *instance,
+				  const struct mk_reply_handle *reply,
+				  s32 status, u32 value)
 {
 	struct mk_shared_data *shared;
 	struct mk_reply_slot *slot;
@@ -396,11 +397,11 @@ int mk_reply_publish(struct mk_instance *instance,
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
 		return -EINVAL;
-	down_read(&instance->control_route_sem);
+	lockdep_assert_held_read(&instance->control_route_sem);
 	shared = instance->ipi_data;
 	ret = shared ? 0 : -ENODEV;
 	if (ret)
-		goto unlock_route;
+		return ret;
 	slot = &shared->replies.slots[reply->slot];
 	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
 	executing = mk_reply_token(reply->generation, MK_REPLY_EXECUTING);
@@ -419,28 +420,39 @@ int mk_reply_publish(struct mk_instance *instance,
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		ret = -ESTALE;
-		goto unlock_route;
+		return ret;
 	}
 	if (old == committed) {
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		ret = -ESTALE;
-		goto unlock_route;
+		return ret;
 	}
 	if (old != executing && old != writing) {
 		atomic_inc(&shared->replies.late_replies);
 		ret = -EIO;
-		goto unlock_route;
+		return ret;
 	}
 
 	target = mk_instance_irq_route_load(instance);
 	if (target == MK_PHYS_CPU_INVALID) {
 		ret = -ENODEV;
-		goto unlock_route;
+		return ret;
 	}
 	ret = 0;
 	mk_arch_send_ipi(target);
-unlock_route:
+	return ret;
+}
+
+int mk_reply_publish(struct mk_instance *instance,
+		     const struct mk_reply_handle *reply, s32 status, u32 value)
+{
+	int ret;
+
+	if (!instance)
+		return -EINVAL;
+	down_read(&instance->control_route_sem);
+	ret = mk_reply_publish_route_locked(instance, reply, status, value);
 	up_read(&instance->control_route_sem);
 	return ret;
 }
