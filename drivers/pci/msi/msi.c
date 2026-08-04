@@ -11,6 +11,7 @@
 #include <linux/export.h>
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
+#include <linux/multikernel.h>
 
 #include "../pci.h"
 #include "msi.h"
@@ -239,6 +240,15 @@ static inline void pci_write_msg_msix(struct msi_desc *desc, struct msi_msg *msg
 void __pci_write_msi_msg(struct msi_desc *entry, struct msi_msg *msg)
 {
 	struct pci_dev *dev = msi_desc_to_pci_dev(entry);
+
+	if (mk_pci_msi_write_msg(dev, entry->msi_index, entry->irq,
+				 entry->nvec_used,
+				 entry->pci.msi_attrib.is_msix)) {
+		entry->msg = *msg;
+		if (entry->write_msi_msg)
+			entry->write_msi_msg(entry, entry->write_msi_msg_data);
+		return;
+	}
 
 	if (dev->current_state != PCI_D0 || pci_dev_is_disconnected(dev)) {
 		/* Don't touch the hardware now */

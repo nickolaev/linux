@@ -17,6 +17,7 @@
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 struct pci_bus;
+struct pci_dev;
 
 /**
  * Physical CPU identifiers
@@ -202,6 +203,8 @@ void mk_ipi_ring_drop_pending(void);
 /* Host-mediated PCI control-plane subtypes */
 #define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
 #define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+#define MK_PCI_IRQ_REQUEST  (MK_MSG_PCI + 3)
+#define MK_PCI_IRQ_RESPONSE (MK_MSG_PCI + 4)
 
 /**
  * Core message structure
@@ -226,6 +229,13 @@ struct mk_io_irq_payload {
 	u32 flags;              /* Control flags (priority, etc.) */
 };
 
+/* Pack a PCI segment and BDF into mk_io_irq_payload::device_id. */
+#define MK_PCI_IRQ_ID(domain, bus, devfn) \
+	(((u32)(domain) << 16) | ((u32)(bus) << 8) | (u32)(devfn))
+#define MK_PCI_IRQ_ID_DOMAIN(id)	((u16)((id) >> 16))
+#define MK_PCI_IRQ_ID_BUS(id)		((u8)((id) >> 8))
+#define MK_PCI_IRQ_ID_DEVFN(id)		((u8)(id))
+
 struct mk_pci_cfg_request {
 	u64 request_id;
 	s32 sender_instance_id;
@@ -242,6 +252,31 @@ struct mk_pci_cfg_response {
 	u64 request_id;
 	s32 status;
 	u32 value;
+};
+
+enum mk_pci_irq_operation {
+	MK_PCI_IRQ_SETUP = 1,
+	MK_PCI_IRQ_BIND,
+	MK_PCI_IRQ_TEARDOWN,
+};
+
+struct mk_pci_irq_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 operation;
+	u16 vector;
+	u16 nr_vectors;
+	u8 msix;
+	u8 reserved;
+	u32 local_irq;
+};
+
+struct mk_pci_irq_response {
+	u64 request_id;
+	s32 status;
 };
 
 /* IRQ control flags */
@@ -847,6 +882,42 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
 				      unsigned int devfn, u16 *vendor,
 				      u16 *device);
+#ifdef CONFIG_X86
+bool mk_pci_msi_controlled(struct pci_dev *dev);
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
+int mk_pci_msi_activate(struct pci_dev *dev);
+bool mk_pci_msi_write_msg(struct pci_dev *dev, unsigned int index,
+			  unsigned int irq, unsigned int nvec, bool msix);
+void mk_pci_msi_teardown(struct pci_dev *dev);
+#else
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline bool mk_pci_msi_write_msg(struct pci_dev *dev,
+					unsigned int index,
+					unsigned int irq,
+					unsigned int nvec, bool msix)
+{
+	return false;
+}
+
+static inline void mk_pci_msi_teardown(struct pci_dev *dev)
+{
+}
+#endif
+
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -900,6 +971,34 @@ static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
 }
+
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline bool mk_pci_msi_write_msg(struct pci_dev *dev,
+					unsigned int index,
+					unsigned int irq,
+					unsigned int nvec, bool msix)
+{
+	return false;
+}
+
+static inline void mk_pci_msi_teardown(struct pci_dev *dev)
+{
+}
+
 static inline void mk_register_cpus_from_manifest(void)
 {
 }

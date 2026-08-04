@@ -7,7 +7,11 @@
  */
 
 #include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 #include <linux/ktime.h>
+#include <linux/msi.h>
 #include <linux/multikernel.h>
 #include <linux/panic.h>
 #include <linux/pci.h>
@@ -33,6 +37,8 @@ static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
 static LIST_HEAD(mk_pci_cfg_pending);
 static DEFINE_RAW_SPINLOCK(mk_pci_cfg_pending_lock);
+static LIST_HEAD(mk_pci_irq_pending);
+static DEFINE_RAW_SPINLOCK(mk_pci_irq_pending_lock);
 static struct mk_instance *mk_pci_host_instance;
 
 struct mk_pci_cfg_pending {
@@ -43,36 +49,276 @@ struct mk_pci_cfg_pending {
 	bool done;
 };
 
+struct mk_pci_irq_pending {
+	struct list_head node;
+	u64 request_id;
+	s32 status;
+	bool done;
+};
+
 static bool mk_pci_message_from_host(mk_phys_cpu_t sender_cpu)
 {
 	return mk_pci_host_instance &&
 		mk_cpu_set_contains(mk_pci_host_instance->cpus, sender_cpu);
 }
 
+static void mk_pci_forward_irq_noop(struct irq_data *data)
+{
+}
+
+static void mk_pci_forward_irq_write_msg(struct irq_data *data,
+					 struct msi_msg *msg)
+{
+}
+
+static struct irq_chip mk_pci_forward_irq_chip = {
+	.name = "multikernel-pci-forward",
+	.irq_ack = mk_pci_forward_irq_noop,
+	.irq_mask = pci_msi_mask_irq,
+	.irq_unmask = pci_msi_unmask_irq,
+	.irq_write_msi_msg = mk_pci_forward_irq_write_msg,
+};
+
+static void mk_pci_bind_local_irqs(unsigned int irq, unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		irq_set_chip_and_handler(irq + i, &mk_pci_forward_irq_chip,
+					 handle_edge_irq);
+}
+
+static bool mk_pci_forward_irq_matches(const struct mk_io_irq_payload *irq,
+				       struct irq_data **irq_data)
+{
+	struct irq_data *data = irq_get_irq_data(irq->irq_number);
+	struct msi_desc *desc;
+	struct pci_dev *dev;
+	unsigned int offset;
+
+	if (!data)
+		return false;
+	desc = irq_data_get_msi_desc(data);
+	if (!desc || irq->vector < desc->msi_index)
+		return false;
+
+	dev = msi_desc_to_pci_dev(desc);
+	offset = irq->vector - desc->msi_index;
+	if (offset >= desc->nvec_used || desc->irq + offset != irq->irq_number ||
+	    pci_domain_nr(dev->bus) != MK_PCI_IRQ_ID_DOMAIN(irq->device_id) ||
+	    dev->bus->number != MK_PCI_IRQ_ID_BUS(irq->device_id) ||
+	    dev->devfn != MK_PCI_IRQ_ID_DEVFN(irq->device_id))
+		return false;
+
+	*irq_data = data;
+	return true;
+}
+
 static void mk_pci_cfg_response_handler(u32 msg_type, u32 subtype,
 					void *payload, u32 payload_len,
 					mk_phys_cpu_t sender_cpu, void *ctx)
 {
-	struct mk_pci_cfg_response *response = payload;
-	struct mk_pci_cfg_pending *pending;
+	struct mk_pci_cfg_response *cfg_response = payload;
 	unsigned long flags;
 
-	if (msg_type != MK_MSG_PCI || subtype != MK_PCI_CFG_RESPONSE ||
-	    !mk_pci_message_from_host(sender_cpu) ||
-	    payload_len != sizeof(*response))
+	if (msg_type != MK_MSG_PCI || !mk_pci_message_from_host(sender_cpu))
 		return;
 
-	raw_spin_lock_irqsave(&mk_pci_cfg_pending_lock, flags);
-	list_for_each_entry(pending, &mk_pci_cfg_pending, node) {
-		if (pending->request_id != response->request_id)
-			continue;
-		pending->status = response->status;
-		pending->value = response->value;
-		/* Publish the response fields before waking the polling CPU. */
-		smp_store_release(&pending->done, true);
-		break;
+	if (subtype == MK_PCI_CFG_RESPONSE &&
+	    payload_len == sizeof(*cfg_response)) {
+		struct mk_pci_cfg_pending *pending;
+
+		raw_spin_lock_irqsave(&mk_pci_cfg_pending_lock, flags);
+		list_for_each_entry(pending, &mk_pci_cfg_pending, node) {
+			if (pending->request_id != cfg_response->request_id)
+				continue;
+			pending->status = cfg_response->status;
+			pending->value = cfg_response->value;
+			/* Publish response fields before waking the polling CPU. */
+			smp_store_release(&pending->done, true);
+			break;
+		}
+		raw_spin_unlock_irqrestore(&mk_pci_cfg_pending_lock, flags);
+	} else if (subtype == MK_PCI_IRQ_RESPONSE &&
+		   payload_len == sizeof(struct mk_pci_irq_response)) {
+		struct mk_pci_irq_response *response = payload;
+		struct mk_pci_irq_pending *pending;
+
+		raw_spin_lock_irqsave(&mk_pci_irq_pending_lock, flags);
+		list_for_each_entry(pending, &mk_pci_irq_pending, node) {
+			if (pending->request_id != response->request_id)
+				continue;
+			pending->status = response->status;
+			/* Publish status before waking the polling CPU. */
+			smp_store_release(&pending->done, true);
+			break;
+		}
+		raw_spin_unlock_irqrestore(&mk_pci_irq_pending_lock, flags);
 	}
-	raw_spin_unlock_irqrestore(&mk_pci_cfg_pending_lock, flags);
+}
+
+static void mk_pci_irq_forward_handler(u32 msg_type, u32 subtype,
+				       void *payload, u32 payload_len,
+				       mk_phys_cpu_t sender_cpu, void *ctx)
+{
+	struct mk_io_irq_payload *irq = payload;
+	struct irq_data *irq_data;
+	struct pci_dev *dev;
+
+	if (msg_type != MK_MSG_IO || subtype != MK_IO_IRQ_FORWARD ||
+	    payload_len != sizeof(*irq) ||
+	    !mk_pci_message_from_host(sender_cpu))
+		return;
+	if (!mk_pci_forward_irq_matches(irq, &irq_data)) {
+		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u with unmatched identity %#x vector %u\n",
+				    irq->irq_number, irq->device_id,
+				    irq->vector);
+		return;
+	}
+
+	if (irq_data_get_irq_chip(irq_data) != &mk_pci_forward_irq_chip) {
+		dev = msi_desc_to_pci_dev(irq_data_get_msi_desc(irq_data));
+		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u for %s vector %u before local binding\n",
+				    irq->irq_number, pci_name(dev),
+				    irq->vector);
+		return;
+	}
+
+	if (generic_handle_irq_safe(irq->irq_number))
+		pr_warn_ratelimited("Failed to dispatch host-forwarded PCI IRQ %u\n",
+				    irq->irq_number);
+}
+
+static int mk_pci_send_irq_request(struct mk_pci_irq_request *request)
+{
+	struct mk_pci_irq_pending pending = {
+		.request_id = atomic64_inc_return(&mk_pci_request_id),
+		.status = -ETIMEDOUT,
+	};
+	unsigned long flags;
+	u64 deadline = ktime_get_mono_fast_ns() + NSEC_PER_SEC;
+	int ret;
+
+	request->request_id = pending.request_id;
+	request->sender_instance_id = root_instance ? root_instance->id : -1;
+	raw_spin_lock_irqsave(&mk_pci_irq_pending_lock, flags);
+	list_add_tail(&pending.node, &mk_pci_irq_pending);
+	raw_spin_unlock_irqrestore(&mk_pci_irq_pending_lock, flags);
+
+	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_IRQ_REQUEST,
+			      request, sizeof(*request));
+	if (ret)
+		goto out;
+
+	/* Pairs with the response handler's publication of status. */
+	while (!smp_load_acquire(&pending.done)) {
+		mk_poll_ipi_messages();
+		if (ktime_get_mono_fast_ns() >= deadline) {
+			ret = -ETIMEDOUT;
+			goto out;
+		}
+		cpu_relax();
+	}
+	ret = pending.status;
+out:
+	raw_spin_lock_irqsave(&mk_pci_irq_pending_lock, flags);
+	list_del(&pending.node);
+	raw_spin_unlock_irqrestore(&mk_pci_irq_pending_lock, flags);
+	return ret;
+}
+
+bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return root_instance && root_instance->id != 0 &&
+		mk_pci_get_assigned_identity_bdf(pci_domain_nr(dev->bus),
+						 dev->bus->number, dev->devfn,
+						 NULL, NULL);
+}
+
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_SETUP,
+		.nr_vectors = nvec,
+		.msix = type == PCI_CAP_ID_MSIX,
+	};
+
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_bind(struct pci_dev *dev, unsigned int index,
+			   unsigned int irq, unsigned int nvec, bool msix)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_BIND,
+		.vector = index,
+		.nr_vectors = nvec,
+		.msix = msix,
+		.local_irq = irq,
+	};
+
+	/* The local descriptor must be dispatchable before the host unmasks. */
+	mk_pci_bind_local_irqs(irq, msix ? 1 : nvec);
+	return mk_pci_send_irq_request(&request);
+}
+
+bool mk_pci_msi_write_msg(struct pci_dev *dev, unsigned int index,
+			  unsigned int irq, unsigned int nvec, bool msix)
+{
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return false;
+	ret = mk_pci_msi_bind(dev, index, irq, nvec, msix);
+	if (ret)
+		pr_err_ratelimited("Failed to bind host-owned MSI vector for %s: %d\n",
+				   pci_name(dev), ret);
+	return true;
+}
+
+int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	struct msi_desc *desc;
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return 0;
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
+		ret = mk_pci_msi_bind(dev, desc->msi_index, desc->irq,
+				      desc->nvec_used,
+				      desc->pci.msi_attrib.is_msix);
+		if (ret) {
+			pr_err("Failed to activate host-owned MSI vector %u for %s: %d\n",
+			       desc->msi_index, pci_name(dev), ret);
+			return ret;
+		}
+	}
+
+	return 0;
+}
+
+void mk_pci_msi_teardown(struct pci_dev *dev)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_TEARDOWN,
+	};
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return;
+	ret = mk_pci_send_irq_request(&request);
+	if (ret)
+		pr_warn("Failed to tear down host-owned MSI vectors for %s: %d\n",
+			pci_name(dev), ret);
 }
 
 static void mk_pci_record_latency(u64 start)
@@ -358,6 +604,13 @@ static int __init x86_multikernel_pci_arch_init(void)
 	if (mk_register_msg_handler(MK_MSG_PCI, mk_pci_cfg_response_handler,
 				    NULL)) {
 		pr_err("Multikernel failed to register PCI control-plane response handler\n");
+		return 0;
+	}
+	if (mk_register_msg_handler(MK_MSG_IO, mk_pci_irq_forward_handler,
+				    NULL)) {
+		mk_unregister_msg_handler(MK_MSG_PCI,
+					  mk_pci_cfg_response_handler);
+		pr_err("Multikernel failed to register PCI IRQ forwarding handler\n");
 		return 0;
 	}
 

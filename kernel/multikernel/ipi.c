@@ -298,7 +298,19 @@ advance_tail:
 
 void mk_poll_ipi_messages(void)
 {
+	unsigned long flags;
+	mk_phys_cpu_t target;
+
+	if (!root_instance)
+		return;
+	target = mk_cpu_set_first(root_instance->cpus);
+	if (target == MK_PHYS_CPU_INVALID ||
+	    target != arch_cpu_physical_id(smp_processor_id()))
+		return;
+
+	local_irq_save(flags);
 	mk_ipi_drain_ring();
+	local_irq_restore(flags);
 }
 
 /**
