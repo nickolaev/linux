@@ -77,8 +77,51 @@ bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 #define MK_IPI_SLOT_READY	2
 #define MK_IPI_SLOT_CONSUMING	3
 #define MK_IPI_SLOT_CANCELLED	4
-#define MK_IPI_ABI_MAGIC		0x4d4b495049303033ULL /* "MKIPI003" */
+#define MK_IPI_ABI_MAGIC		0x4d4b495049303034ULL /* "MKIPI004" */
 #define MK_IPI_READY_TIMEOUT_MS	120000
+
+#define MK_REPLY_SLOTS		16
+#define MK_REPLY_STATE_BITS	3
+
+enum mk_reply_state {
+	MK_REPLY_FREE = 0,
+	MK_REPLY_RESERVED,
+	MK_REPLY_WRITING,
+	MK_REPLY_EXECUTING,
+	MK_REPLY_COMMITTED,
+	MK_REPLY_READY,
+	MK_REPLY_ABANDONED,
+};
+
+enum mk_reply_kind {
+	MK_REPLY_PCI_CFG = 1,
+	MK_REPLY_PCI_IRQ,
+};
+
+struct mk_reply_slot {
+	atomic64_t state_generation;
+	u64 request_id;
+	u32 kind;
+	s32 status;
+	u32 value;
+	u32 reserved;
+};
+
+struct mk_reply_table {
+	struct mk_reply_slot slots[MK_REPLY_SLOTS];
+	atomic_t late_replies;
+	atomic_t cancelled_slots;
+	atomic_t atomic_timeouts;
+	atomic_t indeterminate_timeouts;
+	atomic_t occupied_failures;
+};
+
+struct mk_reply_handle {
+	u32 slot;
+	u32 kind;
+	u64 request_id;
+	u64 generation;
+};
 
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
@@ -119,7 +162,27 @@ struct mk_shared_data {
 	u32 abi_size;
 	s32 ready_instance_id;
 	atomic_t ready;
+	/* Appended direct synchronous replies; keep all older offsets stable. */
+	struct mk_reply_table replies;
 };
+
+static inline void mk_reply_table_reset(struct mk_reply_table *table)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		atomic64_set(&table->slots[i].state_generation, MK_REPLY_FREE);
+		WRITE_ONCE(table->slots[i].request_id, 0);
+		WRITE_ONCE(table->slots[i].kind, 0);
+		WRITE_ONCE(table->slots[i].status, 0);
+		WRITE_ONCE(table->slots[i].value, 0);
+	}
+	atomic_set(&table->late_replies, 0);
+	atomic_set(&table->cancelled_slots, 0);
+	atomic_set(&table->atomic_timeouts, 0);
+	atomic_set(&table->indeterminate_timeouts, 0);
+	atomic_set(&table->occupied_failures, 0);
+}
 
 static inline void mk_ipi_ring_reset_contents(struct mk_ipi_ring *ring)
 {
@@ -152,6 +215,7 @@ static inline void mk_shared_data_reset(struct mk_shared_data *shared)
 	WRITE_ONCE(shared->abi_size, sizeof(*shared));
 	WRITE_ONCE(shared->ready_instance_id, -1);
 	atomic_set(&shared->ready, 0);
+	mk_reply_table_reset(&shared->replies);
 }
 
 /* Function pointer type for IPI callbacks */
@@ -220,6 +284,7 @@ int mk_ipi_ring_recover_halted(const struct mk_cpu_set *halted_cpus);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -246,6 +311,9 @@ int mk_ipi_ring_recover_halted(const struct mk_cpu_set *halted_cpus);
 /* Network/vsock subtypes */
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
+/* Host-mediated PCI control-plane subtypes */
+#define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
 
 /**
  * Core message structure
@@ -268,6 +336,27 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+};
+
+struct mk_pci_cfg_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 reg;
+	u8 len;
+	u8 write;
+	u32 value;
+	u32 reply_slot;
+	u32 reply_reserved;
+	u64 reply_generation;
+};
+
+struct mk_pci_cfg_response {
+	u64 request_id;
+	s32 status;
+	u32 value;
 };
 
 /* IRQ control flags */
@@ -337,7 +426,8 @@ struct mk_shutdown_payload {
  * Message handler callback type
  */
 typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx);
+				 void *payload, u32 payload_len,
+				 mk_phys_cpu_t sender_cpu, void *ctx);
 
 /* Opaque type for pending message tracking */
 struct mk_pending_msg;
@@ -377,6 +467,23 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
  * Returns 0 on success, negative error code on failure
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
+int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
+		     struct mk_reply_handle *reply);
+int mk_reply_claim(struct mk_instance *instance,
+		   const struct mk_reply_handle *reply);
+int mk_reply_begin_execute(struct mk_instance *instance,
+			   const struct mk_reply_handle *reply);
+int mk_reply_publish(struct mk_instance *instance,
+		     const struct mk_reply_handle *reply, s32 status, u32 value);
+int mk_reply_wait_atomic(struct mk_shared_data *shared,
+			 struct mk_reply_handle *reply, unsigned int timeout_us,
+			 s32 *status, u32 *value);
+int mk_reply_wait(struct mk_shared_data *shared,
+		  struct mk_reply_handle *reply, unsigned int timeout_ms,
+		  s32 *status, u32 *value);
+void mk_reply_release(struct mk_shared_data *shared,
+		      struct mk_reply_handle *reply);
+void mk_reply_scan(struct mk_shared_data *shared);
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
@@ -1003,7 +1110,7 @@ static inline bool mk_manifest_rejected(void)
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
 /* Bumped whenever the shared-memory layout or message semantics change. */
-#define MK_FDT_COMPATIBLE "multikernel-v3"
+#define MK_FDT_COMPATIBLE "multikernel-v4"
 
 /**
  * Property Names

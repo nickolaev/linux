@@ -14,6 +14,8 @@
 #include <linux/ioport.h>
 #include <linux/delay.h>
 #include <linux/ratelimit.h>
+#include <linux/ktime.h>
+#include <linux/wait.h>
 #include "internal.h"
 
 /* Callback management */
@@ -23,10 +25,28 @@ static DEFINE_RATELIMIT_STATE(mk_ipi_publish_rs, DEFAULT_RATELIMIT_INTERVAL,
 			      DEFAULT_RATELIMIT_BURST);
 
 static void mk_ipi_drain_ring(void);
+static DECLARE_WAIT_QUEUE_HEAD(mk_reply_waitq);
 
 #define MK_IPI_PRODUCER_RETRIES	10000
 #define MK_IPI_GATE_INDEX_BITS	6
 #define MK_IPI_GATE_INDEX_MASK	(MK_IPI_RING_SIZE - 1)
+#define MK_REPLY_STATE_MASK	(BIT(MK_REPLY_STATE_BITS) - 1)
+#define MK_REPLY_GENERATION_MAX	(U64_MAX >> MK_REPLY_STATE_BITS)
+
+static u64 mk_reply_token(u64 generation, enum mk_reply_state state)
+{
+	return generation << MK_REPLY_STATE_BITS | state;
+}
+
+static u64 mk_reply_generation(u64 token)
+{
+	return token >> MK_REPLY_STATE_BITS;
+}
+
+static enum mk_reply_state mk_reply_state(u64 token)
+{
+	return token & MK_REPLY_STATE_MASK;
+}
 
 /*
  * A nonzero gate records both the physical producer CPU and the slot at head.
@@ -200,6 +220,336 @@ int mk_ipi_shared_mark_ready(struct mk_shared_data *shared, int instance_id)
 	return 0;
 }
 
+int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
+		     struct mk_reply_handle *reply)
+{
+	struct mk_reply_table *table;
+	unsigned int i;
+	int ret;
+
+	if (!reply || !request_id || !kind)
+		return -EINVAL;
+	ret = mk_ipi_shared_validate(shared);
+	if (ret)
+		return ret;
+
+	table = &shared->replies;
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		struct mk_reply_slot *slot = &table->slots[i];
+		u64 generation;
+		u64 claim;
+		u64 old;
+
+		old = atomic64_read(&slot->state_generation);
+		if (mk_reply_state(old) != MK_REPLY_FREE)
+			continue;
+		generation = mk_reply_generation(old) + 1;
+		if (!generation || generation > MK_REPLY_GENERATION_MAX)
+			generation = 1;
+		claim = mk_reply_token(generation, MK_REPLY_WRITING);
+		if (atomic64_cmpxchg_acquire(&slot->state_generation, old,
+					     claim) != old)
+			continue;
+
+		WRITE_ONCE(slot->request_id, request_id);
+		WRITE_ONCE(slot->kind, kind);
+		WRITE_ONCE(slot->status, -ETIMEDOUT);
+		WRITE_ONCE(slot->value, ~0U);
+		atomic64_set_release(&slot->state_generation,
+				     mk_reply_token(generation,
+						    MK_REPLY_RESERVED));
+		reply->slot = i;
+		reply->kind = kind;
+		reply->request_id = request_id;
+		reply->generation = generation;
+		return 0;
+	}
+
+	atomic_inc(&table->occupied_failures);
+	return -ENOSPC;
+}
+
+static int mk_reply_take_ready(struct mk_shared_data *shared,
+			       struct mk_reply_handle *reply,
+			       s32 *status, u32 *value)
+{
+	struct mk_reply_slot *slot = &shared->replies.slots[reply->slot];
+	u64 ready = mk_reply_token(reply->generation, MK_REPLY_READY);
+	u64 free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+
+	if (atomic64_read_acquire(&slot->state_generation) != ready)
+		return -EAGAIN;
+	if (READ_ONCE(slot->request_id) != reply->request_id ||
+	    READ_ONCE(slot->kind) != reply->kind)
+		return -EPROTO;
+	if (status)
+		*status = READ_ONCE(slot->status);
+	if (value)
+		*value = READ_ONCE(slot->value);
+	if (atomic64_cmpxchg_release(&slot->state_generation, ready, free) !=
+	    ready)
+		return -EAGAIN;
+	return 0;
+}
+
+static bool mk_reply_cancel(struct mk_shared_data *shared,
+			    struct mk_reply_handle *reply, bool atomic_timeout)
+{
+	struct mk_reply_table *table = &shared->replies;
+	struct mk_reply_slot *slot = &table->slots[reply->slot];
+	u64 reserved = mk_reply_token(reply->generation, MK_REPLY_RESERVED);
+	u64 writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
+	u64 executing = mk_reply_token(reply->generation, MK_REPLY_EXECUTING);
+	u64 committed = mk_reply_token(reply->generation, MK_REPLY_COMMITTED);
+	u64 abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
+	u64 ready = mk_reply_token(reply->generation, MK_REPLY_READY);
+	u64 free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+	u64 token;
+
+	if (atomic64_cmpxchg_release(&slot->state_generation, reserved, free) ==
+	    reserved)
+		goto cancelled;
+
+	for (;;) {
+		token = atomic64_read_acquire(&slot->state_generation);
+		if (token == ready)
+			return true;
+		if (token == writing &&
+		    atomic64_cmpxchg_release(&slot->state_generation, writing,
+					     abandoned) == writing)
+			break;
+		if (token == executing &&
+		    atomic64_cmpxchg_release(&slot->state_generation, executing,
+					     committed) == executing) {
+			atomic_inc(&table->indeterminate_timeouts);
+			goto timed_out;
+		}
+		if (token != writing && token != executing)
+			break;
+	}
+
+cancelled:
+	atomic_inc(&table->cancelled_slots);
+timed_out:
+	if (atomic_timeout)
+		atomic_inc(&table->atomic_timeouts);
+	return false;
+}
+
+static bool mk_reply_wait_done(struct mk_shared_data *shared,
+			       const struct mk_reply_handle *reply)
+{
+	struct mk_reply_slot *slot = &shared->replies.slots[reply->slot];
+	u64 token;
+
+	token = atomic64_read_acquire(&slot->state_generation);
+	return token == mk_reply_token(reply->generation, MK_REPLY_READY) ||
+	       mk_reply_generation(token) != reply->generation ||
+	       mk_reply_state(token) == MK_REPLY_FREE;
+}
+
+int mk_reply_wait_atomic(struct mk_shared_data *shared,
+			 struct mk_reply_handle *reply, unsigned int timeout_us,
+			 s32 *status, u32 *value)
+{
+	u64 deadline;
+
+	if (!shared || !reply || reply->slot >= MK_REPLY_SLOTS)
+		return -EINVAL;
+	deadline = ktime_get_mono_fast_ns() + (u64)timeout_us * NSEC_PER_USEC;
+	for (;;) {
+		int ret = mk_reply_take_ready(shared, reply, status, value);
+
+		if (!ret)
+			return 0;
+		if (ret != -EAGAIN)
+			return ret;
+		if (ktime_get_mono_fast_ns() >= deadline)
+			break;
+		cpu_relax();
+	}
+
+	if (mk_reply_cancel(shared, reply, true))
+		return mk_reply_take_ready(shared, reply, status, value);
+	return -ETIMEDOUT;
+}
+
+int mk_reply_wait(struct mk_shared_data *shared,
+		  struct mk_reply_handle *reply, unsigned int timeout_ms,
+		  s32 *status, u32 *value)
+{
+	long waited;
+	int ret;
+
+	if (!shared || !reply || reply->slot >= MK_REPLY_SLOTS)
+		return -EINVAL;
+	waited = wait_event_timeout(mk_reply_waitq,
+				    mk_reply_wait_done(shared, reply),
+				    msecs_to_jiffies(timeout_ms));
+	if (!waited) {
+		if (mk_reply_cancel(shared, reply, false))
+			return mk_reply_take_ready(shared, reply, status, value);
+		return -ETIMEDOUT;
+	}
+	ret = mk_reply_take_ready(shared, reply, status, value);
+	if (ret == -EAGAIN)
+		ret = -ESTALE;
+	return ret;
+}
+
+void mk_reply_release(struct mk_shared_data *shared,
+		      struct mk_reply_handle *reply)
+{
+	if (!shared || !reply || reply->slot >= MK_REPLY_SLOTS)
+		return;
+	mk_reply_cancel(shared, reply, false);
+}
+
+int mk_reply_claim(struct mk_instance *instance,
+		   const struct mk_reply_handle *reply)
+{
+	struct mk_shared_data *shared;
+	struct mk_reply_slot *slot;
+	u64 writing;
+	u64 abandoned;
+	u64 reserved;
+	u64 free;
+	int ret;
+
+	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
+		return -EINVAL;
+	shared = instance->ipi_data;
+	ret = mk_ipi_shared_validate(shared);
+	if (ret)
+		return ret;
+	if (!atomic_read_acquire(&shared->ready) ||
+	    READ_ONCE(shared->ready_instance_id) != instance->id)
+		return -ESHUTDOWN;
+
+	slot = &shared->replies.slots[reply->slot];
+	reserved = mk_reply_token(reply->generation, MK_REPLY_RESERVED);
+	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
+	abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
+	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+	if (atomic64_cmpxchg_acquire(&slot->state_generation, reserved,
+				     writing) != reserved) {
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
+	if (READ_ONCE(slot->request_id) != reply->request_id ||
+	    READ_ONCE(slot->kind) != reply->kind) {
+		u64 old;
+
+		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
+					       free);
+		if (old == abandoned)
+			old = atomic64_cmpxchg_release(&slot->state_generation,
+						       abandoned, free);
+		if (old == writing || old == abandoned)
+			wake_up_all(&mk_reply_waitq);
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
+	return 0;
+}
+
+int mk_reply_begin_execute(struct mk_instance *instance,
+			   const struct mk_reply_handle *reply)
+{
+	struct mk_reply_slot *slot;
+	u64 writing;
+	u64 executing;
+	u64 old;
+
+	if (!instance || !instance->ipi_data || !reply ||
+	    reply->slot >= MK_REPLY_SLOTS)
+		return -EINVAL;
+	slot = &instance->ipi_data->replies.slots[reply->slot];
+	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
+	executing = mk_reply_token(reply->generation, MK_REPLY_EXECUTING);
+	old = atomic64_cmpxchg_acquire(&slot->state_generation, writing,
+				       executing);
+	if (old == writing)
+		return 0;
+	if (old == mk_reply_token(reply->generation, MK_REPLY_ABANDONED))
+		return -ECANCELED;
+	return -ESTALE;
+}
+
+int mk_reply_publish(struct mk_instance *instance,
+		     const struct mk_reply_handle *reply, s32 status, u32 value)
+{
+	struct mk_shared_data *shared;
+	struct mk_reply_slot *slot;
+	mk_phys_cpu_t target;
+	u64 writing;
+	u64 executing;
+	u64 committed;
+	u64 abandoned;
+	u64 ready;
+	u64 free;
+	u64 old;
+	int ret;
+
+	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
+		return -EINVAL;
+	shared = instance->ipi_data;
+	ret = mk_ipi_shared_validate(shared);
+	if (ret)
+		return ret;
+	slot = &shared->replies.slots[reply->slot];
+	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
+	executing = mk_reply_token(reply->generation, MK_REPLY_EXECUTING);
+	committed = mk_reply_token(reply->generation, MK_REPLY_COMMITTED);
+	abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
+	ready = mk_reply_token(reply->generation, MK_REPLY_READY);
+	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+
+	WRITE_ONCE(slot->status, status);
+	WRITE_ONCE(slot->value, value);
+	old = atomic64_cmpxchg_release(&slot->state_generation, executing, ready);
+	if (old == writing)
+		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
+					       ready);
+	if (old == abandoned) {
+		atomic64_set_release(&slot->state_generation, free);
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
+	if (old == committed) {
+		atomic64_set_release(&slot->state_generation, free);
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
+	if (old != executing && old != writing) {
+		atomic_inc(&shared->replies.late_replies);
+		return -EIO;
+	}
+
+	target = mk_cpu_set_first(instance->cpus);
+	if (target == MK_PHYS_CPU_INVALID)
+		return -ENODEV;
+	mk_arch_send_ipi(target);
+	return 0;
+}
+
+void mk_reply_scan(struct mk_shared_data *shared)
+{
+	unsigned int i;
+
+	if (!shared)
+		return;
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		struct mk_reply_slot *slot = &shared->replies.slots[i];
+		u64 token = atomic64_read_acquire(&slot->state_generation);
+
+		if (mk_reply_state(token) == MK_REPLY_READY) {
+			wake_up_all(&mk_reply_waitq);
+			return;
+		}
+	}
+}
+
 int mk_ipi_shared_wait_ready(struct mk_shared_data *shared, int instance_id,
 			     unsigned int timeout_ms)
 {
@@ -270,6 +620,7 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared,
 	/* The old receiver is parked and every pre-existing publisher drained. */
 	mk_ipi_ring_reset_contents(ring);
 	WRITE_ONCE(shared->force_halt, 0);
+	mk_reply_table_reset(&shared->replies);
 	WRITE_ONCE(shared->abi_magic, MK_IPI_ABI_MAGIC);
 	WRITE_ONCE(shared->abi_version, MK_IPI_ABI_VERSION);
 	WRITE_ONCE(shared->abi_size, sizeof(*shared));
@@ -678,23 +1029,6 @@ advance_tail:
 	}
 }
 
-void mk_poll_ipi_messages(void)
-{
-	unsigned long flags;
-	mk_phys_cpu_t target;
-
-	if (!root_instance)
-		return;
-	target = mk_cpu_set_first(root_instance->cpus);
-	if (target == MK_PHYS_CPU_INVALID ||
-	    target != arch_cpu_physical_id(smp_processor_id()))
-		return;
-
-	local_irq_save(flags);
-	mk_ipi_drain_ring();
-	local_irq_restore(flags);
-}
-
 /**
  * multikernel_interrupt_handler - Handle the multikernel IPI
  *
@@ -705,6 +1039,7 @@ static void multikernel_interrupt_handler(void)
 {
 	if (!root_instance || !root_instance->ipi_data)
 		return;
+	mk_reply_scan(root_instance->ipi_data);
 
 	/*
 	 * Drain here rather than from irq_work. We are already in interrupt

@@ -1631,7 +1631,8 @@ static void mk_halted_work_fn(struct work_struct *work)
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,
-				  void *payload, u32 payload_len, void *ctx)
+				  void *payload, u32 payload_len,
+				  mk_phys_cpu_t sender_cpu, void *ctx)
 {
 	if (msg_type != MK_MSG_SYSTEM)
 		return;
