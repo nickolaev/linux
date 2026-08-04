@@ -6,6 +6,7 @@
  * filtered here and become host-mediated once the RPC transport is installed.
  */
 #include <linux/init.h>
+#include <linux/ktime.h>
 #include <linux/multikernel.h>
 #include <linux/panic.h>
 #include <linux/pci.h>
@@ -14,9 +15,84 @@
 #include <asm/pci_x86.h>
 #include <asm/x86_init.h>
 
-static const struct pci_raw_ops *mk_pci_native_raw_ops;
-static const struct pci_raw_ops *mk_pci_native_raw_ext_ops;
 static bool mk_pci_roots_ready;
+static atomic64_t mk_pci_request_id = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_count = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
+static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
+static struct mk_instance *mk_pci_host_instance;
+
+static void mk_pci_record_latency(u64 start)
+{
+	u64 elapsed = ktime_get_mono_fast_ns() - start;
+	u64 old_max = atomic64_read(&mk_pci_cfg_max_ns);
+
+	atomic64_inc(&mk_pci_cfg_count);
+	atomic64_add(elapsed, &mk_pci_cfg_total_ns);
+	while (elapsed > old_max) {
+		u64 previous = atomic64_cmpxchg(&mk_pci_cfg_max_ns, old_max,
+						 elapsed);
+
+		if (previous == old_max)
+			break;
+		old_max = previous;
+	}
+}
+
+static int mk_pci_remote_config(unsigned int domain, unsigned int bus,
+				unsigned int devfn, int where, int size,
+				bool write, u32 *value)
+{
+	struct mk_pci_cfg_request request = {
+		.request_id = atomic64_inc_return(&mk_pci_request_id),
+		.sender_instance_id = root_instance ? root_instance->id : -1,
+		.domain = domain,
+		.bus = bus,
+		.devfn = devfn,
+		.reg = where,
+		.len = size,
+		.write = write,
+		.value = *value,
+	};
+	struct mk_reply_handle reply;
+	s32 status;
+	u32 response_value;
+	u64 start = ktime_get_mono_fast_ns();
+	int ret;
+
+	ret = mk_reply_reserve(root_instance->ipi_data, MK_REPLY_PCI_CFG,
+			       request.request_id, &reply);
+	if (ret)
+		goto out_error;
+	request.reply_slot = reply.slot;
+	request.reply_generation = reply.generation;
+	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_CFG_REQUEST,
+			      &request, sizeof(request));
+	if (ret) {
+		mk_reply_release(root_instance->ipi_data, &reply);
+		goto out_error;
+	}
+	ret = mk_reply_wait_atomic(root_instance->ipi_data, &reply, 20000,
+				   &status, &response_value);
+	if (ret)
+		goto out_error;
+	if (status < 0) {
+		ret = status;
+		goto out_error;
+	}
+	if (!write)
+		*value = response_value;
+	mk_pci_record_latency(start);
+	return status;
+
+out_error:
+	if (ret < 0) {
+		pr_err_ratelimited("Multikernel PCI config request timed out or failed to send: %d\n",
+				   ret);
+		return PCIBIOS_SET_FAILED;
+	}
+	return PCIBIOS_SET_FAILED;
+}
 
 static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
 				 u32 *value)
@@ -32,8 +108,7 @@ static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
 	return true;
 }
 
-static int mk_pci_raw_read(const struct pci_raw_ops *native,
-			   unsigned int domain, unsigned int bus,
+static int mk_pci_raw_read(unsigned int domain, unsigned int bus,
 			   unsigned int devfn, int where, int size,
 			   u32 *value)
 {
@@ -46,65 +121,35 @@ static int mk_pci_raw_read(const struct pci_raw_ops *native,
 	}
 	if (mk_pci_identity_read(vendor, device, where, size, value))
 		return PCIBIOS_SUCCESSFUL;
-	return native->read(domain, bus, devfn, where, size, value);
+	return mk_pci_remote_config(domain, bus, devfn, where, size, false,
+				    value);
 }
 
-static int mk_pci_raw_write(const struct pci_raw_ops *native,
-			    unsigned int domain, unsigned int bus,
+static int mk_pci_raw_write(unsigned int domain, unsigned int bus,
 			    unsigned int devfn, int where, int size,
 			    u32 value)
 {
 	if (!mk_pci_get_assigned_identity_bdf(domain, bus, devfn, NULL, NULL))
 		return PCIBIOS_DEVICE_NOT_FOUND;
-	return native->write(domain, bus, devfn, where, size, value);
-}
-
-static int mk_pci_read(unsigned int domain, unsigned int bus,
-		       unsigned int devfn, int where, int size, u32 *value)
-{
-	return mk_pci_raw_read(mk_pci_native_raw_ops, domain, bus, devfn,
-			       where, size, value);
-}
-
-static int mk_pci_write(unsigned int domain, unsigned int bus,
-			unsigned int devfn, int where, int size, u32 value)
-{
-	return mk_pci_raw_write(mk_pci_native_raw_ops, domain, bus, devfn,
-				where, size, value);
-}
-
-static int mk_pci_ext_read(unsigned int domain, unsigned int bus,
-			   unsigned int devfn, int where, int size, u32 *value)
-{
-	return mk_pci_raw_read(mk_pci_native_raw_ext_ops, domain, bus, devfn,
-			       where, size, value);
-}
-
-static int mk_pci_ext_write(unsigned int domain, unsigned int bus,
-			    unsigned int devfn, int where, int size, u32 value)
-{
-	return mk_pci_raw_write(mk_pci_native_raw_ext_ops, domain, bus, devfn,
-				where, size, value);
+	return mk_pci_remote_config(domain, bus, devfn, where, size, true,
+				    &value);
 }
 
 static const struct pci_raw_ops mk_pci_filtered_raw_ops = {
-	.read = mk_pci_read,
-	.write = mk_pci_write,
-};
-
-static const struct pci_raw_ops mk_pci_filtered_raw_ext_ops = {
-	.read = mk_pci_ext_read,
-	.write = mk_pci_ext_write,
+	.read = mk_pci_raw_read,
+	.write = mk_pci_raw_write,
 };
 static int __init x86_multikernel_pci_arch_init(void)
 {
 	if (!root_instance || !root_instance->pci_devices_valid)
 		return 0;
-
-	mk_pci_native_raw_ops = raw_pci_ops;
-	mk_pci_native_raw_ext_ops = raw_pci_ext_ops;
+	mk_pci_host_instance = mk_instance_find(0);
+	if (!mk_pci_host_instance) {
+		pr_err("Multikernel has no restored host instance for PCI control\n");
+		return 0;
+	}
 	raw_pci_ops = &mk_pci_filtered_raw_ops;
-	raw_pci_ext_ops = &mk_pci_filtered_raw_ext_ops;
+	raw_pci_ext_ops = &mk_pci_filtered_raw_ops;
 	mk_pci_roots_ready = true;
 	pr_notice("Multikernel selected filtered raw PCI config access\n");
 	return 0;
@@ -182,6 +227,13 @@ static int __init x86_multikernel_pci_init(void)
 			      device->domain, device->bus, device->slot,
 			      device->func);
 		pci_bus_add_devices(bus);
+	}
+	if (atomic64_read(&mk_pci_cfg_count)) {
+		u64 count = atomic64_read(&mk_pci_cfg_count);
+
+		pr_notice("Multikernel PCI control plane: %llu config requests, average %llu ns, max %llu ns\n",
+			  count, atomic64_read(&mk_pci_cfg_total_ns) / count,
+			  atomic64_read(&mk_pci_cfg_max_ns));
 	}
 
 	/* Suppress legacy bus 0 probing after every assigned function is present. */

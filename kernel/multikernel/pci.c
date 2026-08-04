@@ -10,6 +10,8 @@
 #include <linux/device/bus.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
+#include <linux/interrupt.h>
+#include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/multikernel.h>
 #include <linux/overflow.h>
@@ -47,6 +49,68 @@ static DEFINE_MUTEX(mk_pci_lease_mutex);
 static DEFINE_SPINLOCK(mk_pci_active_lock);
 static LIST_HEAD(mk_pci_active_assignments);
 static bool mk_pci_notifier_registered;
+static bool mk_pci_control_registered;
+static mempool_t *mk_pci_control_pool;
+static struct workqueue_struct *mk_pci_control_wq;
+static DEFINE_SPINLOCK(mk_pci_control_lock);
+static DECLARE_WAIT_QUEUE_HEAD(mk_pci_control_waitq);
+static unsigned int mk_pci_control_active;
+static bool mk_pci_control_shutdown = true;
+static atomic64_t mk_pci_control_pool_exhausted = ATOMIC64_INIT(0);
+
+struct mk_pci_control_work {
+	struct work_struct work;
+	struct mk_pci_cfg_request request;
+	mk_phys_cpu_t sender_cpu;
+};
+
+static bool mk_pci_control_handler_get(void)
+{
+	unsigned long flags;
+	bool acquired = false;
+
+	spin_lock_irqsave(&mk_pci_control_lock, flags);
+	if (!mk_pci_control_shutdown) {
+		mk_pci_control_active++;
+		acquired = true;
+	}
+	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+	return acquired;
+}
+
+static void mk_pci_control_handler_put(void)
+{
+	unsigned long flags;
+	bool drained;
+
+	spin_lock_irqsave(&mk_pci_control_lock, flags);
+	WARN_ON_ONCE(!mk_pci_control_active);
+	if (mk_pci_control_active)
+		mk_pci_control_active--;
+	drained = !mk_pci_control_active;
+	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+	if (drained)
+		wake_up_all(&mk_pci_control_waitq);
+}
+
+static void mk_pci_control_shutdown_begin(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mk_pci_control_lock, flags);
+	mk_pci_control_shutdown = true;
+	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+}
+
+static void mk_pci_control_shutdown_end(void)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&mk_pci_control_lock, flags);
+	mk_pci_control_active = 0;
+	mk_pci_control_shutdown = false;
+	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+}
 
 static bool mk_pci_device_live(struct pci_dev *pdev)
 {
@@ -119,6 +183,156 @@ mk_pci_find_assignment(struct mk_instance *instance, u16 domain, u8 bus,
 	}
 
 	return NULL;
+}
+
+static bool mk_pci_request_route_stale(struct mk_instance *instance,
+				       mk_phys_cpu_t sender_cpu)
+{
+	if (!instance || instance == root_instance)
+		return true;
+	if (READ_ONCE(instance->state) != MK_STATE_ACTIVE)
+		return true;
+
+	mk_cpu_ownership_assert_held();
+	return !mk_cpu_set_contains(instance->cpus, sender_cpu);
+}
+
+static int mk_pci_config_access(struct mk_instance *instance,
+				const struct mk_pci_cfg_request *request,
+				u32 *value,
+				const struct mk_reply_handle *reply)
+{
+	struct mk_pci_assignment *assignment;
+	struct pci_dev *vf;
+	int ret;
+
+	if (request->len != 1 && request->len != 2 && request->len != 4)
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	if (request->reg > PCI_CFG_SPACE_EXP_SIZE - request->len)
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+
+	mutex_lock(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	assignment = mk_pci_find_assignment(instance, request->domain,
+					    request->bus, request->devfn);
+	if (!assignment || !assignment->assigned ||
+	    !mk_pci_device_live(assignment->vf)) {
+		ret = PCIBIOS_DEVICE_NOT_FOUND;
+		goto out;
+	}
+	ret = mk_reply_begin_execute(instance, reply);
+	if (ret)
+		goto out;
+
+	vf = assignment->vf;
+	if (request->write) {
+		switch (request->len) {
+		case 1:
+			ret = pci_write_config_byte(vf, request->reg,
+						    request->value);
+			break;
+		case 2:
+			ret = pci_write_config_word(vf, request->reg,
+						    request->value);
+			break;
+		default:
+			ret = pci_write_config_dword(vf, request->reg,
+						     request->value);
+			break;
+		}
+	} else {
+		switch (request->len) {
+		case 1: {
+			u8 data;
+
+			ret = pci_read_config_byte(vf, request->reg, &data);
+			*value = data;
+			break;
+		}
+		case 2: {
+			u16 data;
+
+			ret = pci_read_config_word(vf, request->reg, &data);
+			*value = data;
+			break;
+		}
+		default:
+			ret = pci_read_config_dword(vf, request->reg, value);
+			break;
+		}
+	}
+out:
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
+}
+
+static void mk_pci_cfg_work_fn(struct work_struct *work)
+{
+	struct mk_pci_control_work *control_work =
+		container_of(work, struct mk_pci_control_work, work);
+	struct mk_reply_handle reply = {
+		.slot = control_work->request.reply_slot,
+		.kind = MK_REPLY_PCI_CFG,
+		.request_id = control_work->request.request_id,
+		.generation = control_work->request.reply_generation,
+	};
+	struct mk_instance *instance;
+	u32 value = ~0U;
+	s32 status;
+
+	instance = mk_instance_find(control_work->request.sender_instance_id);
+	if (!instance)
+		goto out;
+	down_read(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	status = mk_pci_request_route_stale(instance, control_work->sender_cpu) ?
+		-ESTALE : 0;
+	mk_cpu_ownership_unlock();
+	if (status)
+		goto unlock_route;
+	if (mk_reply_claim(instance, &reply))
+		goto unlock_route;
+	status = mk_pci_config_access(instance, &control_work->request,
+				      &value, &reply);
+	if (mk_reply_publish(instance, &reply, status, value))
+		pr_warn_ratelimited("Failed to return PCI config response to instance %d\n",
+				    instance->id);
+unlock_route:
+	up_read(&instance->control_route_sem);
+	mk_instance_put(instance);
+out:
+	mempool_free(control_work, mk_pci_control_pool);
+}
+
+static void mk_pci_control_msg_handler(u32 msg_type, u32 subtype,
+				       void *payload, u32 payload_len,
+				       mk_phys_cpu_t sender_cpu, void *ctx)
+{
+	struct mk_pci_control_work *work;
+
+	if (msg_type != MK_MSG_PCI || subtype != MK_PCI_CFG_REQUEST ||
+	    payload_len != sizeof(work->request))
+		return;
+	if (!mk_pci_control_handler_get())
+		return;
+
+	/* One reserve object exists for every valid outstanding reply slot. */
+	work = mempool_alloc(mk_pci_control_pool, GFP_ATOMIC);
+	if (!work) {
+		atomic64_inc(&mk_pci_control_pool_exhausted);
+		pr_warn_ratelimited("Multikernel PCI control work pool exhausted\n");
+		goto out;
+	}
+	INIT_WORK(&work->work, mk_pci_cfg_work_fn);
+	memcpy(&work->request, payload, sizeof(work->request));
+	work->sender_cpu = sender_cpu;
+	if (!queue_work(mk_pci_control_wq, &work->work))
+		mempool_free(work, mk_pci_control_pool);
+out:
+	mk_pci_control_handler_put();
 }
 
 static void mk_pci_assignment_failure_work(struct work_struct *work)
@@ -1153,6 +1367,8 @@ int mk_pci_prepare_instance_start(struct mk_instance *instance)
 
 int mk_pci_lease_system_init(void)
 {
+	unsigned int pool_size;
+	size_t work_size = sizeof(struct mk_pci_control_work);
 	int ret;
 
 	ret = mk_pci_iommu_system_init();
@@ -1164,11 +1380,59 @@ int mk_pci_lease_system_init(void)
 		return ret;
 	}
 	mk_pci_notifier_registered = true;
+	if (root_instance && root_instance->id == 0) {
+		pool_size = max_t(unsigned int, num_possible_cpus(), 1) *
+			MK_REPLY_SLOTS;
+		mk_pci_control_pool = mempool_create_kmalloc_pool(pool_size, work_size);
+		if (!mk_pci_control_pool) {
+			ret = -ENOMEM;
+			goto unregister_notifier;
+		}
+		mk_pci_control_wq =
+			alloc_workqueue("mk-pci-control",
+					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+		if (!mk_pci_control_wq) {
+			ret = -ENOMEM;
+			goto destroy_pool;
+		}
+		mk_pci_control_shutdown_end();
+		ret = mk_register_msg_handler(MK_MSG_PCI,
+					      mk_pci_control_msg_handler, NULL);
+		if (ret)
+			goto destroy_workqueue;
+		mk_pci_control_registered = true;
+	}
 	return 0;
+
+destroy_workqueue:
+	mk_pci_control_shutdown_begin();
+	destroy_workqueue(mk_pci_control_wq);
+	mk_pci_control_wq = NULL;
+destroy_pool:
+	mempool_destroy(mk_pci_control_pool);
+	mk_pci_control_pool = NULL;
+unregister_notifier:
+	bus_unregister_notifier(&pci_bus_type, &mk_pci_bus_notifier);
+	mk_pci_notifier_registered = false;
+	mk_pci_iommu_system_cleanup();
+	return ret;
 }
 
 void mk_pci_lease_system_cleanup(void)
 {
+	if (mk_pci_control_registered) {
+		mk_pci_control_shutdown_begin();
+		mk_unregister_msg_handler(MK_MSG_PCI,
+					  mk_pci_control_msg_handler);
+		mk_pci_control_registered = false;
+		wait_event(mk_pci_control_waitq, !READ_ONCE(mk_pci_control_active));
+	}
+	if (mk_pci_control_wq) {
+		destroy_workqueue(mk_pci_control_wq);
+		mk_pci_control_wq = NULL;
+	}
+	mempool_destroy(mk_pci_control_pool);
+	mk_pci_control_pool = NULL;
 	if (mk_pci_notifier_registered) {
 		bus_unregister_notifier(&pci_bus_type, &mk_pci_bus_notifier);
 		mk_pci_notifier_registered = false;
