@@ -270,7 +270,10 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			struct mk_pci_device *pci_dev;
 			const char *pci_id_str;
 			const fdt32_t *vendor_prop, *device_prop;
-			unsigned int domain, bus, slot, func;
+			u32 vendor, device;
+			u16 domain;
+			u8 bus, slot, func;
+			int ret;
 
 			pci_id_str = fdt_getprop(fdt, dev_node, "pci-id", &len);
 			if (!pci_id_str) {
@@ -279,10 +282,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s' for device '%s'\n",
-				       pci_id_str, dev_name);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s' for device '%s'\n",
+				       len, pci_id_str, dev_name);
+				return ret;
 			}
 
 			vendor_prop = fdt_getprop(fdt, dev_node, "vendor-id", &len);
@@ -298,6 +303,13 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				       dev_name);
 				return -EINVAL;
 			}
+			vendor = fdt32_to_cpu(*vendor_prop);
+			device = fdt32_to_cpu(*device_prop);
+			if (vendor > U16_MAX || device > U16_MAX) {
+				pr_err("Out-of-range vendor-id or device-id for device '%s'\n",
+				       dev_name);
+				return -ERANGE;
+			}
 
 			pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
 			if (!pci_dev) {
@@ -307,12 +319,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 
 			strncpy(pci_dev->name, dev_name, sizeof(pci_dev->name) - 1);
 			pci_dev->name[sizeof(pci_dev->name) - 1] = '\0';
-			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
-			pci_dev->domain = (u16)domain;
-			pci_dev->bus = (u8)bus;
-			pci_dev->slot = (u8)slot;
-			pci_dev->func = (u8)func;
+			pci_dev->vendor = (u16)vendor;
+			pci_dev->device = (u16)device;
+			pci_dev->domain = domain;
+			pci_dev->bus = bus;
+			pci_dev->slot = slot;
+			pci_dev->func = func;
 
 			list_add_tail(&pci_dev->list, &instance->pci_devices);
 			instance->pci_device_count++;
@@ -501,6 +513,7 @@ static int mk_baseline_initialize_cpus(void)
 	return 0;
 }
 
+#ifdef CONFIG_PCI
 static int mk_baseline_initialize_devices(const struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev;
@@ -555,6 +568,18 @@ static int mk_baseline_initialize_devices(const struct mk_instance *instance)
 		available);
 	return 0;
 }
+#else
+static int mk_baseline_initialize_devices(const struct mk_instance *instance)
+{
+	if (!instance->pci_device_count) {
+		pr_debug("No PCI devices in the multikernel pool\n");
+		return 0;
+	}
+
+	pr_err("Cannot initialize PCI devices without CONFIG_PCI\n");
+	return -EOPNOTSUPP;
+}
+#endif
 
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 {

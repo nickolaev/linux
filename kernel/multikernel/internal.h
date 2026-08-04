@@ -26,6 +26,8 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
 int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size);
+int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
+		     u8 *slot, u8 *func);
 int mk_dt_parse_pci_host_bridges(const void *fdt, int resources_node,
 				 struct list_head *bridges, int *count,
 				 bool *valid);
@@ -43,6 +45,7 @@ void mk_cpu_ownership_unlock(void);
 void mk_cpu_ownership_assert_held(void);
 
 /* pci.c */
+#ifdef CONFIG_PCI
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
@@ -55,9 +58,58 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
-
 /* Caller must hold instance->resource_mutex. */
 void mk_pci_quiesce_instance_irqs(struct mk_instance *instance);
+#else
+static inline int mk_pci_lease_system_init(void)
+{
+	return 0;
+}
+
+static inline void mk_pci_lease_system_cleanup(void)
+{
+}
+
+static inline void mk_pci_lease_instance_init(struct mk_instance *instance)
+{
+	mutex_init(&instance->resource_mutex);
+	INIT_LIST_HEAD(&instance->pci_assignments);
+}
+
+static inline bool
+mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
+{
+	return false;
+}
+
+static inline int
+mk_pci_assign_devices(struct mk_instance *instance,
+		      const struct list_head *requested_devices,
+		      int requested_count)
+{
+	if (requested_count < 0)
+		return -EINVAL;
+
+	return requested_count ? -EOPNOTSUPP : 0;
+}
+
+static inline int mk_pci_assign_device(struct mk_instance *instance,
+				       u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int mk_pci_unassign_device(struct mk_instance *instance,
+					 u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int mk_pci_release_assignments(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 int mk_instance_force_halt(struct mk_instance *instance);
 
 /* overlay.c */

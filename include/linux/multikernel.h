@@ -879,10 +879,19 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device filtering against the instance metadata */
+#ifdef CONFIG_PCI
 bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
 				      unsigned int devfn, u16 *vendor,
 				      u16 *device);
-#ifdef CONFIG_X86
+#else
+static inline bool
+mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				 unsigned int devfn, u16 *vendor, u16 *device)
+{
+	return false;
+}
+#endif
+#if defined(CONFIG_X86) && defined(CONFIG_PCI)
 bool mk_pci_msi_controlled(struct pci_dev *dev);
 int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
 int mk_pci_msi_activate(struct pci_dev *dev);
@@ -928,7 +937,14 @@ void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+#ifdef CONFIG_PCI
 int mk_pci_prepare_instance_start(struct mk_instance *instance);
+#else
+static inline int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {

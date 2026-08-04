@@ -20,6 +20,7 @@
 #include <linux/pci.h>
 #include <linux/sizes.h>
 #include <linux/cpumask.h>
+#include <linux/hex.h>
 #include <linux/multikernel.h>
 #include <asm/multikernel.h>
 
@@ -30,6 +31,48 @@ mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
 				  struct mk_pci_host_bridge *bridges,
 				  size_t capacity)
 {
+	return 0;
+}
+
+static int mk_pci_parse_hex(const char *str, size_t digits, u32 *value)
+{
+	size_t i;
+	u32 parsed = 0;
+
+	for (i = 0; i < digits; i++) {
+		int digit = hex_to_bin(str[i]);
+
+		if (digit < 0)
+			return -EINVAL;
+		parsed = (parsed << 4) | digit;
+	}
+
+	*value = parsed;
+	return 0;
+}
+
+int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
+		     u8 *slot, u8 *func)
+{
+	u32 parsed_domain, parsed_bus, parsed_slot, parsed_func;
+
+	if (len != (int)sizeof("0000:00:00.0") || pci_id[12] != '\0' ||
+	    pci_id[4] != ':' || pci_id[7] != ':' || pci_id[10] != '.')
+		return -EINVAL;
+
+	if (mk_pci_parse_hex(pci_id, 4, &parsed_domain) ||
+	    mk_pci_parse_hex(pci_id + 5, 2, &parsed_bus) ||
+	    mk_pci_parse_hex(pci_id + 8, 2, &parsed_slot) ||
+	    mk_pci_parse_hex(pci_id + 11, 1, &parsed_func))
+		return -EINVAL;
+	if (parsed_domain > U16_MAX || parsed_bus > U8_MAX ||
+	    parsed_slot > 31 || parsed_func > 7)
+		return -ERANGE;
+
+	*domain = (u16)parsed_domain;
+	*bus = (u8)parsed_bus;
+	*slot = (u8)parsed_slot;
+	*func = (u8)parsed_func;
 	return 0;
 }
 
@@ -366,9 +409,11 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	const fdt32_t *vendor_prop, *device_prop;
 	const fdt64_t *resources_prop;
 	struct mk_pci_device *pci_dev;
-	unsigned int domain, bus, slot, func;
+	u32 vendor, device;
+	u16 domain;
+	u8 bus, slot, func;
 	const char *node_name;
-	int len, i;
+	int len, i, ret;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
 
@@ -379,10 +424,11 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		return -EINVAL;
 	}
 
-	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
-		       pci_id_str);
-		return -EINVAL;
+	ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus, &slot, &func);
+	if (ret) {
+		pr_err("Invalid or out-of-range pci-id: '%.*s' (expected domain:bus:slot.func)\n",
+		       len, pci_id_str);
+		return ret;
 	}
 
 	vendor_prop = fdt_getprop(source_fdt, dev_node, "vendor-id", &len);
@@ -398,6 +444,13 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		       device_name, node_name ? node_name : "<unnamed>");
 		return -EINVAL;
 	}
+	vendor = fdt32_to_cpu(*vendor_prop);
+	device = fdt32_to_cpu(*device_prop);
+	if (vendor > U16_MAX || device > U16_MAX) {
+		pr_err("Out-of-range vendor-id or device-id in device '%s'\n",
+		       device_name);
+		return -ERANGE;
+	}
 
 	pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
 	if (!pci_dev) {
@@ -406,12 +459,12 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 	}
 
 	strscpy(pci_dev->name, device_name, sizeof(pci_dev->name));
-	pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-	pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
-	pci_dev->domain = (u16)domain;
-	pci_dev->bus = (u8)bus;
-	pci_dev->slot = (u8)slot;
-	pci_dev->func = (u8)func;
+	pci_dev->vendor = (u16)vendor;
+	pci_dev->device = (u16)device;
+	pci_dev->domain = domain;
+	pci_dev->bus = bus;
+	pci_dev->slot = slot;
+	pci_dev->func = func;
 	resources_prop = fdt_getprop(source_fdt, dev_node, "bar-resources", &len);
 	if (resources_prop) {
 		if (len != MK_PCI_RESOURCE_COUNT * 3 * sizeof(*resources_prop)) {

@@ -173,10 +173,13 @@ int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 struct mk_pci_host_bridge;
 
 #ifdef CONFIG_MULTIKERNEL
-void __init x86_multikernel_pci_platform_init(void);
 int mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
 				      struct mk_pci_host_bridge *bridges,
 				      size_t capacity);
+#endif
+
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_PCI)
+void __init x86_multikernel_pci_platform_init(void);
 #else
 static inline void x86_multikernel_pci_platform_init(void) { }
 #endif
