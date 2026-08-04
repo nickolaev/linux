@@ -980,8 +980,11 @@ int mk_instance_abort_spawn(struct mk_instance *instance);
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
-/* Device probe filtering against the instance's allowlist */
+/* Device filtering against the current kernel's boot tree */
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				      unsigned int devfn, u16 *vendor,
+				      u16 *device);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -1035,6 +1038,14 @@ static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	return true;
 }
+
+static inline bool
+mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				 unsigned int devfn, u16 *vendor, u16 *device)
+{
+	return false;
+}
+
 static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
@@ -1092,7 +1103,7 @@ int __init mk_instance_restore_from_manifest(void);
  */
 
 /**
- * PCI Device Enforcement Functions
+ * PCI Device Filtering Functions
  */
 
 /**
@@ -1100,13 +1111,24 @@ int __init mk_instance_restore_from_manifest(void);
  * @bus: PCI bus
  * @devfn: PCI device/function number
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist, avoiding hardware conflicts on bare metal.
+ * Returns: true if probing should proceed, false to skip entirely.
+ */
+
+/**
+ * mk_pci_get_assigned_identity_bdf() - Identify an assigned PCI function
+ * @domain: PCI domain number
+ * @bus: PCI bus number
+ * @devfn: PCI device/function number
+ * @vendor: optional assigned vendor ID output
+ * @device: optional assigned device ID output
  *
- * Returns: true if probing should proceed, false to skip entirely
+ * The raw x86 PCI configuration wrappers use this BDF-only lookup before
+ * reaching their hardware backend. Spawn kernels accept exact functions
+ * recorded in their boot tree; a host kernel without a parent keeps normal
+ * PCI discovery. A privileged spawn kernel can bypass these wrappers, so the
+ * check prevents accidental access rather than isolating a hostile kernel.
  *
- * Declared above with the CONFIG_MULTIKERNEL stubs.
+ * Returns: true for an exact assignment match, false otherwise.
  */
 
 /**
