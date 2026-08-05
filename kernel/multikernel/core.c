@@ -16,6 +16,35 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
+/* CPU moves hold the transaction lock before the ownership lock. */
+static DEFINE_MUTEX(mk_cpu_transaction_mutex);
+static DEFINE_MUTEX(mk_cpu_ownership_mutex);
+
+void mk_cpu_transaction_lock(void)
+{
+	mutex_lock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_transaction_unlock(void)
+{
+	mutex_unlock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_ownership_lock(void)
+{
+	mutex_lock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_unlock(void)
+{
+	mutex_unlock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_assert_held(void)
+{
+	lockdep_assert_held(&mk_cpu_ownership_mutex);
+}
+
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
 	if (!instance || mk_cpu_set_empty(instance->cpus))
@@ -484,6 +513,7 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *requested;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
 	int unavailable = 0;
@@ -495,14 +525,25 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	requested_count = mk_cpu_set_count(cpus);
+	requested = mk_cpu_set_alloc();
+	if (!requested)
+		return -ENOMEM;
+
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(requested, cpus);
+	if (ret)
+		goto out_unlock;
+
+	requested_count = mk_cpu_set_count(requested);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested for instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto out_unlock;
 	}
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, requested) {
 		if (!mk_cpu_set_contains(mk_pool->cpus, phys_cpu)) {
 			pr_err("CPU %llu not available in the pool\n",
 			       phys_cpu);
@@ -519,15 +560,16 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 
 	if (unavailable > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not available\n",
-		       instance->id, instance->name, unavailable);
-		return -EBUSY;
+			instance->id, instance->name, unavailable);
+		ret = -EBUSY;
+		goto out_unlock;
 	}
 
 	ret = mk_cpu_set_reserve(instance->cpus, requested_count);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, requested) {
 		mk_cpu_set_del(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
@@ -536,7 +578,12 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+	ret = 0;
+out_unlock:
+	mk_cpu_ownership_unlock();
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(requested);
+	return ret;
 }
 
 /**
@@ -552,6 +599,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *requested;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
 	int not_found = 0;
@@ -563,15 +611,26 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -EINVAL;
 	}
 
-	requested_count = mk_cpu_set_count(cpus);
+	requested = mk_cpu_set_alloc();
+	if (!requested)
+		return -ENOMEM;
+
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(requested, cpus);
+	if (ret)
+		goto out_unlock;
+
+	requested_count = mk_cpu_set_count(requested);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested to return from instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto out_unlock;
 	}
 
 	/* Validate all CPUs are assigned to this instance */
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, requested) {
 		if (!mk_cpu_set_contains(instance->cpus, phys_cpu)) {
 			pr_err("CPU %llu not assigned to instance %d (%s)\n",
 			       phys_cpu, instance->id, instance->name);
@@ -581,23 +640,18 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 
 	if (not_found > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not assigned to this instance\n",
-		       instance->id, instance->name, not_found);
-		return -EINVAL;
+			instance->id, instance->name, not_found);
+		ret = -EINVAL;
+		goto out_unlock;
 	}
 
 	ret = mk_cpu_set_reserve(mk_pool->cpus, requested_count);
 	if (ret)
-		return ret;
+		goto out_unlock;
 
-	mk_cpu_set_format(buf, sizeof(buf), cpus);
+	mk_cpu_set_format(buf, sizeof(buf), requested);
 
-	/*
-	 * @cpus may alias instance->cpus (returning everything on
-	 * teardown), so walk it back-to-front: a deletion then never
-	 * shifts entries the walk has yet to visit.
-	 */
-	for (i = requested_count; i-- > 0; ) {
-		phys_cpu = cpus->ids[i];
+	mk_cpu_set_for_each(i, phys_cpu, requested) {
 		mk_cpu_set_add(mk_pool->cpus, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
@@ -605,7 +659,12 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+	ret = 0;
+out_unlock:
+	mk_cpu_ownership_unlock();
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(requested);
+	return ret;
 }
 
 /**

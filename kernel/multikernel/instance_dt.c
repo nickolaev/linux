@@ -463,12 +463,19 @@ int __init mk_instance_restore_from_manifest(void)
 			pr_err("Failed to allocate the self instance\n");
 			return -ENOMEM;
 		}
-		/* Initially, root owns all online CPUs (physical IDs) */
-		for_each_online_cpu(cpu) {
-			if (mk_cpu_set_add(instance->cpus,
-					   arch_cpu_physical_id(cpu)))
-				pr_warn("Failed to add CPU %d to the self instance\n",
-					cpu);
+		/*
+		 * Root owns every enumerated CPU, including APs that become online
+		 * only after early initcalls complete.
+		 */
+		for_each_present_cpu(cpu) {
+			ret = mk_cpu_set_add(instance->cpus,
+					     arch_cpu_physical_id(cpu));
+			if (ret) {
+				pr_err("Failed to track CPU %d in the self instance: %d\n",
+				       cpu, ret);
+				mk_instance_free(instance);
+				return ret;
+			}
 		}
 		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);
 		pr_info("Self instance initialized with CPUs (physical): %s\n",

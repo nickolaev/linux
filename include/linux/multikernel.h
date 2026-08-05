@@ -14,7 +14,6 @@
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
-#include <linux/mutex.h>
 #include <linux/numa.h>
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
@@ -61,12 +60,14 @@ bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id);
 bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
-
 unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
 bool mk_cpu_set_empty(const struct mk_cpu_set *set);
 mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
 bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 		    mk_phys_cpu_t *id);
+
+void mk_cpu_transaction_lock(void);
+void mk_cpu_transaction_unlock(void);
 
 #define mk_cpu_set_for_each(i, id, set)					\
 	for ((i) = 0;							\
