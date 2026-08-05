@@ -77,25 +77,6 @@ struct mk_cpu_hotplug_work {
 	u32 operation;           /* MK_RES_CPU_ADD or MK_RES_CPU_REMOVE */
 };
 
-/*
- * Ownership tracking for this kernel's own hotplug: root_instance->cpus
- * is the set of CPUs this kernel owns, in the host and in spawn kernels
- * alike. The assignable-pool bookkeeping (mk_cpu_pool) is not done here;
- * it belongs to the mk_send_cpu_* initiator paths of the kernel that
- * manages the pool.
- */
-static void mk_account_cpu_online(mk_phys_cpu_t cpu_id)
-{
-	if (root_instance->cpus && mk_cpu_set_add(root_instance->cpus, cpu_id))
-		pr_warn("Multikernel hotplug: Failed to track CPU %llu\n",
-			cpu_id);
-}
-
-static void mk_account_cpu_offline(mk_phys_cpu_t cpu_id)
-{
-	mk_cpu_set_del(root_instance->cpus, cpu_id);
-}
-
 /**
  * Search present CPUs (not possible CPUs) to find the logical CPU with matching
  * physical ID. Using present CPUs is important because topology can change during
@@ -124,6 +105,7 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	pr_info("Multikernel hotplug: Adding CPU %llu (numa=%d, flags=0x%x)\n",
 		cpu_id, (int)numa_node, flags);
 
+	mk_cpu_transaction_lock();
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
 		/*
@@ -136,7 +118,8 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 		if (logical_cpu < 0) {
 			pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
 			       cpu_id);
-			return -ENODEV;
+			ret = -ENODEV;
+			goto unlock_transaction;
 		}
 		set_cpu_present(logical_cpu, true);
 	}
@@ -144,18 +127,37 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already online\n",
 			logical_cpu, cpu_id);
-		mk_account_cpu_online(cpu_id);
-		return 0;
+		mk_cpu_ownership_lock();
+		if (root_instance->cpus) {
+			ret = mk_cpu_set_add(root_instance->cpus, cpu_id);
+			if (ret)
+				pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+					cpu_id);
+		}
+		mk_cpu_ownership_unlock();
+		ret = 0;
+		goto unlock_transaction;
 	}
+
+	mk_cpu_ownership_lock();
+	if (root_instance->cpus) {
+		ret = mk_cpu_set_reserve(root_instance->cpus, 1);
+		if (ret) {
+			mk_cpu_ownership_unlock();
+			goto unlock_transaction;
+		}
+	}
+	mk_cpu_ownership_unlock();
 
 	if (!get_cpu_device(logical_cpu)) {
 		struct cpu *c = &per_cpu(cpu_devices, logical_cpu);
+
 		c->hotpluggable = true;
 		ret = register_cpu(c, logical_cpu);
 		if (ret) {
 			pr_err("Multikernel hotplug: Failed to register CPU %d: %d\n",
 			       logical_cpu, ret);
-			return ret;
+			goto unlock_transaction;
 		}
 	}
 
@@ -163,10 +165,19 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to add CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
-		return ret;
+		goto unlock_transaction;
 	}
 
-	mk_account_cpu_online(cpu_id);
+	mk_cpu_ownership_lock();
+	if (root_instance->cpus) {
+		ret = mk_cpu_set_add(root_instance->cpus, cpu_id);
+		if (ret)
+			pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
+				cpu_id);
+	}
+	mk_cpu_ownership_unlock();
+	if (ret)
+		goto unlock_transaction;
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);
@@ -183,7 +194,10 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	pr_info("Multikernel hotplug: Successfully added CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
-	return 0;
+	ret = 0;
+unlock_transaction:
+	mk_cpu_transaction_unlock();
+	return ret;
 }
 
 static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
@@ -192,24 +206,33 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	int ret;
 	struct mk_hotplug_op *op;
 
+	mk_cpu_transaction_lock();
 	logical_cpu = mk_cpu_to_logical(cpu_id);
 	if (logical_cpu < 0) {
 		pr_err("Multikernel hotplug: Physical CPU %llu not found\n", cpu_id);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto unlock_transaction;
 	}
+
+	mk_cpu_ownership_lock();
 
 	if (!cpu_online(logical_cpu)) {
 		pr_warn("Multikernel hotplug: CPU %d (phys %llu) already offline\n",
 			logical_cpu, cpu_id);
-		mk_account_cpu_offline(cpu_id);
-		return 0;
+		mk_cpu_set_del(root_instance->cpus, cpu_id);
+		mk_cpu_ownership_unlock();
+		ret = 0;
+		goto unlock_transaction;
 	}
 
 	/* Don't allow removing CPU 0 (boot processor) */
 	if (logical_cpu == 0) {
 		pr_err("Multikernel hotplug: Cannot remove boot CPU\n");
-		return -EINVAL;
+		mk_cpu_ownership_unlock();
+		ret = -EINVAL;
+		goto unlock_transaction;
 	}
+	mk_cpu_ownership_unlock();
 
 	mk_set_pool_cpu(logical_cpu, true);
 
@@ -218,10 +241,12 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 		pr_err("Multikernel hotplug: Failed to remove CPU %d (phys %llu): %d\n",
 		       logical_cpu, cpu_id, ret);
 		mk_set_pool_cpu(logical_cpu, false);
-		return ret;
+		goto unlock_transaction;
 	}
 
-	mk_account_cpu_offline(cpu_id);
+	mk_cpu_ownership_lock();
+	mk_cpu_set_del(root_instance->cpus, cpu_id);
+	mk_cpu_ownership_unlock();
 
 	/*
 	 * Clear CPU from present mask to prevent host kernel from trying
@@ -244,7 +269,10 @@ static int mk_do_cpu_remove(mk_phys_cpu_t cpu_id)
 	pr_info("Multikernel hotplug: Successfully removed CPU %d (phys %llu)\n",
 		logical_cpu, cpu_id);
 
-	return 0;
+	ret = 0;
+unlock_transaction:
+	mk_cpu_transaction_unlock();
+	return ret;
 }
 
 static void mk_cpu_add_work_fn(struct work_struct *work)
@@ -1230,6 +1258,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
+		raw_spin_lock_init(&cpus.lock);
 		/*
 		 * A CPU the instance has already run on is parked on that
 		 * instance's context. Bring it back to the host slot before
@@ -1249,32 +1278,45 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto out;
 	}
 
-	/* The pool set must be able to take the CPU once it parks */
+	/* The pool set must exist before the ownership transaction starts. */
 	if (!mk_cpu_pool) {
 		ret = -ENODEV;
 		goto out;
 	}
 
-	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
-	if (ret)
-		goto out;
-
+	mk_cpu_transaction_lock();
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_REMOVE, cpu_id);
 	if (!pending) {
 		ret = -ENOMEM;
-		goto out;
+		goto unlock_transaction;
 	}
 
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
-			      &payload, sizeof(payload));
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
+		pr_err("Multikernel hotplug: CPU %llu not assigned to instance %d\n",
+		       cpu_id, instance_id);
+		mk_msg_pending_wait(pending, 0);
+		ret = -EINVAL;
+		goto unlock_ownership;
+	}
+
+	ret = mk_cpu_set_reserve(mk_cpu_pool, 1);
+	if (ret) {
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_ownership;
+	}
+	mk_cpu_ownership_unlock();
+
+	ret = mk_send_message(target_instance->id, MK_MSG_RESOURCE,
+			      MK_RES_CPU_REMOVE, &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		goto out;
+		goto unlock_transaction;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		goto out;
+		goto unlock_transaction;
 
 	/*
 	 * The spawn kernel parked the CPU on its own context when it went
@@ -1288,13 +1330,27 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: CPU %llu offline in instance %d but not reparked to host: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
+		goto unlock_transaction;
 	}
 
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
+		ret = -ESTALE;
+		goto unlock_ownership;
+	}
+	ret = mk_cpu_set_add(mk_cpu_pool, cpu_id);
+	if (ret) {
+		pr_warn("Multikernel hotplug: Failed to track CPU %llu in pool\n",
+			cpu_id);
+		goto unlock_ownership;
+	}
 	mk_cpu_set_del(target_instance->cpus, cpu_id);
-	mk_cpu_set_add(mk_cpu_pool, cpu_id);
 
 	ret = 0;
+unlock_ownership:
+	mk_cpu_ownership_unlock();
+unlock_transaction:
+	mk_cpu_transaction_unlock();
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1339,25 +1395,35 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		       instance_id);
 		return -ENODEV;
 	}
+	if (arch_cpu_from_physical_id(cpu_id) == 0) {
+		pr_err("Multikernel hotplug: CPU %llu is reserved for host control\n",
+		       cpu_id);
+		ret = -EINVAL;
+		goto out;
+	}
 
 	/* For non-running instances, transfer CPU from root using existing API */
 	if (target_instance->state != MK_STATE_ACTIVE) {
 		struct mk_cpu_set cpus = { .nr = 1, .cap = 1, .ids = &cpu_id };
 
+		raw_spin_lock_init(&cpus.lock);
 		ret = mk_instance_transfer_cpus(target_instance, &cpus);
 		goto out;
 	}
 
-	/*
-	 * Only a CPU from the assignable pool is parked on the host slot;
-	 * publishing a wakeup for any other CPU can only time out.
-	 */
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
 	if (!mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
-		pr_err("Multikernel hotplug: CPU %llu is not in this kernel's pool\n",
+		pr_err("Multikernel hotplug: CPU %llu not available in the pool\n",
 		       cpu_id);
 		ret = -EBUSY;
-		goto out;
+		goto unlock_ownership;
 	}
+
+	ret = mk_cpu_set_reserve(target_instance->cpus, 1);
+	if (ret)
+		goto unlock_ownership;
+	mk_cpu_ownership_unlock();
 
 	/*
 	 * The CPU is parked on the host slot, where the spawn kernel's
@@ -1368,22 +1434,22 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 	if (ret < 0) {
 		pr_err("Multikernel hotplug: Failed to repark CPU %llu to instance %d: %d\n",
 		       cpu_id, instance_id, ret);
-		goto out;
+		goto unlock_transaction;
 	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_CPU_ADD, cpu_id);
 	if (!pending) {
 		mk_repark_cpu_to_host(target_instance, cpu_id);
 		ret = -ENOMEM;
-		goto out;
+		goto unlock_transaction;
 	}
 
-	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_CPU_ADD,
-			      &payload, sizeof(payload));
+	ret = mk_send_message(target_instance->id, MK_MSG_RESOURCE,
+			      MK_RES_CPU_ADD, &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto unlock_transaction;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
@@ -1395,15 +1461,27 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		 * watching the context and this times out harmlessly.
 		 */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
-		goto out;
+		goto unlock_transaction;
 	}
 
-	if (mk_cpu_set_add(target_instance->cpus, cpu_id))
+	mk_cpu_ownership_lock();
+	if (!mk_cpu_set_contains(mk_cpu_pool, cpu_id)) {
+		ret = -ESTALE;
+		goto unlock_ownership;
+	}
+	ret = mk_cpu_set_add(target_instance->cpus, cpu_id);
+	if (ret) {
 		pr_warn("Multikernel hotplug: Failed to track CPU %llu in instance %d\n",
 			cpu_id, instance_id);
+		goto unlock_ownership;
+	}
 	mk_cpu_set_del(mk_cpu_pool, cpu_id);
 
 	ret = 0;
+unlock_ownership:
+	mk_cpu_ownership_unlock();
+unlock_transaction:
+	mk_cpu_transaction_unlock();
 out:
 	mk_instance_put(target_instance);
 	return ret;

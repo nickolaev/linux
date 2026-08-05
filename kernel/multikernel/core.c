@@ -15,6 +15,35 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
+/* CPU moves hold the transaction lock before the ownership lock. */
+static DEFINE_MUTEX(mk_cpu_transaction_mutex);
+static DEFINE_MUTEX(mk_cpu_ownership_mutex);
+
+void mk_cpu_transaction_lock(void)
+{
+	mutex_lock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_transaction_unlock(void)
+{
+	mutex_unlock(&mk_cpu_transaction_mutex);
+}
+
+void mk_cpu_ownership_lock(void)
+{
+	mutex_lock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_unlock(void)
+{
+	mutex_unlock(&mk_cpu_ownership_mutex);
+}
+
+void mk_cpu_ownership_assert_held(void)
+{
+	lockdep_assert_held(&mk_cpu_ownership_mutex);
+}
+
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
 {
 	if (!instance || mk_cpu_set_empty(instance->cpus))

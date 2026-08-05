@@ -38,6 +38,13 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
 
+/* CPU ownership serialization: transaction must be acquired first. */
+void mk_cpu_transaction_lock(void);
+void mk_cpu_transaction_unlock(void);
+void mk_cpu_ownership_lock(void);
+void mk_cpu_ownership_unlock(void);
+void mk_cpu_ownership_assert_held(void);
+
 /* pci.c */
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
