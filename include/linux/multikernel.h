@@ -15,6 +15,7 @@
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
 struct pci_bus;
 
 /**
@@ -31,6 +32,7 @@ typedef u64 mk_phys_cpu_t;
 #define MK_PHYS_CPU_INVALID	(~(mk_phys_cpu_t)0)
 
 struct mk_cpu_set {
+	raw_spinlock_t lock;
 	unsigned int nr;	/* Entries in use */
 	unsigned int cap;	/* Allocated capacity */
 	mk_phys_cpu_t *ids;
@@ -45,26 +47,15 @@ bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id);
 bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
-
-static inline unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
-{
-	return set ? set->nr : 0;
-}
-
-static inline bool mk_cpu_set_empty(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_count(set) == 0;
-}
-
-static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_empty(set) ? MK_PHYS_CPU_INVALID : set->ids[0];
-}
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
+bool mk_cpu_set_empty(const struct mk_cpu_set *set);
+mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
+bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
+		    mk_phys_cpu_t *id);
 
 #define mk_cpu_set_for_each(i, id, set)					\
 	for ((i) = 0;							\
-	     (set) && (i) < (set)->nr &&				\
-	     (((id) = (set)->ids[(i)]), true);				\
+	     mk_cpu_set_get((set), (i), &(id));				\
 	     (i)++)
 
 /**
