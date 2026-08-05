@@ -77,8 +77,14 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 /* IPI ring buffer size - must be power of 2 for efficient modulo */
 #define MK_IPI_RING_SIZE 64
 
+#define MK_IPI_SLOT_EMPTY	0
+#define MK_IPI_SLOT_WRITING	1
+#define MK_IPI_SLOT_READY	2
+#define MK_IPI_SLOT_CONSUMING	3
+
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	atomic_t state;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
 	unsigned int type;      /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
@@ -87,15 +93,34 @@ struct mk_ipi_data {
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
+	atomic_t head;                          /* Producer allocation cursor */
+	atomic_t tail;                          /* Consumer scan cursor */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
 };
 
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
+	atomic_t emergency_shutdown;
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */
 };
+
+static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
+{
+	unsigned int i;
+
+	atomic_set(&ring->head, 0);
+	atomic_set(&ring->tail, 0);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		WRITE_ONCE(ring->entries[i].data_size, 0);
+		atomic_set(&ring->entries[i].state, MK_IPI_SLOT_EMPTY);
+	}
+}
+
+static inline void mk_shared_data_reset(struct mk_shared_data *shared)
+{
+	atomic_set(&shared->emergency_shutdown, 0);
+	mk_ipi_ring_reset(&shared->ring);
+}
 
 /* Function pointer type for IPI callbacks */
 typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, void *ctx);
@@ -274,7 +299,8 @@ struct mk_shutdown_payload {
  * Message handler callback type
  */
 typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx);
+				 void *payload, u32 payload_len,
+				 mk_phys_cpu_t sender_cpu, void *ctx);
 
 /* Opaque type for pending message tracking */
 struct mk_pending_msg;

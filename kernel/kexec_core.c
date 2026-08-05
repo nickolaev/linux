@@ -1782,8 +1782,10 @@ int multikernel_kexec_by_id(int mk_id)
 	 * filling this one". Anything left in there was addressed to a
 	 * kernel that is gone.
 	 */
-	if (instance->ipi_data)
+	if (instance->ipi_data) {
 		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+		mk_shared_data_reset(instance->ipi_data);
+	}
 
 	/*
 	 * Same for the other direction: whatever the halted instance left

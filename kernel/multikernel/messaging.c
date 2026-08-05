@@ -86,7 +86,8 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
 		 msg_type, msg_subtype, payload_len, data->sender_cpu);
 
 	/* Call the registered handler for this message type */
-	type_handler->msg_handler(msg_type, msg_subtype, payload, payload_len, type_handler->context);
+	type_handler->msg_handler(msg_type, msg_subtype, payload, payload_len,
+				  data->sender_cpu, type_handler->context);
 }
 
 /*

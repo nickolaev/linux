@@ -21,40 +21,70 @@ static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lo
 static void mk_ipi_drain_ring(void);
 
 /*
- * Ring indices live in memory another kernel instance can write, so every
- * read is masked before it indexes the entry array. An instance that dies
- * mid-update must not be able to walk this kernel off the end of its ring.
+ * head is an allocation cursor, not the consumer-visible publication point.
+ * A producer killed while WRITING can strand only its claimed slot; READY
+ * slots elsewhere remain visible to the consumer and to the NMI shutdown scan.
  */
-static inline unsigned int mk_ring_idx(unsigned int i)
+static int mk_ipi_ring_claim_slot(struct mk_ipi_ring *ring,
+				  struct mk_ipi_data **slot_out)
 {
-	return i & (MK_IPI_RING_SIZE - 1);
+	struct mk_ipi_data *slot;
+	unsigned int scanned = 0;
+	unsigned int idx;
+	int head;
+	int next;
+
+	while (scanned < MK_IPI_RING_SIZE) {
+		head = atomic_read(&ring->head);
+		idx = head & (MK_IPI_RING_SIZE - 1);
+		next = (idx + 1) & (MK_IPI_RING_SIZE - 1);
+
+		if (atomic_cmpxchg(&ring->head, head, next) != head) {
+			cpu_relax();
+			continue;
+		}
+
+		slot = &ring->entries[idx];
+		if (atomic_cmpxchg(&slot->state, MK_IPI_SLOT_EMPTY,
+				   MK_IPI_SLOT_WRITING) == MK_IPI_SLOT_EMPTY) {
+			*slot_out = slot;
+			return 0;
+		}
+
+		scanned++;
+	}
+
+	return -ENOSPC;
+}
+
+static void mk_ipi_slot_release(struct mk_ipi_data *slot)
+{
+	WRITE_ONCE(slot->data_size, 0);
+	atomic_set_release(&slot->state, MK_IPI_SLOT_EMPTY);
 }
 
 /**
  * mk_ipi_ring_drop_pending - Discard everything queued in this kernel's ring
  *
- * Called when an instance is re-spawned. A halting instance parks its CPUs
- * wherever they were, including between claiming a ring slot and publishing
- * it, and the drain stops at such a slot forever. Anything still queued was
- * sent by a kernel that is gone, so drop it all rather than let one
- * abandoned slot wedge the ring.
+ * Called after the previous instance has halted and immediately before this
+ * kernel is re-spawned, when no producers can still access the ring.
  */
 void mk_ipi_ring_drop_pending(void)
 {
 	struct mk_ipi_ring *ring;
-	unsigned int head, tail;
+	unsigned int i;
 
 	if (!root_instance || !root_instance->ipi_data)
 		return;
 
 	ring = &root_instance->ipi_data->ring;
-	head = mk_ring_idx(atomic_read(&ring->head));
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		WRITE_ONCE(ring->entries[i].data_size, 0);
+		atomic_set(&ring->entries[i].state, MK_IPI_SLOT_EMPTY);
+	}
 
-	for (tail = mk_ring_idx(atomic_read(&ring->tail)); tail != head;
-	     tail = mk_ring_idx(tail + 1))
-		ring->entries[tail].data_size = 0;
-
-	atomic_set(&ring->tail, head);
+	atomic_set(&ring->head, 0);
+	atomic_set(&ring->tail, 0);
 }
 
 /**
@@ -133,8 +163,9 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 {
 	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
-	unsigned int head, next_head, tail;
+	struct mk_ipi_ring *ring;
 	mk_phys_cpu_t target;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
@@ -169,46 +200,31 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		return -ENODEV;
 	}
 
-	/* Try to enqueue the message in the ring buffer */
-	do {
-		head = mk_ring_idx(atomic_read(&instance->ipi_data->ring.head));
-		next_head = mk_ring_idx(head + 1);
-		tail = mk_ring_idx(atomic_read(&instance->ipi_data->ring.tail));
+	ring = &instance->ipi_data->ring;
+	ret = mk_ipi_ring_claim_slot(ring, &slot);
+	if (ret) {
+		/*
+		 * A doorbell can be coalesced while the target is draining this
+		 * ring.  Kick it again before reporting backpressure so READY
+		 * entries cannot remain stranded without another notification.
+		 */
+		mk_arch_send_ipi(target);
+		printk_deferred(KERN_WARNING
+				"multikernel: IPI ring full for instance %d\n",
+				instance_id);
+		mk_instance_put(instance);
+		return ret;
+	}
 
-		/* Check if ring buffer is full */
-		if (next_head == tail) {
-			/*
-			 * Console output reaches this path, so a plain printk
-			 * here re-enters the console write that called us and
-			 * deadlocks on its lock with interrupts already off.
-			 */
-			printk_deferred(KERN_WARNING
-					"multikernel: IPI ring full for instance %d (head=%u, tail=%u)\n",
-					instance_id, head, tail);
-			mk_instance_put(instance);
-			return -ENOSPC;
-		}
-
-		/* Try to claim this slot atomically */
-	} while (atomic_cmpxchg(&instance->ipi_data->ring.head, head, next_head) != head);
-
-	/* We've claimed slot 'head', now fill it */
-	slot = &instance->ipi_data->ring.entries[head];
-
+	WRITE_ONCE(slot->data_size, 0);
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;
 
 	if (data && data_size > 0)
 		memcpy(slot->buffer, data, data_size);
 
-	/*
-	 * data_size publishes the slot: the reader treats a zero as "the
-	 * producer has claimed this slot but has not filled it yet" and
-	 * waits. Claiming the slot advanced head, so a reader can already
-	 * be looking at it; everything above must be visible first.
-	 */
-	smp_store_release(&slot->data_size, data_size);
-
+	WRITE_ONCE(slot->data_size, data_size);
+	atomic_set_release(&slot->state, MK_IPI_SLOT_READY);
 	mk_arch_send_ipi(target);
 
 	mk_instance_put(instance);
@@ -219,44 +235,31 @@ static void mk_ipi_drain_ring(void)
 {
 	struct mk_ipi_data *slot;
 	struct mk_ipi_handler *handler;
-	unsigned int head, tail, next_tail;
+	struct mk_ipi_ring *ring;
+	unsigned int tail, idx, scanned;
 	size_t data_size;
 	int messages_processed = 0;
 
 	if (!root_instance || !root_instance->ipi_data)
 		return;
 
-	while (1) {
-		tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
-		head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
+	ring = &root_instance->ipi_data->ring;
+	tail = atomic_read(&ring->tail);
 
-		if (tail == head)
-			break;
+	for (scanned = 0; scanned < MK_IPI_RING_SIZE; scanned++) {
+		idx = (tail + scanned) & (MK_IPI_RING_SIZE - 1);
+		slot = &ring->entries[idx];
 
-		slot = &root_instance->ipi_data->ring.entries[tail];
+		if (atomic_cmpxchg_acquire(&slot->state, MK_IPI_SLOT_READY,
+					   MK_IPI_SLOT_CONSUMING) !=
+		    MK_IPI_SLOT_READY)
+			continue;
 
-		/*
-		 * Pairs with the store_release in multikernel_send_ipi_data().
-		 * Zero means the sender claimed this slot but has not
-		 * finished writing it. Leave it alone: skipping it would
-		 * drop the message it is about to publish. Its own IPI, or
-		 * the next one, brings us back here.
-		 *
-		 * A sender stopped before publishing leaves its slot zero
-		 * forever; mk_ipi_ring_drop_pending() clears those out when
-		 * the instance is re-spawned.
-		 */
-		data_size = smp_load_acquire(&slot->data_size);
-		if (data_size == 0)
-			break;
-
+		data_size = READ_ONCE(slot->data_size);
 		if (data_size > MK_MAX_DATA_SIZE) {
 			pr_warn_once("Multikernel IPI slot %u has bad size %zu\n",
-				     tail, data_size);
-			slot->data_size = 0;
-			next_tail = mk_ring_idx(tail + 1);
-			atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
-			continue;
+				     idx, data_size);
+			goto advance_tail;
 		}
 
 		/* Dispatch to registered handler */
@@ -274,10 +277,8 @@ static void mk_ipi_drain_ring(void)
 		raw_spin_unlock(&mk_handlers_lock);
 
 advance_tail:
-		/* Mark consumed so the slot reads as unpublished again */
-		slot->data_size = 0;
-		next_tail = mk_ring_idx(tail + 1);
-		atomic_set(&root_instance->ipi_data->ring.tail, next_tail);
+		mk_ipi_slot_release(slot);
+		atomic_set(&ring->tail, (idx + 1) & (MK_IPI_RING_SIZE - 1));
 		messages_processed++;
 
 		if (messages_processed >= MK_IPI_RING_SIZE)
@@ -320,8 +321,9 @@ void generic_multikernel_interrupt(void)
 /**
  * mk_has_pending_shutdown - Check if there's a pending shutdown message
  *
- * Peeks at the IPI ring buffer to check for a MK_SYS_SHUTDOWN message
- * with MK_SHUTDOWN_IMMEDIATE flag. Used by NMI handler for force halt.
+ * Checks the dedicated emergency flag published before force-halt NMIs.
+ * This path must not depend on claiming a normal IPI ring slot because a
+ * crashed producer can leave slots unavailable.
  *
  * Safe to call from NMI context (no locks, read-only peek).
  *
@@ -329,41 +331,8 @@ void generic_multikernel_interrupt(void)
  */
 bool mk_has_pending_shutdown(void)
 {
-	struct mk_ipi_data *slot;
-	struct mk_message *msg;
-	struct mk_shutdown_payload *payload;
-	unsigned int head, tail, idx, scanned;
-
 	if (!root_instance || !root_instance->ipi_data)
 		return false;
 
-	tail = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.tail));
-	head = mk_ring_idx(atomic_read(&root_instance->ipi_data->ring.head));
-
-	/*
-	 * Scan pending messages without consuming them. The trip count is
-	 * bounded by the ring size rather than by the indices alone: this
-	 * runs in NMI context, where a never-terminating loop takes the CPU
-	 * out permanently with NMIs latched.
-	 */
-	for (scanned = 0, idx = tail;
-	     idx != head && scanned < MK_IPI_RING_SIZE;
-	     idx = mk_ring_idx(idx + 1), scanned++) {
-		slot = &root_instance->ipi_data->ring.entries[idx];
-
-		if (slot->data_size < sizeof(struct mk_message))
-			continue;
-
-		msg = (struct mk_message *)slot->buffer;
-		if (msg->msg_type != MK_MSG_SYSTEM || msg->msg_subtype != MK_SYS_SHUTDOWN)
-			continue;
-
-		if (msg->payload_len >= sizeof(struct mk_shutdown_payload)) {
-			payload = (struct mk_shutdown_payload *)msg->payload;
-			if (payload->flags & MK_SHUTDOWN_IMMEDIATE)
-				return true;
-		}
-	}
-
-	return false;
+	return atomic_read_acquire(&root_instance->ipi_data->emergency_shutdown);
 }
