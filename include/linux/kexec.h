@@ -422,8 +422,6 @@ struct kimage {
 	struct {
 		struct kexec_segment *scratch;
 		phys_addr_t fdt;
-		phys_addr_t ipi;  /* IPI buffer physical address (host->spawn) */
-		phys_addr_t host_ipi;  /* Host's receive buffer (spawn->host) */
 	} kho;
 
 	/* Core ELF header buffer */
@@ -444,13 +442,9 @@ struct kimage {
 	/* Multikernel instance cross-reference */
 	struct mk_instance *mk_instance;
 
-#ifdef CONFIG_MULTIKERNEL
-	/* Multikernel spawn parameters */
-	unsigned long mk_kernel_entry;      /* Physical entry point */
-	unsigned long mk_boot_params;       /* Physical boot_params address */
-	unsigned long multikernel_pool_start; /* Pool region start */
-	unsigned long multikernel_pool_end;   /* Pool region end */
-#endif
+	/* Multikernel manifest page and message ring (physical addresses) */
+	phys_addr_t mk_manifest;
+	phys_addr_t mk_ipi;
 };
 
 /* kexec interface functions */
@@ -458,8 +452,19 @@ extern void machine_kexec(struct kimage *image);
 extern int machine_kexec_prepare(struct kimage *image);
 extern void machine_kexec_cleanup(struct kimage *image);
 extern int kernel_kexec(void);
+#ifdef CONFIG_MULTIKERNEL
 extern int multikernel_kexec_by_id(int mk_id);
 extern struct kimage *kimage_find_by_id(int mk_id);
+#else
+static inline int multikernel_kexec_by_id(int mk_id)
+{
+	return -EOPNOTSUPP;
+}
+static inline struct kimage *kimage_find_by_id(int mk_id)
+{
+	return NULL;
+}
+#endif
 extern struct page *kimage_alloc_control_pages(struct kimage *image,
 						unsigned int order);
 

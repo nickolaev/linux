@@ -339,22 +339,35 @@ static void setup_kho(const struct kimage *image, struct boot_params *params,
 	sd->type = SETUP_KEXEC_KHO;
 	sd->len = sizeof(struct kho_data);
 
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		if (!image->kho.fdt)
-			return;
-	} else if (!image->kho.fdt || !image->kho.scratch)
+	if (!image->kho.fdt || !image->kho.scratch)
 		return;
 
 	/* Add setup data */
 	kho->fdt_addr = image->kho.fdt;
 	kho->fdt_size = PAGE_SIZE;
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		kho->scratch_addr = 0;
-		kho->scratch_size = 0;
-	} else {
-		kho->scratch_addr = image->kho.scratch->mem;
-		kho->scratch_size = image->kho.scratch->bufsz;
-	}
+	kho->scratch_addr = image->kho.scratch->mem;
+	kho->scratch_size = image->kho.scratch->bufsz;
+
+	sd->next = params->hdr.setup_data;
+	params->hdr.setup_data = params_load_addr + setup_data_offset;
+}
+
+static void setup_multikernel(const struct kimage *image,
+			      struct boot_params *params,
+			      unsigned long params_load_addr,
+			      unsigned int setup_data_offset)
+{
+	struct setup_data *sd = (void *)params + setup_data_offset;
+	struct mk_setup_data *mk = (void *)sd + sizeof(*sd);
+
+	if (image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
+		return;
+
+	sd->type = SETUP_MULTIKERNEL;
+	sd->len = sizeof(struct mk_setup_data);
+
+	mk->fdt_addr = image->mk_manifest;
+	mk->fdt_size = PAGE_SIZE;
 
 	sd->next = params->hdr.setup_data;
 	params->hdr.setup_data = params_load_addr + setup_data_offset;
@@ -439,11 +452,21 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	}
 
 #ifdef CONFIG_EFI
-	/* Setup EFI state */
-	setup_efi_state(params, params_load_addr, efi_map_offset, efi_map_sz,
-			setup_data_offset);
-	setup_data_offset += sizeof(struct setup_data) +
-			sizeof(struct efi_setup_data);
+	/*
+	 * A spawn kernel gets no EFI state. It runs alongside the kernel that
+	 * owns the firmware, so entering virtual mode on the same runtime
+	 * services and enumerating variables concurrently would corrupt state
+	 * the host is using. It also has no business reserving the host's EFI
+	 * memory regions: its memory map is the instance partition.
+	 */
+	if (image->type != KEXEC_TYPE_MULTIKERNEL) {
+		setup_efi_state(params, params_load_addr, efi_map_offset,
+				efi_map_sz, setup_data_offset);
+		setup_data_offset += sizeof(struct setup_data) +
+				sizeof(struct efi_setup_data);
+	} else {
+		memset(&params->efi_info, 0, sizeof(params->efi_info));
+	}
 #endif
 
 #ifdef CONFIG_OF_FLATTREE
@@ -470,6 +493,14 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 		setup_kho(image, params, params_load_addr, setup_data_offset);
 		setup_data_offset += sizeof(struct setup_data) +
 				     sizeof(struct kho_data);
+	}
+
+	if (IS_ENABLED(CONFIG_MULTIKERNEL)) {
+		/* Point the spawn kernel at its manifest */
+		setup_multikernel(image, params, params_load_addr,
+				  setup_data_offset);
+		setup_data_offset += sizeof(struct setup_data) +
+				     sizeof(struct mk_setup_data);
 	}
 
 	/* Setup RNG seed */
@@ -663,6 +694,10 @@ static void *bzImage64_load(struct kimage *image, char *kernel,
 	if (IS_ENABLED(CONFIG_KEXEC_HANDOVER))
 		kbuf.bufsz += sizeof(struct setup_data) +
 			      sizeof(struct kho_data);
+
+	if (IS_ENABLED(CONFIG_MULTIKERNEL))
+		kbuf.bufsz += sizeof(struct setup_data) +
+			      sizeof(struct mk_setup_data);
 
 	params = kvzalloc(kbuf.bufsz, GFP_KERNEL);
 	if (!params)

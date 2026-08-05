@@ -10,10 +10,14 @@
 #include <linux/kobject.h>
 #include <linux/kernfs.h>
 #include <linux/ioport.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/cpumask.h>
 #include <linux/genalloc.h>
 #include <linux/sizes.h>
+#include <linux/spinlock.h>
+struct pci_bus;
+struct pci_dev;
 
 /**
  * Physical CPU identifiers
@@ -29,6 +33,7 @@ typedef u64 mk_phys_cpu_t;
 #define MK_PHYS_CPU_INVALID	(~(mk_phys_cpu_t)0)
 
 struct mk_cpu_set {
+	raw_spinlock_t lock;
 	unsigned int nr;	/* Entries in use */
 	unsigned int cap;	/* Allocated capacity */
 	mk_phys_cpu_t *ids;
@@ -43,26 +48,15 @@ bool mk_cpu_set_del(struct mk_cpu_set *set, mk_phys_cpu_t id);
 bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
-
-static inline unsigned int mk_cpu_set_count(const struct mk_cpu_set *set)
-{
-	return set ? set->nr : 0;
-}
-
-static inline bool mk_cpu_set_empty(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_count(set) == 0;
-}
-
-static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
-{
-	return mk_cpu_set_empty(set) ? MK_PHYS_CPU_INVALID : set->ids[0];
-}
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
+bool mk_cpu_set_empty(const struct mk_cpu_set *set);
+mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
+bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
+		    mk_phys_cpu_t *id);
 
 #define mk_cpu_set_for_each(i, id, set)					\
 	for ((i) = 0;							\
-	     (set) && (i) < (set)->nr &&				\
-	     (((id) = (set)->ids[(i)]), true);				\
+	     mk_cpu_set_get((set), (i), &(id));				\
 	     (i)++)
 
 /**
@@ -75,8 +69,14 @@ static inline mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set)
 /* IPI ring buffer size - must be power of 2 for efficient modulo */
 #define MK_IPI_RING_SIZE 64
 
+#define MK_IPI_SLOT_EMPTY	0
+#define MK_IPI_SLOT_WRITING	1
+#define MK_IPI_SLOT_READY	2
+#define MK_IPI_SLOT_CONSUMING	3
+
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
+	atomic_t state;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
 	unsigned int type;      /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
@@ -85,15 +85,34 @@ struct mk_ipi_data {
 
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
-	atomic_t head;                          /* Producer index */
-	atomic_t tail;                          /* Consumer index */
+	atomic_t head;                          /* Producer allocation cursor */
+	atomic_t tail;                          /* Consumer scan cursor */
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
 };
 
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
+	atomic_t emergency_shutdown;
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */
 };
+
+static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
+{
+	unsigned int i;
+
+	atomic_set(&ring->head, 0);
+	atomic_set(&ring->tail, 0);
+	for (i = 0; i < MK_IPI_RING_SIZE; i++) {
+		WRITE_ONCE(ring->entries[i].data_size, 0);
+		atomic_set(&ring->entries[i].state, MK_IPI_SLOT_EMPTY);
+	}
+}
+
+static inline void mk_shared_data_reset(struct mk_shared_data *shared)
+{
+	atomic_set(&shared->emergency_shutdown, 0);
+	mk_ipi_ring_reset(&shared->ring);
+}
 
 /* Function pointer type for IPI callbacks */
 typedef void (*mk_ipi_callback_t)(struct mk_ipi_data *data, void *ctx);
@@ -137,6 +156,9 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 void generic_multikernel_interrupt(void);
 
+/* Discard everything queued in this kernel's ring (instance re-spawn) */
+void mk_ipi_ring_drop_pending(void);
+
 /*
  * Multikernel Messaging System
  */
@@ -151,6 +173,7 @@ void generic_multikernel_interrupt(void);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -172,10 +195,16 @@ void generic_multikernel_interrupt(void);
 #define MK_SYS_HEARTBEAT    (MK_MSG_SYSTEM + 1)
 #define MK_SYS_SHUTDOWN     (MK_MSG_SYSTEM + 2)
 #define MK_SYS_SHUTDOWN_ACK (MK_MSG_SYSTEM + 3)
+#define MK_SYS_HALTED       (MK_MSG_SYSTEM + 4)  /* Voluntary halt notification */
 
 /* Network/vsock subtypes */
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
+/* Host-mediated PCI control-plane subtypes */
+#define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+#define MK_PCI_IRQ_REQUEST  (MK_MSG_PCI + 3)
+#define MK_PCI_IRQ_RESPONSE (MK_MSG_PCI + 4)
 
 /**
  * Core message structure
@@ -198,6 +227,56 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+};
+
+/* Pack a PCI segment and BDF into mk_io_irq_payload::device_id. */
+#define MK_PCI_IRQ_ID(domain, bus, devfn) \
+	(((u32)(domain) << 16) | ((u32)(bus) << 8) | (u32)(devfn))
+#define MK_PCI_IRQ_ID_DOMAIN(id)	((u16)((id) >> 16))
+#define MK_PCI_IRQ_ID_BUS(id)		((u8)((id) >> 8))
+#define MK_PCI_IRQ_ID_DEVFN(id)		((u8)(id))
+
+struct mk_pci_cfg_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 reg;
+	u8 len;
+	u8 write;
+	u32 value;
+};
+
+struct mk_pci_cfg_response {
+	u64 request_id;
+	s32 status;
+	u32 value;
+};
+
+enum mk_pci_irq_operation {
+	MK_PCI_IRQ_SETUP = 1,
+	MK_PCI_IRQ_BIND,
+	MK_PCI_IRQ_TEARDOWN,
+};
+
+struct mk_pci_irq_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 operation;
+	u16 vector;
+	u16 nr_vectors;
+	u8 msix;
+	u8 reserved;
+	u32 local_irq;
+};
+
+struct mk_pci_irq_response {
+	u64 request_id;
+	s32 status;
 };
 
 /* IRQ control flags */
@@ -268,7 +347,8 @@ struct mk_shutdown_payload {
  * Message handler callback type
  */
 typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx);
+				 void *payload, u32 payload_len,
+				 mk_phys_cpu_t sender_cpu, void *ctx);
 
 /* Opaque type for pending message tracking */
 struct mk_pending_msg;
@@ -308,6 +388,7 @@ int mk_register_msg_handler(u32 msg_type, mk_msg_handler_t handler, void *ctx);
  * Returns 0 on success, negative error code on failure
  */
 int mk_unregister_msg_handler(u32 msg_type, mk_msg_handler_t handler);
+void mk_poll_ipi_messages(void);
 
 /* Pending message tracking for request-response pattern */
 struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resource_id);
@@ -399,6 +480,12 @@ struct mk_memory_region {
  * Represents a single PCI device that should be accessible to an instance.
  * Format: vendor:device@domain:bus:slot.func
  */
+#define MK_PCI_RESOURCE_COUNT 6
+struct mk_pci_resource {
+	u64 start;
+	u64 end;
+	u64 flags;
+};
 struct mk_pci_device {
 	char name[64];     /* Device name from DTB (e.g., "enp9s0_dev") */
 	u16 vendor;        /* PCI vendor ID */
@@ -407,8 +494,26 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	struct mk_pci_resource resources[MK_PCI_RESOURCE_COUNT];
+	bool resources_valid;
 	struct list_head list;  /* Link to device list */
 };
+
+/**
+ * PCI host bridge configuration-space descriptor
+ *
+ * Describes an ECAM window for a PCI segment and inclusive bus range. This is
+ * platform metadata shared with an instance, not an assignable device.
+ */
+struct mk_pci_host_bridge {
+	u16 segment;
+	u8 bus_start;
+	u8 bus_end;
+	u64 ecam_base;
+	struct list_head list;
+};
+
+#define MK_MAX_PCI_HOST_BRIDGES 16
 
 /**
  * Platform device specification
@@ -450,13 +555,18 @@ struct mk_dt_config {
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
 
+	/* PCI host bridge metadata */
+	struct list_head pci_host_bridges;
+	int pci_host_bridge_count;
+	bool pci_host_bridges_valid;
+
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[7];                 /* Reduced due to added fields */
+	u32 reserved[4];
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -473,6 +583,8 @@ struct mk_instance {
 	int id;                         /* Kernel-assigned instance ID */
 	char *name;                     /* User-provided instance name */
 	enum mk_instance_state state;   /* Current state */
+	/* Serializes memory topology changes with PCI assignment leases. */
+	struct mutex resource_mutex;
 
 	/* Resource management - list of reserved memory regions */
 	struct list_head memory_regions;  /* List of struct mk_memory_region */
@@ -488,6 +600,13 @@ struct mk_instance {
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
 	int pci_device_count;            /* Number of PCI devices */
 	bool pci_devices_valid;          /* Whether PCI device list is valid */
+	/* Host-only live PCI assignment leases (private elements). */
+	struct list_head pci_assignments;
+
+	/* PCI host bridge metadata (descriptive, never transferred) */
+	struct list_head pci_host_bridges;
+	int pci_host_bridge_count;
+	bool pci_host_bridges_valid;
 
 	/* Platform device resources */
 	struct list_head platform_devices;   /* List of struct mk_platform_device */
@@ -523,7 +642,14 @@ struct mk_instance {
 	phys_addr_t ctrl_phys;
 	size_t ctrl_used;
 
-	bool cpus_on_instance_slot;	/* CPUs watch the instance context, not the host slot */
+	/*
+	 * CPUs currently parked on this instance's context rather than the
+	 * host pool slot. Membership is per CPU because it changes one CPU
+	 * at a time: hotplug moves CPUs in and out while the instance runs,
+	 * and a stopped instance can gain CPUs that are still parked on the
+	 * host slot while the ones it already ran on watch its context.
+	 */
+	struct mk_cpu_set *cpus_on_slot;
 
 	/* Sysfs representation */
 	struct kernfs_node *kn;            /* Kernfs node for this instance */
@@ -661,24 +787,6 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
 
 /**
- * mk_instance_put() - Decrement reference count
- * @instance: Instance to dereference
- *
- * May free the instance if reference count reaches zero.
- */
-void mk_instance_put(struct mk_instance *instance);
-
-/**
- * mk_instance_set_state() - Update instance state
- * @instance: Instance to update
- * @state: New state
- *
- * Updates the instance state and notifies sysfs.
- */
-void mk_instance_set_state(struct mk_instance *instance,
-			   enum mk_instance_state state);
-
-/**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool
  *
  * Notifies the host and parks every CPU in the pool wait loop, keeping
@@ -687,14 +795,14 @@ void mk_instance_set_state(struct mk_instance *instance,
 void __noreturn mk_halt_to_pool(void);
 
 /**
- * mk_instance_reserve_resources() - Reserve CPU and memory resources for instance
- * @instance: Instance to reserve resources for
- * @config: Device tree configuration with memory size and CPU assignment
+ * mk_instance_reserve_resources() - Atomically reserve instance resources
+ * @instance: Empty instance to populate
+ * @config: Parsed memory, CPU, PCI, and platform resource configuration
  *
- * Allocates the specified memory size from the multikernel pool, creates
- * memory regions, and copies CPU assignment.
+ * Reserves every configured resource class or returns all resources acquired
+ * by the attempt. A failure never leaves a partially populated instance.
  *
- * Returns 0 on success, negative error code on failure.
+ * Returns: 0 on success, negative error code on failure
  */
 int mk_instance_reserve_resources(struct mk_instance *instance,
 				  const struct mk_dt_config *config);
@@ -724,9 +832,6 @@ int mk_instance_remove_pci_device(struct mk_instance *instance,
 void *mk_instance_alloc(struct mk_instance *instance, size_t size, size_t align);
 void mk_instance_free(struct mk_instance *instance, void *virt_addr, size_t size);
 
-void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
-void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
-
 /**
  * String conversion helpers
  */
@@ -741,14 +846,6 @@ enum mk_instance_state mk_string_to_state(const char *str);
  */
 
 /**
- * mk_instance_find() - Find instance by a multikernel instance ID
- * @mk_id: Multikernel instance ID
- *
- * Returns pointer to mk_instance if found, NULL otherwise.
- */
-struct mk_instance *mk_instance_find(int mk_id);
-
-/**
  * mk_instance_set_kexec_active() - Mark instance as active for kexec
  * @mk_id: Multikernel ID from kexec system
  *
@@ -756,12 +853,98 @@ struct mk_instance *mk_instance_find(int mk_id);
  */
 int mk_instance_set_kexec_active(int mk_id);
 
+/*
+ * The declarations below are referenced from always-built code (kexec,
+ * PCI and platform device probing, SMP setup), so they carry stubs for
+ * the CONFIG_MULTIKERNEL=n build.
+ */
+struct kimage;
+struct pci_bus;
+
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool cpu_is_multikernel_pool(unsigned int cpu);
 bool mk_has_pending_shutdown(void);
+
+/* Instance lookup and reference counting */
+struct mk_instance *mk_instance_find(int mk_id);
+void mk_instance_put(struct mk_instance *instance);
+void mk_instance_set_state(struct mk_instance *instance,
+			   enum mk_instance_state state);
+
+/* Kimage-based access to the instance memory pool */
+void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
+void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
+
+/* Device filtering against the instance metadata */
+#ifdef CONFIG_PCI
+bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				      unsigned int devfn, u16 *vendor,
+				      u16 *device);
+#else
+static inline bool
+mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				 unsigned int devfn, u16 *vendor, u16 *device)
+{
+	return false;
+}
+#endif
+#if defined(CONFIG_X86) && defined(CONFIG_PCI)
+bool mk_pci_msi_controlled(struct pci_dev *dev);
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
+int mk_pci_msi_activate(struct pci_dev *dev);
+bool mk_pci_msi_write_msg(struct pci_dev *dev, unsigned int index,
+			  unsigned int irq, unsigned int nvec, bool msix);
+void mk_pci_msi_teardown(struct pci_dev *dev);
+#else
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline bool mk_pci_msi_write_msg(struct pci_dev *dev,
+					unsigned int index,
+					unsigned int irq,
+					unsigned int nvec, bool msix)
+{
+	return false;
+}
+
+static inline void mk_pci_msi_teardown(struct pci_dev *dev)
+{
+}
+#endif
+
+bool mk_platform_device_allowed(const char *name, const char *hid);
+
+/* Early CPU registration from the manifest (spawn kernels) */
+void mk_register_cpus_from_manifest(void);
+
+/* Accept the manifest handed over at boot (spawn kernels) */
+void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len);
+
+/* Build the manifest for a spawn (host, kexec path) */
+int mk_manifest_finalize(struct kimage *image);
+#ifdef CONFIG_PCI
+int mk_pci_prepare_instance_start(struct mk_instance *instance);
+#else
+static inline int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -778,6 +961,65 @@ static inline int multikernel_force_halt_by_id(int mk_id)
 static inline bool cpu_is_multikernel_pool(unsigned int cpu)
 {
 	return false;
+}
+static inline struct mk_instance *mk_instance_find(int mk_id)
+{
+	return NULL;
+}
+static inline void mk_instance_put(struct mk_instance *instance)
+{
+}
+static inline void mk_instance_set_state(struct mk_instance *instance,
+					 enum mk_instance_state state)
+{
+}
+static inline void *mk_kimage_alloc(struct kimage *image, size_t size,
+				    size_t align)
+{
+	return NULL;
+}
+static inline void mk_kimage_free(struct kimage *image, void *virt_addr,
+				  size_t size)
+{
+}
+
+static inline bool mk_platform_device_allowed(const char *name, const char *hid)
+{
+	return true;
+}
+
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline bool mk_pci_msi_write_msg(struct pci_dev *dev,
+					unsigned int index,
+					unsigned int irq,
+					unsigned int nvec, bool msix)
+{
+	return false;
+}
+
+static inline void mk_pci_msi_teardown(struct pci_dev *dev)
+{
+}
+
+static inline void mk_register_cpus_from_manifest(void)
+{
+}
+static inline void mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
+{
 }
 #endif
 
@@ -817,69 +1059,70 @@ static inline bool mk_is_resource_property(const char *prop_name)
 }
 
 /**
- * KHO (Kexec HandOver) Integration Functions
+ * Manifest Integration Functions
  *
- * These functions provide KHO support for preserving and restoring
- * multikernel instance device trees across kexec boundaries.
+ * These functions build the instance device tree into the manifest on
+ * the host side, and restore an instance from it on the spawn side.
  */
 
 /**
- * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
+ * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
  *
- * Called by mk_kexec_finalize() to add multikernel DTB to KHO FDT.
+ * Called by mk_manifest_finalize() to add the multikernel DTB to the manifest.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id);
+int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id);
 
 /**
- * mk_kho_preserve_host_ipi() - Preserve host's IPI buffer address in KHO
+ * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt);
+int mk_manifest_add_host_ipi(struct kimage *image, void *fdt);
 
 
 /**
- * mk_kho_restore_dtbs() - Restore DTBs from KHO shared memory
+ * mk_instance_restore_from_manifest() - Restore this instance from the manifest
  *
  * Called during multikernel initialization to restore DTBs that were
- * preserved by the previous kernel via KHO.
+ * placed in the manifest by the host kernel.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int __init mk_kho_restore_dtbs(void);
+int __init mk_instance_restore_from_manifest(void);
 
-/**
- * mk_register_cpus_from_kho() - Register CPUs from KHO DTB during SMP config
- *
- * Called early during SMP configuration to register CPUs from the KHO DTB.
- * This must happen before topology_init_possible_cpus() to ensure CPUs are
- * properly registered in the topology.
- */
-void __init mk_register_cpus_from_kho(void);
-
-/**
- * PCI Device Enforcement Functions
+/*
+ * mk_register_cpus_from_manifest() registers CPUs from the manifest during SMP
+ * configuration, before topology_init_possible_cpus(); it is declared
+ * above with the CONFIG_MULTIKERNEL stubs.
  */
 
 /**
- * mk_pci_should_probe() - Check if PCI probing should occur at a location
- * @bus: PCI bus
+ * PCI Device Filtering Functions
+ */
+
+/**
+ * mk_pci_get_assigned_identity_bdf() - Identify an assigned PCI function
+ * @domain: PCI domain number
+ * @bus: PCI bus number
  * @devfn: PCI device/function number
+ * @vendor: optional assigned vendor ID output
+ * @device: optional assigned device ID output
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist, avoiding hardware conflicts on bare metal.
+ * The raw x86 PCI configuration wrappers use this BDF-only lookup before
+ * reaching their hardware backend. Synthetic roots make assigned functions
+ * directly discoverable. A privileged spawn kernel can bypass those wrappers,
+ * so this check prevents accidental access rather than isolating a hostile
+ * kernel.
  *
- * Returns: true if probing should proceed, false to skip entirely
+ * Returns: true for an exact assignment metadata match, false otherwise
  */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 
 /**
  * mk_platform_device_allowed() - Check if a platform device is allowed by DTB allowlist
@@ -893,83 +1136,86 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
  * The check matches against either the device name or ACPI HID for portability.
  *
  * Returns: true if device is allowed, false otherwise
- */
-bool mk_platform_device_allowed(const char *name, const char *hid);
-
-/**
- * Direct 64-bit Spawn Functions
  *
- * These functions implement the direct 64-bit to 64-bit spawn mechanism.
- * Pool CPUs wait in multikernel_play_dead() with APIC enabled, and can be
- * triggered to execute the spawn trampoline via IPI.
- *
- * The spawn context combines boot_params with spawn-specific fields,
- * allocated once per instance and reused for secondary CPU bringup.
+ * Declared above with the CONFIG_MULTIKERNEL stubs.
  */
-
-struct mk_spawn_context;
-struct mk_ident_pgtable;
-
-/* Allocate spawn context (includes boot_params) */
-struct mk_spawn_context *mk_alloc_spawn_context(struct mk_instance *instance,
-						phys_addr_t *phys_out);
-struct boot_params *mk_spawn_context_boot_params(struct mk_spawn_context *ctx);
-
-/* Set up spawn context for kernel boot */
-void mk_set_spawn_context(struct mk_spawn_context *ctx,
-			  unsigned long identity_cr3,
-			  unsigned long kernel_entry,
-			  unsigned long trampoline_virt,
-			  unsigned long trampoline_phys,
-			  unsigned long park_phys);
-
-/* Trigger spawn on a pool CPU */
-int mk_spawn_cpu(struct mk_instance *instance, int cpu,
-		 struct mk_spawn_context *ctx);
-
-/* Host pool park area, set up when the baseline is applied */
-int mk_setup_host_park(void);
-
-
-/*
- * Control block: spawn context, trampoline page, park page and identity
- * page tables, plus slack for alignment. Sized once so the whole thing is
- * one contiguous range the spawn kernel can reserve with a single call.
- */
-#define MK_CTRL_PGTABLE_PAGES	64
-#define MK_CTRL_BLOCK_SIZE	(SZ_16K + (3 + MK_CTRL_PGTABLE_PAGES) * PAGE_SIZE)
 
 void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 			     size_t align);
 
+/**
+ * Architecture interface
+ *
+ * Everything below is implemented per architecture. An architecture that
+ * selects ARCH_SUPPORTS_MULTIKERNEL must provide these functions, plus,
+ * through <asm/multikernel.h>:
+ *
+ *  - arch_cpu_physical_id() / arch_cpu_from_physical_id(): translate
+ *    between logical CPU numbers and the physical CPU IDs (APIC ID,
+ *    MPIDR, hartid) that name CPUs across kernel instances.
+ *  - MK_CTRL_BLOCK_SIZE: size of the per-instance control block that
+ *    holds the arch's boot structures (spawn context, trampolines, page
+ *    tables), carved from instance memory and reserved from the spawn
+ *    kernel's allocator.
+ *  - The spawn mechanics themselves (context setup, trampolines, CPU
+ *    wakeup), which generic code currently drives from the kexec path;
+ *    their declarations live in the arch header until that path is
+ *    extracted behind a single arch hook.
+ */
+#ifdef CONFIG_MULTIKERNEL
+#include <asm/multikernel.h>
+#endif
+
+/* Doorbell for the message ring: IPI a CPU owned by another kernel */
+void mk_arch_send_ipi(mk_phys_cpu_t phys_cpu);
+
+/* Enumerate a pool CPU in this kernel's topology during early boot */
+void mk_arch_register_cpu(mk_phys_cpu_t phys_id);
+
+/* Mark/query a CPU as parked in the multikernel pool */
+void mk_set_pool_cpu(int cpu, bool is_pool);
+
+/* Park the calling CPU in the pool wait loop; never returns */
+void __noreturn mk_enter_pool_state(void *info);
+
+/*
+ * Forcible stop of another instance's CPUs (NMI on x86). Registration
+ * may fail where the architecture has nothing suitable; graceful
+ * shutdown must keep working without it.
+ */
+int mk_register_stop_nmi_handler(void);
+void mk_force_stop_cpu(mk_phys_cpu_t phys_cpu);
+
+/* Host pool park area, set up when the baseline is applied */
+int mk_setup_host_park(void);
+
+/*
+ * Build the boot state for @instance from the loaded @image and start
+ * its boot CPU (a parked pool CPU, given as a logical CPU number). On
+ * success the arch keeps its spawn resources in the instance so a
+ * re-spawn can reuse them; mk_arch_release_instance() frees them when
+ * the instance's memory is torn down.
+ */
+struct kimage;
+int mk_arch_spawn_instance(struct kimage *image, struct mk_instance *instance,
+			   int cpu);
+int mk_arch_release_instance(struct mk_instance *instance);
+
+/* Verify one of an instance's CPUs has reached its park loop */
+int mk_arch_confirm_parked(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
+
+/*
+ * Wait until every CPU an instance owns is parked. Its kernel image may
+ * only be overwritten once this succeeds: a CPU still executing that
+ * image when it is rewritten takes the machine down with it.
+ */
+int mk_instance_confirm_parked(struct mk_instance *instance);
+
 /* Return an instance's parked CPUs to the host slot before teardown */
 int mk_repark_instance_to_host(struct mk_instance *instance);
 
-/* Move one parked CPU between the host slot and a live instance's context */
+/* Move one parked CPU between the host pool and a live instance */
 int mk_repark_cpu_to_instance(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
 int mk_repark_cpu_to_host(struct mk_instance *instance, mk_phys_cpu_t phys_cpu);
-
-/* Initialize boot context tracking in spawn kernel */
-void mk_init_boot_context(phys_addr_t ctx_phys);
-
-/* Identity page table and trampoline setup */
-struct mk_ident_pgtable *mk_build_identity_pgtable(struct mk_instance *instance,
-						    unsigned long start,
-						    unsigned long end);
-void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
-unsigned long mk_get_identity_cr3(struct mk_ident_pgtable *pgt);
-void *mk_setup_trampoline(struct mk_instance *instance,
-			  struct mk_ident_pgtable *pgt,
-			  unsigned long *phys_out);
-void *mk_setup_park_page(struct mk_instance *instance, unsigned long *phys_out);
-
-/* Secondary CPU wakeup for spawn kernels (reuses boot context) */
-int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
-					unsigned int cpu);
-
-/* Restore AP to spawn context (used by hibernation/switch) */
-int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
-			   unsigned long gs_base, unsigned long stack,
-			   unsigned long entry);
 
 #endif /* _LINUX_MULTIKERNEL_H */

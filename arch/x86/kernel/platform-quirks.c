@@ -14,8 +14,10 @@
 #include <asm/e820/api.h>
 #include <asm/apic.h>
 #include <asm/apicdef.h>
+#include <asm/cpufeature.h>
 #include <asm/mpspec.h>
 #include <asm/numa.h>
+#include <asm/page.h>
 #include <linux/pgtable.h>
 #include <asm/pgtable.h>
 #include <asm/pgtable_64_types.h>
@@ -26,6 +28,36 @@ extern pmd_t *populate_extra_pmd(unsigned long vaddr);
 
 /* Physical address of original boot_params (saved during boot) */
 extern unsigned long orig_boot_params;
+
+#ifdef CONFIG_MULTIKERNEL
+static unsigned long multikernel_cpu_khz;
+static unsigned long multikernel_tsc_khz;
+
+static unsigned long multikernel_calibrate_cpu(void)
+{
+	return multikernel_cpu_khz;
+}
+
+static unsigned long multikernel_calibrate_tsc(void)
+{
+	return multikernel_tsc_khz;
+}
+
+static void __init multikernel_setup_calibration(void)
+{
+	phys_addr_t ctx_phys = orig_boot_params -
+		offsetof(struct mk_spawn_context, bp);
+	struct mk_spawn_context *ctx = __va(ctx_phys);
+
+	if (ctx->self_phys != ctx_phys || !ctx->boot_tsc_khz)
+		return;
+
+	multikernel_tsc_khz = ctx->boot_tsc_khz;
+	multikernel_cpu_khz = ctx->boot_cpu_khz ?: ctx->boot_tsc_khz;
+	x86_platform.calibrate_cpu = multikernel_calibrate_cpu;
+	x86_platform.calibrate_tsc = multikernel_calibrate_tsc;
+	setup_force_cpu_cap(X86_FEATURE_TSC_KNOWN_FREQ);
+}
 
 /*
  * Custom wakeup for multikernel spawn kernels.
@@ -75,7 +107,7 @@ static void __init multikernel_pagetable_init(void)
 
 /*
  * Multikernel SMP configuration - similar to Jailhouse.
- * Parses CPU configuration from KHO DTB and registers CPUs.
+ * Parses CPU configuration from the multikernel manifest and registers CPUs.
  */
 static void __init multikernel_parse_smp_config(void)
 {
@@ -87,8 +119,8 @@ static void __init multikernel_parse_smp_config(void)
 
 	register_lapic_address(APIC_DEFAULT_PHYS_BASE);
 
-	/* Register CPUs from KHO DTB if available */
-	mk_register_cpus_from_kho();
+	/* Register CPUs from the manifest if available */
+	mk_register_cpus_from_manifest();
 
 	/*
 	 * Initialize boot context for secondary CPU wakeup.
@@ -104,6 +136,11 @@ static void __init multikernel_parse_smp_config(void)
 	 */
 	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
+#else
+static inline void multikernel_setup_calibration(void)
+{
+}
+#endif /* CONFIG_MULTIKERNEL */
 
 void __init x86_early_init_platform_quirks(void)
 {
@@ -133,6 +170,8 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		break;
 	case X86_SUBARCH_MULTIKERNEL:
+		multikernel_setup_calibration();
+		x86_multikernel_pci_platform_init();
 		x86_platform.legacy.devices.pnpbios = 0;
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		x86_platform.legacy.rtc = 0;
@@ -156,6 +195,7 @@ void __init x86_early_init_platform_quirks(void)
 #endif
 		x86_init.resources.memory_setup = e820__memory_setup_multikernel;
 		x86_init.paging.init_direct_mapping = init_direct_mapping_sparse;
+#ifdef CONFIG_MULTIKERNEL
 #ifdef CONFIG_X86_64
 		/*
 		 * Use custom pagetable_init that ensures PGD[508] exists
@@ -163,15 +203,18 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		x86_init.paging.pagetable_init = multikernel_pagetable_init;
 #endif
-		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
+#endif
+		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		/*
 		 * No legacy timer setup. There is no HPET without ACPI, so
 		 * the default timer_init() would fall back to programming
 		 * the PIT - which belongs to the host - and then request
 		 * legacy IRQ0, which can never reach an instance CPU that
 		 * has neither a PIC nor an IO-APIC. Ticks come from the
-		 * local APIC timer via setup_percpu_clockev() instead.
+		 * local APIC timer initialized by setup_percpu_clockev().
+		 * Keeping global_clock_event unset bypasses LAPIC timer
+		 * verification, whose fallback path requires legacy IRQ0.
 		 */
 		x86_init.timers.timer_init = x86_init_noop;
 		x86_init.timers.wallclock_init = x86_init_noop;

@@ -186,6 +186,13 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_secondary_identity)
 	movq	%cr3, %rax
 	movq	%rax, %cr3
 
+	/*
+	 * Restore CR4 minus CET: a CPU parked by a spawn kernel carries that
+	 * kernel's IBT arming, and the jump below lands on a NOENDBR entry.
+	 * The spawn kernel re-enables CET for this CPU in cpu_init(), the
+	 * same as after the boot trampoline's CET clear.
+	 */
+	andq	$~X86_CR4_CET, %rbx
 	movq	%rbx, %cr4
 
 	movl	$MSR_GS_BASE, %ecx
@@ -389,16 +396,24 @@ SYM_CODE_START_LOCAL_NOALIGN(mk_park_identity)
 	/*
 	 * Move to another park slot: reload the watch address, page table
 	 * and park page from the publication and start over. Our APIC ID
-	 * and MWAIT capability stay in R13/R15; interrupts stay off.
+	 * and MWAIT capability stay in R13/R15; interrupts stay off. RBX
+	 * must follow to the new page: mk_park_identity anchors the fault
+	 * stack, GDT and IDT to it, and the page we leave may belong to an
+	 * instance whose pool is later freed and recycled.
+	 *
+	 * The repark_* dispatch fields are separate from the park_phys/
+	 * park_cr3/self_phys anchor so that publishing a repark on a live
+	 * instance context never corrupts the context's own park identity.
 	 */
-	movq	MK_CTX_park_cr3(%r12), %r14
-	movq	MK_CTX_park_phys(%r12), %rcx
-	movq	MK_CTX_self_phys(%r12), %r10
+	movq	MK_CTX_repark_park_cr3(%r12), %r14
+	movq	MK_CTX_repark_park_phys(%r12), %rcx
+	movq	MK_CTX_repark_slot_phys(%r12), %r10
 	movl	$1, %eax
 	xorl	%ebp, %ebp
 	lock cmpxchgl %ebp, MK_CTX_ready(%r12)
 	jnz	.Lpark_wait
 	movq	%r10, %r12
+	movq	%rcx, %rbx
 	movq	%r14, %cr3
 	movq	%cr3, %rax
 	movq	%rax, %cr3

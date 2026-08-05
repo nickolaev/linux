@@ -35,6 +35,25 @@ static DEFINE_MUTEX(pci_mmcfg_lock);
 
 LIST_HEAD(pci_mmcfg_list);
 
+int pci_mmcfg_walk_regions(pci_mmcfg_region_cb callback, void *data)
+{
+	const struct pci_mmcfg_region *region;
+	int ret = 0;
+
+	if (!callback)
+		return -EINVAL;
+
+	mutex_lock(&pci_mmcfg_lock);
+	list_for_each_entry(region, &pci_mmcfg_list, list) {
+		ret = callback(region, data);
+		if (ret)
+			break;
+	}
+	mutex_unlock(&pci_mmcfg_lock);
+
+	return ret;
+}
+
 static void __init pci_mmconfig_remove(struct pci_mmcfg_region *cfg)
 {
 	if (cfg->res.parent)

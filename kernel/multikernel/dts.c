@@ -17,12 +17,64 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/ioport.h>
+#include <linux/pci.h>
 #include <linux/sizes.h>
-#include <asm/smp.h>
 #include <linux/cpumask.h>
+#include <linux/hex.h>
 #include <linux/multikernel.h>
+#include <asm/multikernel.h>
 
 #include "internal.h"
+
+int __weak
+mk_arch_snapshot_pci_host_bridges(const struct mk_instance *instance,
+				  struct mk_pci_host_bridge *bridges,
+				  size_t capacity)
+{
+	return 0;
+}
+
+static int mk_pci_parse_hex(const char *str, size_t digits, u32 *value)
+{
+	size_t i;
+	u32 parsed = 0;
+
+	for (i = 0; i < digits; i++) {
+		int digit = hex_to_bin(str[i]);
+
+		if (digit < 0)
+			return -EINVAL;
+		parsed = (parsed << 4) | digit;
+	}
+
+	*value = parsed;
+	return 0;
+}
+
+int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
+		     u8 *slot, u8 *func)
+{
+	u32 parsed_domain, parsed_bus, parsed_slot, parsed_func;
+
+	if (len != (int)sizeof("0000:00:00.0") || pci_id[12] != '\0' ||
+	    pci_id[4] != ':' || pci_id[7] != ':' || pci_id[10] != '.')
+		return -EINVAL;
+
+	if (mk_pci_parse_hex(pci_id, 4, &parsed_domain) ||
+	    mk_pci_parse_hex(pci_id + 5, 2, &parsed_bus) ||
+	    mk_pci_parse_hex(pci_id + 8, 2, &parsed_slot) ||
+	    mk_pci_parse_hex(pci_id + 11, 1, &parsed_func))
+		return -EINVAL;
+	if (parsed_domain > U16_MAX || parsed_bus > U8_MAX ||
+	    parsed_slot > 31 || parsed_func > 7)
+		return -ERANGE;
+
+	*domain = (u16)parsed_domain;
+	*bus = (u8)parsed_bus;
+	*slot = (u8)parsed_slot;
+	*func = (u8)parsed_func;
+	return 0;
+}
 
 static const void *mk_dt_get_base_fdt(void)
 {
@@ -55,6 +107,9 @@ void mk_dt_config_init(struct mk_dt_config *config)
 	INIT_LIST_HEAD(&config->pci_devices);
 	config->pci_device_count = 0;
 	config->pci_devices_valid = true;
+	INIT_LIST_HEAD(&config->pci_host_bridges);
+	config->pci_host_bridge_count = 0;
+	config->pci_host_bridges_valid = false;
 
 	INIT_LIST_HEAD(&config->platform_devices);
 	config->platform_device_count = 0;
@@ -64,6 +119,7 @@ void mk_dt_config_init(struct mk_dt_config *config)
 void mk_dt_config_free(struct mk_dt_config *config)
 {
 	struct mk_pci_device *pci_dev, *tmp_pci;
+	struct mk_pci_host_bridge *host_bridge, *tmp_bridge;
 	struct mk_platform_device *plat_dev, *tmp_plat;
 
 	if (!config)
@@ -82,6 +138,16 @@ void mk_dt_config_free(struct mk_dt_config *config)
 		config->pci_devices_valid = false;
 	}
 
+	if (config->pci_host_bridges_valid) {
+		list_for_each_entry_safe(host_bridge, tmp_bridge,
+					 &config->pci_host_bridges, list) {
+			list_del(&host_bridge->list);
+			kfree(host_bridge);
+		}
+		config->pci_host_bridge_count = 0;
+		config->pci_host_bridges_valid = false;
+	}
+
 	/* Free platform device list */
 	if (config->platform_devices_valid) {
 		list_for_each_entry_safe(plat_dev, tmp_plat, &config->platform_devices, list) {
@@ -96,6 +162,138 @@ void mk_dt_config_free(struct mk_dt_config *config)
 	config->memory_size = 0;
 
 	/* Note: We don't free dtb_data here as it's managed by the caller */
+}
+
+void mk_pci_host_bridges_free(struct list_head *bridges, int *count,
+			      bool *valid)
+{
+	struct mk_pci_host_bridge *bridge, *tmp;
+
+	list_for_each_entry_safe(bridge, tmp, bridges, list) {
+		list_del(&bridge->list);
+		kfree(bridge);
+	}
+	*count = 0;
+	*valid = false;
+}
+
+int mk_pci_host_bridges_clone(struct list_head *dst, int *dst_count,
+				 bool *dst_valid, const struct list_head *src,
+				 int src_count, bool src_valid)
+{
+	const struct mk_pci_host_bridge *src_bridge;
+	struct mk_pci_host_bridge *dst_bridge;
+	int ret = -EINVAL;
+
+	mk_pci_host_bridges_free(dst, dst_count, dst_valid);
+	if (src_count < 0)
+		return -EINVAL;
+	if (!src_valid) {
+		if (src_count || !list_empty(src))
+			return -EINVAL;
+		return 0;
+	}
+	if (!src_count) {
+		if (!list_empty(src))
+			return -EINVAL;
+		return 0;
+	}
+	if (list_empty(src))
+		return -EINVAL;
+
+	*dst_valid = true;
+	list_for_each_entry(src_bridge, src, list) {
+		dst_bridge = kmemdup(src_bridge, sizeof(*dst_bridge),
+				     GFP_KERNEL);
+		if (!dst_bridge) {
+			ret = -ENOMEM;
+			goto error;
+		}
+		INIT_LIST_HEAD(&dst_bridge->list);
+		list_add_tail(&dst_bridge->list, dst);
+		(*dst_count)++;
+	}
+
+	if (*dst_count != src_count)
+		goto error;
+	return 0;
+
+error:
+	mk_pci_host_bridges_free(dst, dst_count, dst_valid);
+	return ret;
+}
+int mk_dt_parse_pci_host_bridges(const void *fdt, int resources_node,
+				 struct list_head *bridges, int *count,
+				 bool *valid)
+{
+	struct mk_pci_host_bridge *bridge, *existing;
+	const fdt32_t *segment_prop, *bus_range;
+	const fdt64_t *ecam_prop;
+	int bridges_node, bridge_node, len, ret = -EINVAL;
+	u32 segment, bus_start, bus_end;
+	u64 ecam_base;
+
+	bridges_node = fdt_subnode_offset(fdt, resources_node,
+					  "pci-host-bridges");
+	if (bridges_node < 0)
+		return 0;
+
+	*valid = true;
+	fdt_for_each_subnode(bridge_node, fdt, bridges_node) {
+		segment_prop = fdt_getprop(fdt, bridge_node, "segment", &len);
+		if (!segment_prop || len != sizeof(*segment_prop))
+			goto invalid;
+		segment = fdt32_to_cpu(*segment_prop);
+
+		bus_range = fdt_getprop(fdt, bridge_node, "bus-range", &len);
+		if (!bus_range || len != 2 * sizeof(*bus_range))
+			goto invalid;
+		bus_start = fdt32_to_cpu(bus_range[0]);
+		bus_end = fdt32_to_cpu(bus_range[1]);
+
+		ecam_prop = fdt_getprop(fdt, bridge_node, "ecam-base", &len);
+		if (!ecam_prop || len != sizeof(*ecam_prop))
+			goto invalid;
+		ecam_base = fdt64_to_cpu(*ecam_prop);
+
+		if (segment > U16_MAX || bus_start > U8_MAX || bus_end > U8_MAX ||
+		    bus_start > bus_end || !ecam_base || !IS_ALIGNED(ecam_base, SZ_1M))
+			goto invalid;
+
+		list_for_each_entry(existing, bridges, list) {
+			if (existing->segment == segment &&
+			    bus_start <= existing->bus_end &&
+			    bus_end >= existing->bus_start) {
+				pr_err("Overlapping PCI host bridge bus ranges in segment %04x\n",
+				       segment);
+				goto error;
+			}
+		}
+
+		bridge = kzalloc(sizeof(*bridge), GFP_KERNEL);
+		if (!bridge) {
+			ret = -ENOMEM;
+			goto error;
+		}
+		bridge->segment = segment;
+		bridge->bus_start = bus_start;
+		bridge->bus_end = bus_end;
+		bridge->ecam_base = ecam_base;
+		list_add_tail(&bridge->list, bridges);
+		(*count)++;
+		pr_info("Added PCI host bridge: segment %04x [bus %02x-%02x] ECAM %#llx\n",
+			bridge->segment, bridge->bus_start, bridge->bus_end,
+			(unsigned long long)bridge->ecam_base);
+	}
+
+	return 0;
+
+invalid:
+	pr_err("Invalid PCI host bridge metadata in node '%s'\n",
+	       fdt_get_name(fdt, bridge_node, NULL));
+error:
+	mk_pci_host_bridges_free(bridges, count, valid);
+	return ret;
 }
 
 /**
@@ -209,10 +407,13 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 {
 	const char *pci_id_str;
 	const fdt32_t *vendor_prop, *device_prop;
+	const fdt64_t *resources_prop;
 	struct mk_pci_device *pci_dev;
-	unsigned int domain, bus, slot, func;
+	u32 vendor, device;
+	u16 domain;
+	u8 bus, slot, func;
 	const char *node_name;
-	int len;
+	int len, i, ret;
 
 	node_name = fdt_get_name(source_fdt, dev_node, NULL);
 
@@ -223,10 +424,11 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		return -EINVAL;
 	}
 
-	if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-		pr_err("Invalid pci-id format: '%s' (expected domain:bus:slot.func)\n",
-		       pci_id_str);
-		return -EINVAL;
+	ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus, &slot, &func);
+	if (ret) {
+		pr_err("Invalid or out-of-range pci-id: '%.*s' (expected domain:bus:slot.func)\n",
+		       len, pci_id_str);
+		return ret;
 	}
 
 	vendor_prop = fdt_getprop(source_fdt, dev_node, "vendor-id", &len);
@@ -242,6 +444,13 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		       device_name, node_name ? node_name : "<unnamed>");
 		return -EINVAL;
 	}
+	vendor = fdt32_to_cpu(*vendor_prop);
+	device = fdt32_to_cpu(*device_prop);
+	if (vendor > U16_MAX || device > U16_MAX) {
+		pr_err("Out-of-range vendor-id or device-id in device '%s'\n",
+		       device_name);
+		return -ERANGE;
+	}
 
 	pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
 	if (!pci_dev) {
@@ -249,12 +458,38 @@ static int mk_dt_parse_single_pci_device(const void *source_fdt, int dev_node,
 		return -ENOMEM;
 	}
 
-	pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-	pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
-	pci_dev->domain = (u16)domain;
-	pci_dev->bus = (u8)bus;
-	pci_dev->slot = (u8)slot;
-	pci_dev->func = (u8)func;
+	strscpy(pci_dev->name, device_name, sizeof(pci_dev->name));
+	pci_dev->vendor = (u16)vendor;
+	pci_dev->device = (u16)device;
+	pci_dev->domain = domain;
+	pci_dev->bus = bus;
+	pci_dev->slot = slot;
+	pci_dev->func = func;
+	resources_prop = fdt_getprop(source_fdt, dev_node, "bar-resources", &len);
+	if (resources_prop) {
+		if (len != MK_PCI_RESOURCE_COUNT * 3 * sizeof(*resources_prop)) {
+			pr_err("Invalid bar-resources in device '%s'\n", device_name);
+			kfree(pci_dev);
+			return -EINVAL;
+		}
+		for (i = 0; i < MK_PCI_RESOURCE_COUNT; i++) {
+			u64 start = fdt64_to_cpu(resources_prop[i * 3]);
+			u64 end = fdt64_to_cpu(resources_prop[i * 3 + 1]);
+			u64 flags = fdt64_to_cpu(resources_prop[i * 3 + 2]);
+
+			if ((start || end) &&
+			    (end < start || !(flags & (IORESOURCE_IO | IORESOURCE_MEM)))) {
+				pr_err("Invalid PCI BAR %d range in device '%s'\n",
+				       i, device_name);
+				kfree(pci_dev);
+				return -EINVAL;
+			}
+			pci_dev->resources[i].start = start;
+			pci_dev->resources[i].end = end;
+			pci_dev->resources[i].flags = flags;
+		}
+		pci_dev->resources_valid = true;
+	}
 
 	list_add_tail(&pci_dev->list, &config->pci_devices);
 	config->pci_device_count++;
@@ -558,6 +793,16 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
+	ret = mk_dt_parse_pci_host_bridges(fdt, resources_node,
+					   &config->pci_host_bridges,
+					   &config->pci_host_bridge_count,
+					   &config->pci_host_bridges_valid);
+	if (ret) {
+		pr_err("Failed to parse PCI host bridge metadata: %d\n", ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse device resources: %d\n", ret);
@@ -565,9 +810,10 @@ int mk_dt_parse(const void *dtb_data, size_t dtb_size,
 		return ret;
 	}
 
-	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %u CPUs, %d PCI devices, and %d platform devices\n",
+	pr_info("Successfully parsed multikernel device tree with %zu bytes memory, %d CPUs, %d PCI host bridges, %d PCI devices, and %d platform devices\n",
 		config->memory_size, mk_cpu_set_count(config->cpus),
-		config->pci_device_count, config->platform_device_count);
+		config->pci_host_bridge_count, config->pci_device_count,
+		config->platform_device_count);
 	return 0;
 }
 
@@ -608,6 +854,17 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 		return ret;
 	}
 
+	ret = mk_dt_parse_pci_host_bridges(fdt, resources_node,
+					   &config->pci_host_bridges,
+					   &config->pci_host_bridge_count,
+					   &config->pci_host_bridges_valid);
+	if (ret) {
+		pr_err("Failed to parse PCI host bridge metadata for '%s': %d\n",
+		       instance_name, ret);
+		mk_dt_config_free(config);
+		return ret;
+	}
+
 	ret = mk_dt_parse_devices(fdt, resources_node, config);
 	if (ret) {
 		pr_err("Failed to parse device resources for '%s': %d\n", instance_name, ret);
@@ -615,10 +872,11 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 		return ret;
 	}
 
-	pr_info("Successfully parsed instance '%s': %zu bytes memory, %u CPUs, %d PCI devices, %d platform devices\n",
+	pr_info("Successfully parsed instance '%s': %zu bytes memory, %d CPUs, %d PCI host bridges, %d PCI devices, %d platform devices\n",
 		instance_name, config->memory_size,
 		mk_cpu_set_count(config->cpus),
-		config->pci_device_count, config->platform_device_count);
+		config->pci_host_bridge_count, config->pci_device_count,
+		config->platform_device_count);
 	return 0;
 }
 
@@ -817,6 +1075,7 @@ int mk_dt_get_property_size(const void *dtb_data, size_t dtb_size,
 void mk_dt_print_config(const struct mk_dt_config *config)
 {
 	struct mk_pci_device *pci_dev;
+	struct mk_pci_host_bridge *host_bridge;
 	struct mk_platform_device *plat_dev;
 
 	if (!config) {
@@ -845,6 +1104,17 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 		}
 	} else {
 		pr_info("  CPU assignment: unavailable (allocation failed)\n");
+	}
+
+	if (config->pci_host_bridges_valid) {
+		pr_info("  PCI host bridges: %d\n", config->pci_host_bridge_count);
+		list_for_each_entry(host_bridge, &config->pci_host_bridges, list)
+			pr_info("    - segment %04x [bus %02x-%02x] ECAM %#llx\n",
+				host_bridge->segment, host_bridge->bus_start,
+				host_bridge->bus_end,
+				(unsigned long long)host_bridge->ecam_base);
+	} else {
+		pr_info("  PCI host bridges: none specified\n");
 	}
 
 	if (config->pci_devices_valid) {
@@ -879,6 +1149,73 @@ void mk_dt_print_config(const struct mk_dt_config *config)
 	}
 
 	pr_info("  DTB: %zu bytes\n", config->dtb_size);
+}
+
+static int mk_dt_emit_pci_host_bridge(void *fdt,
+				      const struct mk_pci_host_bridge *bridge)
+{
+	char node_name[32];
+	fdt32_t bus_range[2];
+	int ret;
+
+	snprintf(node_name, sizeof(node_name), "host@%04x,%02x",
+		 bridge->segment, bridge->bus_start);
+	ret = fdt_begin_node(fdt, node_name);
+	if (ret)
+		return ret;
+	ret = fdt_property_u32(fdt, "segment", bridge->segment);
+	if (ret)
+		return ret;
+	bus_range[0] = cpu_to_fdt32(bridge->bus_start);
+	bus_range[1] = cpu_to_fdt32(bridge->bus_end);
+	ret = fdt_property(fdt, "bus-range", bus_range, sizeof(bus_range));
+	if (ret)
+		return ret;
+	ret = fdt_property_u64(fdt, "ecam-base", bridge->ecam_base);
+	if (ret)
+		return ret;
+	return fdt_end_node(fdt);
+}
+
+static int mk_dt_emit_pci_host_bridges(void *fdt,
+				       const struct mk_instance *instance)
+{
+	struct mk_pci_host_bridge discovered[MK_MAX_PCI_HOST_BRIDGES];
+	const struct mk_pci_host_bridge *bridge;
+	int discovered_count, index, ret;
+
+	if (!instance->pci_devices_valid)
+		return -EINVAL;
+	if (!instance->pci_device_count)
+		return 0;
+
+	discovered_count =
+		mk_arch_snapshot_pci_host_bridges(instance, discovered,
+						  ARRAY_SIZE(discovered));
+	if (discovered_count < 0)
+		return discovered_count;
+	if (!discovered_count &&
+	    (!instance->pci_host_bridges_valid ||
+	     !instance->pci_host_bridge_count))
+		return 0;
+
+	ret = fdt_begin_node(fdt, "pci-host-bridges");
+	if (ret)
+		return ret;
+	if (discovered_count) {
+		for (index = 0; index < discovered_count; index++) {
+			ret = mk_dt_emit_pci_host_bridge(fdt, &discovered[index]);
+			if (ret)
+				return ret;
+		}
+	} else {
+		list_for_each_entry(bridge, &instance->pci_host_bridges, list) {
+			ret = mk_dt_emit_pci_host_bridge(fdt, bridge);
+			if (ret)
+				return ret;
+		}
+	}
+	return fdt_end_node(fdt);
 }
 
 /**
@@ -953,9 +1290,19 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 		}
 	}
 
-	/* CPU resources, as an array of 64-bit physical CPU IDs */
-	if (!mk_cpu_set_empty(instance->cpus)) {
-		unsigned int idx, cpu_count = mk_cpu_set_count(instance->cpus);
+	/*
+	 * CPU resources, as an array of 64-bit physical CPU IDs. The root
+	 * instance's device tree is the baseline: in the kernel that
+	 * manages a pool it describes the assignable pool, not the CPUs
+	 * the kernel itself runs on.
+	 */
+	const struct mk_cpu_set *cpus = instance->cpus;
+
+	if (instance == root_instance && mk_cpu_pool)
+		cpus = mk_cpu_pool;
+
+	if (!mk_cpu_set_empty(cpus)) {
+		unsigned int idx, cpu_count = mk_cpu_set_count(cpus);
 		mk_phys_cpu_t phys_cpu_id;
 		fdt64_t *cpu_array;
 
@@ -965,7 +1312,7 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 			goto err_free;
 		}
 
-		mk_cpu_set_for_each(idx, phys_cpu_id, instance->cpus)
+		mk_cpu_set_for_each(idx, phys_cpu_id, cpus)
 			cpu_array[idx] = cpu_to_fdt64(phys_cpu_id);
 
 		ret = fdt_property(fdt, "cpus", cpu_array,
@@ -973,6 +1320,10 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 		kfree(cpu_array);
 		if (ret) goto err_free;
 	}
+
+	ret = mk_dt_emit_pci_host_bridges(fdt, instance);
+	if (ret)
+		goto err_free;
 
 	if ((instance->pci_devices_valid && instance->pci_device_count > 0) ||
 	    (instance->platform_devices_valid && instance->platform_device_count > 0)) {
@@ -985,6 +1336,43 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 			list_for_each_entry(pci_dev, &instance->pci_devices, list) {
 				char node_name[64];
 				char pci_id_str[32];
+				fdt64_t resources[MK_PCI_RESOURCE_COUNT * 3];
+				struct pci_dev *live_dev = NULL;
+				unsigned int devfn;
+				int i;
+
+				if (!pci_dev->resources_valid) {
+					devfn = PCI_DEVFN(pci_dev->slot,
+							  pci_dev->func);
+					live_dev =
+						pci_get_domain_bus_and_slot(pci_dev->domain,
+									    pci_dev->bus, devfn);
+					if (!live_dev) {
+						pr_err("PCI device %04x:%02x:%02x.%x disappeared before resource snapshot\n",
+						       pci_dev->domain, pci_dev->bus,
+						       pci_dev->slot, pci_dev->func);
+						ret = -ENODEV;
+						goto err_free;
+					}
+				}
+				for (i = 0; i < MK_PCI_RESOURCE_COUNT; i++) {
+					u64 start, end, flags;
+
+					if (live_dev) {
+						start = pci_resource_start(live_dev, i);
+						end = pci_resource_end(live_dev, i);
+						flags = pci_resource_flags(live_dev, i);
+					} else {
+						start = pci_dev->resources[i].start;
+						end = pci_dev->resources[i].end;
+						flags = pci_dev->resources[i].flags;
+					}
+					resources[i * 3] = cpu_to_fdt64(start);
+					resources[i * 3 + 1] = cpu_to_fdt64(end);
+					resources[i * 3 + 2] = cpu_to_fdt64(flags);
+				}
+				if (live_dev)
+					pci_dev_put(live_dev);
 
 				snprintf(node_name, sizeof(node_name), "%s",
 					 pci_dev->name[0] ? pci_dev->name : "unnamed_pci");
@@ -1005,6 +1393,11 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 
 				ret = fdt_property_u32(fdt, "device-id", pci_dev->device);
 				if (ret) goto err_free;
+
+				ret = fdt_property(fdt, "bar-resources", resources,
+						   sizeof(resources));
+				if (ret)
+					goto err_free;
 
 				ret = fdt_end_node(fdt);
 				if (ret) goto err_free;

@@ -17,12 +17,19 @@
 #include <linux/multikernel.h>
 #include <linux/ioport.h>
 #include <linux/pci.h>
-#include <asm/smp.h>
 
 #include "internal.h"
 
-static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
-				  struct mk_instance *instance)
+/*
+ * Parked CPUs this kernel can assign to child instances. The baseline
+ * creates it, so it exists exactly in a kernel acting as a parent; it
+ * stays NULL until a baseline is applied. instance->cpus,
+ * root_instance's included, always means "CPUs that kernel instance
+ * owns".
+ */
+struct mk_cpu_set *mk_cpu_pool;
+
+static int mk_baseline_parse_cpus(const void *fdt, int resources_node)
 {
 	const fdt64_t *prop;
 	int len, i, cpu_count;
@@ -46,23 +53,24 @@ static int mk_baseline_parse_cpus(const void *fdt, int resources_node,
 		return -EINVAL;
 	}
 
-	if (!instance->cpus) {
-		pr_err("Instance CPU set not allocated\n");
-		return -ENOMEM;
+	if (!mk_cpu_pool) {
+		mk_cpu_pool = mk_cpu_set_alloc();
+		if (!mk_cpu_pool)
+			return -ENOMEM;
 	}
 
-	mk_cpu_set_clear(instance->cpus);
+	mk_cpu_set_clear(mk_cpu_pool);
 
 	for (i = 0; i < cpu_count; i++) {
 		mk_phys_cpu_t cpu_id = fdt64_to_cpu(prop[i]);
-		int ret = mk_cpu_set_add(instance->cpus, cpu_id);
+		int ret = mk_cpu_set_add(mk_cpu_pool, cpu_id);
 
 		if (ret)
 			return ret;
 		pr_debug("Baseline CPU pool: added physical CPU %llu\n", cpu_id);
 	}
 
-	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
+	mk_cpu_set_format(buf, sizeof(buf), mk_cpu_pool);
 	pr_info("Baseline CPU pool: %d CPUs specified: %s\n", cpu_count, buf);
 
 	return 0;
@@ -168,13 +176,16 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 		return;
 
 	mk_instance_free_memory(instance);
-	mk_cpu_set_clear(instance->cpus);
+	mk_cpu_set_clear(mk_cpu_pool);
 	list_for_each_entry_safe(pci_dev, pci_tmp, &instance->pci_devices, list) {
 		list_del(&pci_dev->list);
 		kfree(pci_dev);
 	}
 	instance->pci_device_count = 0;
 	instance->pci_devices_valid = false;
+	mk_pci_host_bridges_free(&instance->pci_host_bridges,
+				 &instance->pci_host_bridge_count,
+				 &instance->pci_host_bridges_valid);
 
 	list_for_each_entry_safe(plat_dev, plat_tmp, &instance->platform_devices, list) {
 		list_del(&plat_dev->list);
@@ -184,14 +195,14 @@ static void mk_baseline_clear_resources(struct mk_instance *instance)
 	instance->platform_devices_valid = false;
 }
 
-static int mk_baseline_validate_cpus(const struct mk_instance *instance)
+static int mk_baseline_validate_cpus(void)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int logical_cpu;
 	int validated = 0;
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0) {
 			pr_err("Baseline CPU %llu not found in system (not present)\n",
@@ -259,7 +270,10 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 			struct mk_pci_device *pci_dev;
 			const char *pci_id_str;
 			const fdt32_t *vendor_prop, *device_prop;
-			unsigned int domain, bus, slot, func;
+			u32 vendor, device;
+			u16 domain;
+			u8 bus, slot, func;
+			int ret;
 
 			pci_id_str = fdt_getprop(fdt, dev_node, "pci-id", &len);
 			if (!pci_id_str) {
@@ -268,10 +282,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s' for device '%s'\n",
-				       pci_id_str, dev_name);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s' for device '%s'\n",
+				       len, pci_id_str, dev_name);
+				return ret;
 			}
 
 			vendor_prop = fdt_getprop(fdt, dev_node, "vendor-id", &len);
@@ -287,6 +303,13 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 				       dev_name);
 				return -EINVAL;
 			}
+			vendor = fdt32_to_cpu(*vendor_prop);
+			device = fdt32_to_cpu(*device_prop);
+			if (vendor > U16_MAX || device > U16_MAX) {
+				pr_err("Out-of-range vendor-id or device-id for device '%s'\n",
+				       dev_name);
+				return -ERANGE;
+			}
 
 			pci_dev = kzalloc(sizeof(*pci_dev), GFP_KERNEL);
 			if (!pci_dev) {
@@ -296,12 +319,12 @@ static int mk_baseline_parse_devices(const void *fdt, int resources_node,
 
 			strncpy(pci_dev->name, dev_name, sizeof(pci_dev->name) - 1);
 			pci_dev->name[sizeof(pci_dev->name) - 1] = '\0';
-			pci_dev->vendor = (u16)fdt32_to_cpu(*vendor_prop);
-			pci_dev->device = (u16)fdt32_to_cpu(*device_prop);
-			pci_dev->domain = (u16)domain;
-			pci_dev->bus = (u8)bus;
-			pci_dev->slot = (u8)slot;
-			pci_dev->func = (u8)func;
+			pci_dev->vendor = (u16)vendor;
+			pci_dev->device = (u16)device;
+			pci_dev->domain = domain;
+			pci_dev->bus = bus;
+			pci_dev->slot = slot;
+			pci_dev->func = func;
 
 			list_add_tail(&pci_dev->list, &instance->pci_devices);
 			instance->pci_device_count++;
@@ -427,17 +450,17 @@ static int mk_baseline_validate_memory(const struct mk_instance *instance)
 	return 0;
 }
 
-static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
+static int mk_baseline_initialize_cpus(void)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
 	int logical_cpu;
 	int ret, failed = 0, offlined = 0;
-	unsigned int cpu_count = mk_cpu_set_count(instance->cpus);
+	unsigned int cpu_count = mk_cpu_set_count(mk_cpu_pool);
 
 	pr_info("Offlining %u CPUs for multikernel pool\n", cpu_count);
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu < 0)
 			continue;
@@ -478,69 +501,85 @@ static int mk_baseline_initialize_cpus(const struct mk_instance *instance)
 
 	pr_info("Successfully offlined %d CPUs for multikernel pool\n", offlined);
 
-	mk_cpu_set_for_each(i, phys_cpu_id, instance->cpus) {
+	mk_cpu_set_for_each(i, phys_cpu_id, mk_cpu_pool) {
 		logical_cpu = arch_cpu_from_physical_id(phys_cpu_id);
 		if (logical_cpu > 0 && !cpu_online(logical_cpu))
 			set_cpu_present(logical_cpu, false);
+
+		/* Donated to the pool: this kernel no longer owns it */
+		mk_cpu_set_del(root_instance->cpus, phys_cpu_id);
 	}
 
 	return 0;
 }
 
+#ifdef CONFIG_PCI
 static int mk_baseline_initialize_devices(const struct mk_instance *instance)
 {
 	struct mk_pci_device *pci_dev;
 	struct pci_dev *dev;
-	int failed = 0, unbound = 0;
+	int failed = 0;
+	int available = 0;
 
-	if (instance->pci_device_count == 0) {
-		pr_debug("No PCI devices in baseline to unbind\n");
+	if (!instance->pci_device_count) {
+		pr_debug("No PCI devices in the multikernel pool\n");
 		return 0;
 	}
 
-	pr_info("Unbinding %d PCI devices for multikernel pool\n",
+	pr_info("Validating %d PCI devices for the multikernel pool\n",
 		instance->pci_device_count);
 
+	pci_lock_rescan_remove();
 	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		dev = pci_get_domain_bus_and_slot(pci_dev->domain, pci_dev->bus,
-						  PCI_DEVFN(pci_dev->slot, pci_dev->func));
+		dev = pci_get_domain_bus_and_slot(pci_dev->domain,
+						  pci_dev->bus,
+						  PCI_DEVFN(pci_dev->slot,
+							    pci_dev->func));
 		if (!dev) {
 			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x not found in system\n",
-				pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				pci_dev->bus, pci_dev->slot, pci_dev->func);
+				pci_dev->vendor, pci_dev->device,
+				pci_dev->domain, pci_dev->bus,
+				pci_dev->slot, pci_dev->func);
 			failed++;
 			continue;
 		}
 
-		if (!dev->driver) {
-			pr_debug("PCI device %04x:%04x@%04x:%02x:%02x.%x already unbound\n",
-				 pci_dev->vendor, pci_dev->device, pci_dev->domain,
-				 pci_dev->bus, pci_dev->slot, pci_dev->func);
-			pci_dev_put(dev);
-			unbound++;
-			continue;
+		if (dev->vendor != pci_dev->vendor ||
+		    dev->device != pci_dev->device ||
+		    pci_dev_is_disconnected(dev) ||
+		    !pci_device_is_present(dev)) {
+			pr_warn("PCI device %04x:%04x@%04x:%02x:%02x.%x is not available\n",
+				pci_dev->vendor, pci_dev->device,
+				pci_dev->domain, pci_dev->bus,
+				pci_dev->slot, pci_dev->func);
+			failed++;
+		} else {
+			available++;
 		}
-
-		const char *driver_name = dev->driver->name;
-
-		device_release_driver(&dev->dev);
-
-		pr_info("Unbound PCI device %04x:%04x@%04x:%02x:%02x.%x (was: %s) for multikernel pool\n",
-			pci_dev->vendor, pci_dev->device, pci_dev->domain,
-			pci_dev->bus, pci_dev->slot, pci_dev->func,
-			driver_name);
-
 		pci_dev_put(dev);
-		unbound++;
 	}
+	pci_unlock_rescan_remove();
 
-	if (failed > 0) {
-		pr_warn("Failed to find %d PCI devices in system\n", failed);
-	}
+	if (failed)
+		pr_warn("%d PCI devices in the multikernel pool are unavailable\n",
+			failed);
 
-	pr_info("Successfully unbound %d PCI devices for multikernel pool\n", unbound);
+	pr_info("Validated %d PCI devices; host drivers remain bound until assignment\n",
+		available);
 	return 0;
 }
+#else
+static int mk_baseline_initialize_devices(const struct mk_instance *instance)
+{
+	if (!instance->pci_device_count) {
+		pr_debug("No PCI devices in the multikernel pool\n");
+		return 0;
+	}
+
+	pr_err("Cannot initialize PCI devices without CONFIG_PCI\n");
+	return -EOPNOTSUPP;
+}
+#endif
 
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 {
@@ -582,7 +621,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 
 	mk_baseline_clear_resources(root_instance);
 
-	ret = mk_baseline_parse_cpus(fdt, resources_node, root_instance);
+	ret = mk_baseline_parse_cpus(fdt, resources_node);
 	if (ret) {
 		pr_err("Failed to parse baseline CPUs: %d\n", ret);
 		return ret;
@@ -594,13 +633,22 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
+	ret = mk_dt_parse_pci_host_bridges(fdt, resources_node,
+					   &root_instance->pci_host_bridges,
+					   &root_instance->pci_host_bridge_count,
+					   &root_instance->pci_host_bridges_valid);
+	if (ret) {
+		pr_err("Failed to parse baseline PCI host bridges: %d\n", ret);
+		return ret;
+	}
+
 	ret = mk_baseline_parse_devices(fdt, resources_node, root_instance);
 	if (ret) {
 		pr_err("Failed to parse baseline devices: %d\n", ret);
 		return ret;
 	}
 
-	ret = mk_baseline_validate_cpus(root_instance);
+	ret = mk_baseline_validate_cpus();
 	if (ret) {
 		pr_err("Baseline CPU validation failed: %d\n", ret);
 		return ret;
@@ -624,7 +672,7 @@ int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size)
 		return ret;
 	}
 
-	ret = mk_baseline_initialize_cpus(root_instance);
+	ret = mk_baseline_initialize_cpus();
 	if (ret) {
 		pr_err("Baseline CPU initialization failed: %d\n", ret);
 		return ret;

@@ -2,10 +2,10 @@
 /*
  * Copyright (C) 2025 Multikernel Technologies, Inc. All rights reserved
  *
- * Multikernel KHO (Kexec HandOver)
+ * Multikernel instance device trees
  *
- * Provides KHO support for preserving and restoring multikernel instance
- * device trees across kexec boundaries using shared memory.
+ * Builds the instance device tree the host hands to a spawn kernel in the
+ * manifest, and restores an instance from the manifest on the spawn side.
  */
 
 #include <linux/kernel.h>
@@ -15,24 +15,18 @@
 #include <linux/multikernel.h>
 #include <linux/io.h>
 #include <linux/pci.h>
-#ifdef CONFIG_KEXEC_HANDOVER
-#include <linux/kexec_handover.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
-#include <asm/apic.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
-#endif
-
-#ifdef CONFIG_KEXEC_HANDOVER
 
 /*
  * Global root instance representing the current kernel.
  *
- * Initialization (in mk_kho_restore_dtbs at early_initcall):
- *   - For host kernels (no KHO): Created with id=0, name="/"
- *   - For spawn kernels (KHO present): Restored from KHO DTB
+ * Initialization (in mk_instance_restore_from_manifest at early_initcall):
+ *   - For host kernels (no manifest): Created with id=0, name="/"
+ *   - For spawn kernels: Restored from the manifest's instance DTB
  *
  * The root instance is used by overlay operations to specify the host/current
  * kernel as a source or target for resource transfers (e.g., mk,instance="/").
@@ -41,13 +35,14 @@ struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
 
 /*
- * Collect every pool CPU the instance might receive through hotplug
- * later: the unallocated pool plus other instances' CPUs, minus the
- * instance's own (those are already in its DTB). The spawn kernel can
- * only online a CPU whose physical ID it enumerated at boot, so the
- * whole pool must be in its topology from the start.
+ * Collect every CPU the instance might receive through hotplug later:
+ * the unassigned pool plus every other kernel's CPUs (the host's and
+ * other instances'), minus the instance's own (those are already in its
+ * DTB). The spawn kernel can only online a CPU whose physical ID it
+ * enumerated at boot, so the whole pool must be in its topology from
+ * the start.
  */
-static int mk_kho_add_pool_cpus(void *fdt, struct mk_instance *target)
+static int mk_manifest_add_pool_cpus(void *fdt, struct mk_instance *target)
 {
 	struct mk_cpu_set *pool;
 	struct mk_instance *other;
@@ -62,7 +57,13 @@ static int mk_kho_add_pool_cpus(void *fdt, struct mk_instance *target)
 
 	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(other, &mk_instance_list, list) {
-		if (other == target)
+		/*
+		 * Skip the root instance: its set is the CPUs the host
+		 * itself runs on, and enumerating a big host's full CPU set
+		 * in every spawn bloats the spawn's possible map and percpu
+		 * allocations.
+		 */
+		if (other == target || other == root_instance)
 			continue;
 		mk_cpu_set_for_each(i, id, other->cpus) {
 			ret = mk_cpu_set_add(pool, id);
@@ -72,8 +73,8 @@ static int mk_kho_add_pool_cpus(void *fdt, struct mk_instance *target)
 		if (ret)
 			break;
 	}
-	if (!ret && root_instance != target) {
-		mk_cpu_set_for_each(i, id, root_instance->cpus) {
+	if (!ret) {
+		mk_cpu_set_for_each(i, id, mk_cpu_pool) {
 			ret = mk_cpu_set_add(pool, id);
 			if (ret)
 				break;
@@ -102,17 +103,17 @@ out:
 }
 
 /**
- * mk_kho_preserve_dtb() - Preserve multikernel DTB for kexec
+ * mk_manifest_add_instance_dtb() - Preserve multikernel DTB for kexec
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  * @mk_id: Multikernel instance ID
  *
- * Called by mk_kexec_finalize() to preserve the multikernel DTB
- * in the KHO FDT for the target kernel.
+ * Called by mk_manifest_finalize() to preserve the multikernel DTB
+ * in the manifest for the target kernel.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
+int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
 {
 	struct mk_instance *instance;
 	void *fresh_dtb = NULL;
@@ -141,7 +142,7 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 
 	ret |= fdt_begin_node(fdt, "multikernel");
 	ret |= fdt_property(fdt, "dtb-data", instance->dtb_data, instance->dtb_size);
-	ret |= mk_kho_add_pool_cpus(fdt, instance);
+	ret |= mk_manifest_add_pool_cpus(fdt, instance);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -156,17 +157,18 @@ int mk_kho_preserve_dtb(struct kimage *image, void *fdt, int mk_id)
 }
 
 /**
- * mk_kho_preserve_host_ipi() - Preserve host's IPI buffer address in KHO
+ * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
  * @image: Target kimage
- * @fdt: FDT being built for KHO
+ * @fdt: The manifest FDT being built
  *
  * Called during kexec preparation to pass the host's IPI receive buffer
  * address to the spawn kernel so it can send messages back to the host.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
+int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 {
+	mk_phys_cpu_t target_cpu = arch_cpu_physical_id(0);
 	int ret = 0;
 
 	if (!root_instance->ipi_data) {
@@ -174,20 +176,23 @@ int mk_kho_preserve_host_ipi(struct kimage *image, void *fdt)
 		return 0;
 	}
 
-	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
+	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u, target CPU=%llu\n",
+		(unsigned long long)root_instance->ipi_phys,
+		root_instance->ipi_pages,
+		(unsigned long long)target_cpu);
 
 	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
 	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
 	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
+	ret |= fdt_property_u64(fdt, "target-cpu", target_cpu);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
-		pr_err("Failed to add host IPI buffer to KHO FDT: %d\n", ret);
+		pr_err("Failed to add host IPI buffer to manifest: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("Preserved host IPI buffer in KHO\n");
+	pr_info("Added host IPI buffer to manifest\n");
 	return 0;
 }
 
@@ -241,33 +246,33 @@ static int mk_dt_extract_instance_info(const void *dtb_data, size_t dtb_size,
 }
 
 /*
- * Register CPUs from KHO DTB during SMP config phase.
+ * Register CPUs from the manifest during SMP config phase.
  * Called from multikernel_parse_smp_config() before topology is finalized.
  */
-void __init mk_register_cpus_from_kho(void)
+void __init mk_register_cpus_from_manifest(void)
 {
 	phys_addr_t fdt_phys;
-	const void *kho_fdt;
+	const void *manifest;
 	int mk_node, resources_node;
 	const fdt64_t *cpus_prop;
 	int cpus_len, i;
 	const void *dtb_data;
 	int dtb_len;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys)
 		return;
 
-	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!kho_fdt)
+	manifest = early_memremap(fdt_phys, PAGE_SIZE);
+	if (!manifest)
 		return;
 
-	mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0)
 		goto out;
 
 	/* Get the embedded DTB */
-	dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0)
 		goto out;
 
@@ -286,31 +291,31 @@ void __init mk_register_cpus_from_kho(void)
 	for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
 		mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
-		topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
-		pr_debug("Registered CPU physical ID %llu from KHO DTB\n", phys_id);
+		mk_arch_register_cpu(phys_id);
+		pr_debug("Registered CPU physical ID %llu from manifest\n", phys_id);
 	}
 
 	/*
 	 * Register the rest of the pool so those CPUs can be hot-added
 	 * later: the topology rejects post-boot APIC IDs it did not see
 	 * during enumeration. They are registered present and pruned from
-	 * the present mask in mk_kho_restore_cpus(), which keeps a logical
+	 * the present mask in mk_restore_instance_cpus(), which keeps a logical
 	 * CPU assigned to each and avoids the hot-pluggable-APIC checks.
 	 */
-	cpus_prop = fdt_getprop(kho_fdt, mk_node, "pool-cpus", &cpus_len);
+	cpus_prop = fdt_getprop(manifest, mk_node, "pool-cpus", &cpus_len);
 	if (cpus_prop && cpus_len >= sizeof(fdt64_t) &&
 	    cpus_len % sizeof(fdt64_t) == 0) {
 		for (i = 0; i < cpus_len / sizeof(fdt64_t); i++) {
 			mk_phys_cpu_t phys_id = fdt64_to_cpu(cpus_prop[i]);
 
-			topology_register_apic((u32)phys_id, CPU_ACPIID_INVALID, true);
-			pr_debug("Registered pool CPU physical ID %llu from KHO\n",
+			mk_arch_register_cpu(phys_id);
+			pr_debug("Registered pool CPU physical ID %llu from manifest\n",
 				 phys_id);
 		}
 	}
 
 out:
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 }
 
 /*
@@ -318,7 +323,7 @@ out:
  * CPUs are already registered during multikernel_parse_smp_config() via
  * topology_register_apic(), so we just need to restrict the present mask.
  */
-static int __init mk_kho_restore_cpus(struct mk_dt_config *config)
+static int __init mk_restore_instance_cpus(struct mk_dt_config *config)
 {
 	mk_phys_cpu_t phys_cpu_id;
 	unsigned int i;
@@ -385,6 +390,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
 			goto err_free_name;
 		}
+		mk_shared_data_reset(instance->ipi_data);
 		instance->ipi_phys = virt_to_phys(instance->ipi_data);
 		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -402,8 +408,12 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mk_pci_lease_instance_init(instance);
 	instance->pci_devices_valid = false;
 	instance->pci_device_count = 0;
+	INIT_LIST_HEAD(&instance->pci_host_bridges);
+	instance->pci_host_bridges_valid = false;
+	instance->pci_host_bridge_count = 0;
 	INIT_LIST_HEAD(&instance->platform_devices);
 	instance->platform_devices_valid = false;
 	instance->platform_device_count = 0;
@@ -433,7 +443,7 @@ err_free_instance:
 	return NULL;
 }
 
-static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
+static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 					  struct mk_instance *instance)
 {
 	struct mk_pci_device *src_dev, *dst_dev;
@@ -451,19 +461,13 @@ static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
 	instance->pci_devices_valid = true;
 
 	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		dst_dev = kmemdup(src_dev, sizeof(*dst_dev), GFP_KERNEL);
 		if (!dst_dev) {
 			pr_err("Failed to allocate PCI device entry\n");
 			return -ENOMEM;
 		}
 
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
-
+		INIT_LIST_HEAD(&dst_dev->list);
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;
 	}
@@ -472,7 +476,18 @@ static int __init mk_kho_copy_pci_devices(const struct mk_dt_config *config,
 	return 0;
 }
 
-static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config,
+static int __init mk_copy_pci_host_bridges(const struct mk_dt_config *config,
+					       struct mk_instance *instance)
+{
+	return mk_pci_host_bridges_clone(&instance->pci_host_bridges,
+					 &instance->pci_host_bridge_count,
+					 &instance->pci_host_bridges_valid,
+					 &config->pci_host_bridges,
+					 config->pci_host_bridge_count,
+					 config->pci_host_bridges_valid);
+}
+
+static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 					       struct mk_instance *instance)
 {
 	struct mk_platform_device *src_dev, *dst_dev;
@@ -509,7 +524,7 @@ static int __init mk_kho_copy_platform_devices(const struct mk_dt_config *config
 	return 0;
 }
 
-static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *instance)
+static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instance *instance)
 {
 	int ipi_node;
 	const fdt64_t *phys_prop;
@@ -519,18 +534,18 @@ static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *in
 	u32 ipi_pages = 0;
 	size_t ipi_size = 0;
 
-	ipi_node = fdt_subnode_offset(kho_fdt, 0, "ipi-buffer");
+	ipi_node = fdt_subnode_offset(manifest, 0, "ipi-buffer");
 	if (ipi_node < 0) {
 		instance->ipi_data = NULL;
-		pr_debug("No IPI buffer available from KHO\n");
+		pr_debug("No IPI buffer available in manifest\n");
 		return 0;
 	}
 
-	phys_prop = fdt_getprop(kho_fdt, ipi_node, "phys-addr", &len);
+	phys_prop = fdt_getprop(manifest, ipi_node, "phys-addr", &len);
 	if (phys_prop && len == sizeof(*phys_prop))
 		ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
 
-	pages_prop = fdt_getprop(kho_fdt, ipi_node, "pages", &len);
+	pages_prop = fdt_getprop(manifest, ipi_node, "pages", &len);
 	if (pages_prop && len == sizeof(*pages_prop)) {
 		ipi_pages = fdt32_to_cpu(*pages_prop);
 		ipi_size = (size_t)ipi_pages << PAGE_SHIFT;
@@ -558,36 +573,43 @@ static int __init mk_kho_restore_ipi(const void *kho_fdt, struct mk_instance *in
 	return 0;
 }
 
-static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_fdt)
+static struct mk_instance * __init mk_restore_host_instance(const void *manifest)
 {
 	struct mk_instance *host_instance;
 	int host_ipi_node;
 	const fdt64_t *phys_prop;
+	const fdt64_t *cpu_prop;
 	const fdt32_t *pages_prop;
 	phys_addr_t host_ipi_phys = 0;
+	mk_phys_cpu_t host_ipi_cpu = MK_PHYS_CPU_INVALID;
 	u32 host_ipi_pages = 0;
 	size_t host_ipi_size = 0;
 	int len;
 
-	host_ipi_node = fdt_subnode_offset(kho_fdt, 0, "host-ipi-buffer");
+	host_ipi_node = fdt_subnode_offset(manifest, 0, "host-ipi-buffer");
 	if (host_ipi_node < 0) {
-		pr_warn("No host-ipi-buffer node in KHO (spawn won't be able to send to host)\n");
+		pr_warn("No host-ipi-buffer node in manifest (spawn won't be able to send to host)\n");
 		return NULL;
 	}
 
-	phys_prop = fdt_getprop(kho_fdt, host_ipi_node, "phys-addr", &len);
+	phys_prop = fdt_getprop(manifest, host_ipi_node, "phys-addr", &len);
 	if (phys_prop && len == sizeof(*phys_prop))
 		host_ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
 
-	pages_prop = fdt_getprop(kho_fdt, host_ipi_node, "pages", &len);
+	pages_prop = fdt_getprop(manifest, host_ipi_node, "pages", &len);
 	if (pages_prop && len == sizeof(*pages_prop)) {
 		host_ipi_pages = fdt32_to_cpu(*pages_prop);
 		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 	}
+	cpu_prop = fdt_getprop(manifest, host_ipi_node, "target-cpu", &len);
+	if (cpu_prop && len == sizeof(*cpu_prop))
+		host_ipi_cpu = fdt64_to_cpu(*cpu_prop);
 
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
+	if (!host_ipi_phys || !host_ipi_pages ||
+	    host_ipi_cpu == MK_PHYS_CPU_INVALID) {
+		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u, target CPU=%llu)\n",
+			(unsigned long long)host_ipi_phys, host_ipi_pages,
+			(unsigned long long)host_ipi_cpu);
 		return NULL;
 	}
 
@@ -595,8 +617,7 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	if (!host_instance)
 		return NULL;
 
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+	if (mk_cpu_set_add(host_instance->cpus, host_ipi_cpu)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
@@ -614,24 +635,24 @@ static struct mk_instance * __init mk_kho_restore_host_instance(const void *kho_
 	}
 	host_instance->ipi_phys = host_ipi_phys;
 	host_instance->ipi_pages = host_ipi_pages;
-	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
+	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%p, pages=%u, target CPU=%llu\n",
 		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
-		host_ipi_pages);
+		host_ipi_pages, (unsigned long long)host_ipi_cpu);
 	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
 
 	return host_instance;
 }
 
 /**
- * mk_kho_restore_dtbs() - Restore DTB from KHO shared memory
+ * mk_instance_restore_from_manifest() - Restore this instance from the manifest
  *
  * Called during multikernel initialization in the spawned kernel to restore
- * the single DTB that was preserved by the host kernel via KHO. The spawned
+ * the single DTB the host kernel placed in the manifest. The spawned
  * kernel receives exactly one DTB and parses the instance ID from it.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int __init mk_kho_restore_dtbs(void)
+int __init mk_instance_restore_from_manifest(void)
 {
 	void *dtb_virt;
 	int dtb_len;
@@ -641,23 +662,23 @@ int __init mk_kho_restore_dtbs(void)
 	struct mk_dt_config config;
 	int instance_id;
 	const char *instance_name;
-	const void *kho_fdt = NULL;
+	const void *manifest = NULL;
 	phys_addr_t fdt_phys;
 
-	fdt_phys = kho_get_fdt_phys();
+	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys) {
-		pr_info("No KHO FDT available for multikernel DTB restoration\n");
+		pr_info("No manifest available for multikernel DTB restoration\n");
 
 		instance = alloc_mk_instance(0, "", true);
 		if (!instance) {
 			pr_err("Failed to allocate root instance\n");
 			return -ENOMEM;
 		}
-		/* Initially, root has all online CPUs (physical IDs) */
+		/* Initially, root owns all online CPUs (physical IDs) */
 		for_each_online_cpu(cpu) {
 			if (mk_cpu_set_add(instance->cpus,
 					   arch_cpu_physical_id(cpu)))
-				pr_warn("Failed to add CPU %d to root pool\n",
+				pr_warn("Failed to add CPU %d to root instance\n",
 					cpu);
 		}
 		mk_cpu_set_format(cpus_buf, sizeof(cpus_buf), instance->cpus);
@@ -670,23 +691,23 @@ int __init mk_kho_restore_dtbs(void)
 		return 0;
 	}
 
-	pr_info("Restoring multikernel DTB from KHO (phys: 0x%llx)\n", fdt_phys);
+	pr_info("Restoring multikernel DTB from manifest (phys: 0x%llx)\n", fdt_phys);
 
 	/* Map the FDT for early boot access */
-	kho_fdt = early_memremap(fdt_phys, PAGE_SIZE);
-	if (!kho_fdt) {
-		pr_err("Failed to map KHO FDT at 0x%llx\n", fdt_phys);
+	manifest = early_memremap(fdt_phys, PAGE_SIZE);
+	if (!manifest) {
+		pr_err("Failed to map manifest at 0x%llx\n", fdt_phys);
 		return -EFAULT;
 	}
 
-	int mk_node = fdt_subnode_offset(kho_fdt, 0, "multikernel");
+	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0) {
-		pr_info("No multikernel node found in KHO FDT\n");
+		pr_info("No multikernel node found in manifest\n");
 		ret = 0;
 		goto cleanup_fdt;
 	}
 
-	const void *dtb_data = fdt_getprop(kho_fdt, mk_node, "dtb-data", &dtb_len);
+	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
 		pr_info("No dtb-data property found in multikernel node\n");
 		ret = 0;
@@ -698,7 +719,7 @@ int __init mk_kho_restore_dtbs(void)
 	/* Validate DTB header */
 	ret = fdt_check_header(dtb_data);
 	if (ret) {
-		pr_err("Invalid DTB header from KHO: %d\n", ret);
+		pr_err("Invalid DTB header in manifest: %d\n", ret);
 		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
@@ -732,11 +753,11 @@ int __init mk_kho_restore_dtbs(void)
 	/* In the new flat format, the root node IS the instance node */
 	ret = mk_dt_parse(dtb_virt, dtb_len, &config);
 	if (ret) {
-		pr_err("Failed to parse DTB from KHO: %d\n", ret);
+		pr_err("Failed to parse DTB from manifest: %d\n", ret);
 		goto config_free;
 	}
 
-	ret = mk_kho_restore_cpus(&config);
+	ret = mk_restore_instance_cpus(&config);
 	if (ret) {
 		pr_err("Failed to restore CPU restrictions: %d\n", ret);
 		goto config_free;
@@ -764,19 +785,25 @@ int __init mk_kho_restore_dtbs(void)
 	memcpy(instance->dtb_data, dtb_virt, dtb_len);
 	instance->dtb_size = dtb_len;
 
-	ret = mk_kho_copy_pci_devices(&config, instance);
+	ret = mk_copy_pci_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy PCI devices: %d\n", ret);
 		goto cleanup_devices;
 	}
 
-	ret = mk_kho_copy_platform_devices(&config, instance);
+	ret = mk_copy_pci_host_bridges(&config, instance);
+	if (ret) {
+		pr_err("Failed to copy PCI host bridge metadata: %d\n", ret);
+		goto cleanup_devices;
+	}
+
+	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
 		pr_err("Failed to copy platform devices: %d\n", ret);
 		goto cleanup_devices;
 	}
 
-	ret = mk_kho_restore_ipi(kho_fdt, instance);
+	ret = mk_restore_instance_ipi(manifest, instance);
 	if (ret) {
 		pr_err("Failed to restore IPI buffer: %d\n", ret);
 		goto cleanup_devices;
@@ -784,18 +811,21 @@ int __init mk_kho_restore_dtbs(void)
 
 	root_instance = instance;
 
-	host_instance = mk_kho_restore_host_instance(kho_fdt);
+	host_instance = mk_restore_host_instance(manifest);
 	if (!host_instance)
 		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
 
-	pr_info("Successfully restored multikernel root instance %d ('%s') from KHO (%d bytes)\n",
+	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
 	kfree(dtb_virt);
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 	return 0;
 
 cleanup_devices:
+	mk_pci_host_bridges_free(&instance->pci_host_bridges,
+				 &instance->pci_host_bridge_count,
+				 &instance->pci_host_bridges_valid);
 	if (instance->pci_devices_valid) {
 		struct mk_pci_device *pci_dev, *tmp_pci;
 		list_for_each_entry_safe(pci_dev, tmp_pci, &instance->pci_devices, list) {
@@ -820,95 +850,12 @@ config_free:
 cleanup_dtb:
 	kfree(dtb_virt);
 cleanup_fdt:
-	early_memunmap((void *)kho_fdt, PAGE_SIZE);
+	early_memunmap((void *)manifest, PAGE_SIZE);
 	return ret;
 }
 
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
-early_initcall(mk_kho_restore_dtbs);
-
-/**
- * mk_pci_should_probe - Check if PCI probing should occur at all
- * @bus: PCI bus
- * @devfn: device/function number
- *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist.
- *
- * Returns: true if probing should proceed, false to skip entirely
- */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(bus);
-	u8 bus_num = bus->number;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
-	u8 hdr_type;
-
-	if (!root_instance)
-		return true;
-
-	if (!root_instance->dtb_data)
-		return true;
-
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
-		return false;
-
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain != domain)
-			continue;
-
-		/* Exact location match - always allow */
-		if (pci_dev->bus == bus_num &&
-		    pci_dev->slot == slot &&
-		    pci_dev->func == func)
-			return true;
-	}
-
-	/*
-	 * Check if any whitelisted device is on a downstream bus.
-	 * If so, this might be a bridge in the path to that device.
-	 */
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
-			goto check_bridge;
-	}
-	return false;
-
-check_bridge:
-	/*
-	 * There's a whitelisted device on a downstream bus. Check if this
-	 * is a bridge that serves it.
-	 */
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
-
-		if (is_bridge) {
-			u8 secondary_bus = 0, subordinate_bus = 0;
-
-			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
-			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
-
-			/*
-			 * Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive).
-			 */
-			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
-				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-					if (pci_dev->domain == domain &&
-					    pci_dev->bus >= secondary_bus &&
-					    pci_dev->bus <= subordinate_bus)
-						return true;
-				}
-			}
-		}
-	}
-
-	return false;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
+early_initcall(mk_instance_restore_from_manifest);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
@@ -939,28 +886,3 @@ bool mk_platform_device_allowed(const char *name, const char *hid)
 	return false;
 }
 EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
-
-#else /* !CONFIG_KEXEC_HANDOVER */
-
-/* No root instance when KHO is not enabled */
-struct mk_instance *root_instance = NULL;
-
-/* Stub functions when KHO is not enabled */
-int __init mk_kho_restore_dtbs(void)
-{
-	return 0;
-}
-
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	return true;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
-
-bool mk_platform_device_allowed(const char *name, const char *hid)
-{
-	return true;
-}
-EXPORT_SYMBOL_GPL(mk_platform_device_allowed);
-
-#endif /* CONFIG_KEXEC_HANDOVER */
