@@ -215,6 +215,14 @@ void mk_instance_set_state(struct mk_instance *instance,
 	 */
 }
 
+static void mk_instance_finish_halt(struct mk_instance *instance)
+{
+	mutex_lock(&instance->resource_mutex);
+	mk_pci_quiesce_instance_irqs(instance);
+	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mutex_unlock(&instance->resource_mutex);
+}
+
 struct mk_instance *mk_instance_find_by_name(const char *name)
 {
 	struct mk_instance *instance;
@@ -1258,7 +1266,7 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
-	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mk_instance_finish_halt(instance);
 }
 
 struct mk_halted_work {
@@ -1403,7 +1411,7 @@ int multikernel_halt_by_id(int mk_id)
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
 
-		mk_instance_set_state(instance, MK_STATE_LOADED);
+		mk_instance_finish_halt(instance);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
@@ -1486,12 +1494,7 @@ int mk_instance_force_halt(struct mk_instance *instance)
 	mk_cpu_set_free(snapshot);
 	pr_info("Sent NMI to %d CPUs in instance %d\n",
 		cpu_count, instance->id);
-
-	/*
-	 * The NMI handler parks each CPU on the instance's context. Wait
-	 * for them to arrive before reporting the instance re-spawnable,
-	 * exactly as the graceful path does after its shutdown ACK.
-	 */
+	/* Quiesce host-owned resources before making the instance reusable. */
 	mk_instance_settle_halted(instance);
 	mk_cpu_transaction_unlock();
 	return 0;

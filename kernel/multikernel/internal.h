@@ -58,6 +58,7 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
+
 /* Caller must hold instance->resource_mutex. */
 void mk_pci_quiesce_instance_irqs(struct mk_instance *instance);
 #else
@@ -109,7 +110,15 @@ static inline int mk_pci_release_assignments(struct mk_instance *instance)
 {
 	return 0;
 }
+
+/* Caller must hold instance->resource_mutex. */
+static inline void
+mk_pci_quiesce_instance_irqs(struct mk_instance *instance)
+{
+}
+
 #endif
+
 int mk_instance_force_halt(struct mk_instance *instance);
 
 /* overlay.c */
