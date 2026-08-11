@@ -19,6 +19,9 @@
 
 struct pci_bus;
 
+struct pci_bus;
+struct pci_ops;
+
 /**
  * Physical CPU identifiers
  *
@@ -532,6 +535,12 @@ struct mk_memory_region {
  * Represents a single PCI device that should be accessible to an instance.
  * Format: vendor:device@domain:bus:slot.func
  */
+#define MK_PCI_RESOURCE_COUNT 6
+struct mk_pci_resource {
+	u64 start;
+	u64 end;
+	u64 flags;
+};
 struct mk_pci_device {
 	char name[64];     /* Device name from DTB (e.g., "enp9s0_dev") */
 	u16 vendor;        /* PCI vendor ID */
@@ -540,6 +549,8 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	struct mk_pci_resource resources[MK_PCI_RESOURCE_COUNT];
+	bool resources_valid;
 	struct list_head list;  /* Link to device list */
 };
 
@@ -592,7 +603,7 @@ struct mk_dt_config {
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
 	/* Extensibility: Reserved fields for future use */
-	u32 reserved[6];                 /* Reduced due to added fields */
+	u32 reserved[4];
 
 	/* Raw device tree data */
 	void *dtb_data;
@@ -899,7 +910,10 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device probe filtering against the instance's allowlist */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
+			 const struct pci_ops *ops);
+bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
+				  u16 *vendor, u16 *device);
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -951,7 +965,9 @@ static inline void mk_kimage_free(struct kimage *image, void *virt_addr,
 				  size_t size)
 {
 }
-static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
+
+static inline bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
+				       const struct pci_ops *ops)
 {
 	return true;
 }
@@ -1038,17 +1054,17 @@ int __init mk_instance_restore_from_manifest(void);
  */
 
 /**
- * mk_pci_should_probe() - Check if PCI probing should occur at a location
+ * mk_pci_get_assigned_identity() - Check and identify an assigned PCI function
  * @bus: PCI bus
  * @devfn: PCI device/function number
+ * @vendor: optional assigned vendor ID output
+ * @device: optional assigned device ID output
  *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist, avoiding hardware conflicts on bare metal.
+ * Synthetic roots make assigned functions directly discoverable. Only exact
+ * assignment metadata matches may access config space; physical bridges and
+ * all other functions remain inaccessible.
  *
- * Returns: true if probing should proceed, false to skip entirely
- *
- * Declared above with the CONFIG_MULTIKERNEL stubs.
+ * Returns: true for an exact assignment metadata match, false otherwise
  */
 
 /**

@@ -186,6 +186,7 @@ int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
  */
 int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 {
+	mk_phys_cpu_t target_cpu = arch_cpu_physical_id(0);
 	int ret = 0;
 
 	if (!root_instance->ipi_data) {
@@ -193,12 +194,15 @@ int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
 		return 0;
 	}
 
-	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
+	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u, target CPU=%llu\n",
+		(unsigned long long)root_instance->ipi_phys,
+		root_instance->ipi_pages,
+		(unsigned long long)target_cpu);
 
 	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
 	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
 	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
+	ret |= fdt_property_u64(fdt, "target-cpu", target_cpu);
 	ret |= fdt_end_node(fdt);
 
 	if (ret) {
@@ -471,19 +475,13 @@ static int __init mk_copy_pci_devices(const struct mk_dt_config *config,
 	instance->pci_devices_valid = true;
 
 	list_for_each_entry(src_dev, &config->pci_devices, list) {
-		dst_dev = kzalloc(sizeof(*dst_dev), GFP_KERNEL);
+		dst_dev = kmemdup(src_dev, sizeof(*dst_dev), GFP_KERNEL);
 		if (!dst_dev) {
 			pr_err("Failed to allocate PCI device entry\n");
 			return -ENOMEM;
 		}
 
-		dst_dev->vendor = src_dev->vendor;
-		dst_dev->device = src_dev->device;
-		dst_dev->domain = src_dev->domain;
-		dst_dev->bus = src_dev->bus;
-		dst_dev->slot = src_dev->slot;
-		dst_dev->func = src_dev->func;
-
+		INIT_LIST_HEAD(&dst_dev->list);
 		list_add_tail(&dst_dev->list, &instance->pci_devices);
 		instance->pci_device_count++;
 	}
@@ -589,8 +587,10 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	struct mk_instance *host_instance;
 	int host_ipi_node;
 	const fdt64_t *phys_prop;
+	const fdt64_t *cpu_prop;
 	const fdt32_t *pages_prop;
 	phys_addr_t host_ipi_phys = 0;
+	mk_phys_cpu_t host_ipi_cpu = MK_PHYS_CPU_INVALID;
 	u32 host_ipi_pages = 0;
 	size_t host_ipi_size = 0;
 	int len;
@@ -610,10 +610,15 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 		host_ipi_pages = fdt32_to_cpu(*pages_prop);
 		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
 	}
+	cpu_prop = fdt_getprop(manifest, host_ipi_node, "target-cpu", &len);
+	if (cpu_prop && len == sizeof(*cpu_prop))
+		host_ipi_cpu = fdt64_to_cpu(*cpu_prop);
 
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
+	if (!host_ipi_phys || !host_ipi_pages ||
+	    host_ipi_cpu == MK_PHYS_CPU_INVALID) {
+		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u, target CPU=%llu)\n",
+			(unsigned long long)host_ipi_phys, host_ipi_pages,
+			(unsigned long long)host_ipi_cpu);
 		return NULL;
 	}
 	if (host_ipi_size < sizeof(struct mk_shared_data)) {
@@ -627,8 +632,7 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	if (!host_instance)
 		return NULL;
 
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+	if (mk_cpu_set_add(host_instance->cpus, host_ipi_cpu)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
@@ -646,9 +650,9 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	}
 	host_instance->ipi_phys = host_ipi_phys;
 	host_instance->ipi_pages = host_ipi_pages;
-	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
+	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%p, pages=%u, target CPU=%llu\n",
 		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
-		host_ipi_pages);
+		host_ipi_pages, (unsigned long long)host_ipi_cpu);
 	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
 
 	return host_instance;
@@ -881,89 +885,6 @@ cleanup_fdt:
 
 /* Run at early_initcall to enforce CPU restrictions before per-CPU allocations */
 early_initcall(mk_instance_restore_from_manifest);
-
-/**
- * mk_pci_should_probe - Check if PCI probing should occur at all
- * @bus: PCI bus
- * @devfn: device/function number
- *
- * Called BEFORE any PCI config space reads to determine if probing
- * should proceed. This prevents config space accesses to devices
- * that are not in the whitelist.
- *
- * Returns: true if probing should proceed, false to skip entirely
- */
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
-{
-	struct mk_pci_device *pci_dev;
-	u16 domain = pci_domain_nr(bus);
-	u8 bus_num = bus->number;
-	u8 slot = PCI_SLOT(devfn);
-	u8 func = PCI_FUNC(devfn);
-	u8 hdr_type;
-
-	if (!root_instance)
-		return true;
-
-	if (!root_instance->dtb_data)
-		return true;
-
-	if (!root_instance->pci_devices_valid || root_instance->pci_device_count == 0)
-		return false;
-
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain != domain)
-			continue;
-
-		/* Exact location match - always allow */
-		if (pci_dev->bus == bus_num &&
-		    pci_dev->slot == slot &&
-		    pci_dev->func == func)
-			return true;
-	}
-
-	/*
-	 * Check if any whitelisted device is on a downstream bus.
-	 * If so, this might be a bridge in the path to that device.
-	 */
-	list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-		if (pci_dev->domain == domain && pci_dev->bus > bus_num)
-			goto check_bridge;
-	}
-	return false;
-
-check_bridge:
-	/*
-	 * There's a whitelisted device on a downstream bus. Check if this
-	 * is a bridge that serves it.
-	 */
-	if (pci_bus_read_config_byte(bus, devfn, PCI_HEADER_TYPE, &hdr_type) == 0) {
-		bool is_bridge = ((hdr_type & PCI_HEADER_TYPE_MASK) == PCI_HEADER_TYPE_BRIDGE);
-
-		if (is_bridge) {
-			u8 secondary_bus = 0, subordinate_bus = 0;
-
-			pci_bus_read_config_byte(bus, devfn, PCI_SECONDARY_BUS, &secondary_bus);
-			pci_bus_read_config_byte(bus, devfn, PCI_SUBORDINATE_BUS, &subordinate_bus);
-
-			/*
-			 * Allow bridge if there's a whitelisted device on any bus
-			 * between secondary and subordinate (inclusive).
-			 */
-			if (secondary_bus > 0 && subordinate_bus >= secondary_bus) {
-				list_for_each_entry(pci_dev, &root_instance->pci_devices, list) {
-					if (pci_dev->domain == domain &&
-					    pci_dev->bus >= secondary_bus &&
-					    pci_dev->bus <= subordinate_bus)
-						return true;
-				}
-			}
-		}
-	}
-
-	return false;
-}
-EXPORT_SYMBOL_GPL(mk_pci_should_probe);
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
