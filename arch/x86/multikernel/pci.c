@@ -2,12 +2,16 @@
 /*
  * x86 PCI support for multikernel spawn kernels.
  *
- * Spawn kernels discover only assigned BDFs. Configuration accesses are
- * filtered here and become host-mediated once the RPC transport is installed.
+ * Spawn kernels discover only assigned BDFs and proxy all configuration
+ * accesses to the host kernel.
  */
 #include <linux/delay.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+#include <linux/irqdesc.h>
 #include <linux/ktime.h>
+#include <linux/msi.h>
 #include <linux/multikernel.h>
 #include <linux/panic.h>
 #include <linux/pci.h>
@@ -23,7 +27,436 @@ static atomic64_t mk_pci_request_id = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_count = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
+#define MK_PCI_RESET_TIMEOUT_MS	70000
+#ifdef CONFIG_PCI_MSI
 static struct mk_instance *mk_pci_host_instance;
+
+static bool mk_pci_message_from_host(mk_phys_cpu_t sender_cpu)
+{
+	return mk_pci_host_instance &&
+		mk_cpu_set_contains(mk_pci_host_instance->cpus, sender_cpu);
+}
+
+static void mk_pci_forward_irq_noop(struct irq_data *data)
+{
+}
+
+static void mk_pci_forward_irq_write_msg(struct irq_data *data,
+					 struct msi_msg *msg)
+{
+}
+
+static struct irq_chip mk_pci_forward_irq_chip = {
+	.name = "multikernel-pci-forward",
+	.irq_ack = mk_pci_forward_irq_noop,
+	/* Host process-context lifecycle owns physical mask state. */
+	.irq_mask = mk_pci_forward_irq_noop,
+	.irq_unmask = mk_pci_forward_irq_noop,
+	.irq_write_msi_msg = mk_pci_forward_irq_write_msg,
+};
+
+static void mk_pci_bind_local_irqs(unsigned int irq, unsigned int count)
+{
+	unsigned int i;
+
+	for (i = 0; i < count; i++)
+		irq_set_chip_and_handler(irq + i, &mk_pci_forward_irq_chip,
+					 handle_edge_irq);
+}
+
+static bool mk_pci_forward_irq_matches(const struct mk_io_irq_payload *irq,
+				       struct irq_data **irq_data)
+{
+	struct irq_data *data = irq_get_irq_data(irq->irq_number);
+	struct msi_desc *desc;
+	struct pci_dev *dev;
+	unsigned int offset;
+
+	if (!data)
+		return false;
+	desc = irq_data_get_msi_desc(data);
+	if (!desc || irq->vector < desc->msi_index)
+		return false;
+
+	dev = msi_desc_to_pci_dev(desc);
+	offset = irq->vector - desc->msi_index;
+	if (offset >= desc->nvec_used || desc->irq + offset != irq->irq_number ||
+	    pci_domain_nr(dev->bus) != MK_PCI_IRQ_ID_DOMAIN(irq->device_id) ||
+	    dev->bus->number != MK_PCI_IRQ_ID_BUS(irq->device_id) ||
+	    dev->devfn != MK_PCI_IRQ_ID_DEVFN(irq->device_id))
+		return false;
+
+	*irq_data = data;
+	return true;
+}
+
+static void mk_pci_irq_forward_handler(u32 msg_type, u32 subtype,
+				       void *payload, u32 payload_len,
+				       mk_phys_cpu_t sender_cpu, void *ctx)
+{
+	struct mk_io_irq_payload *irq = payload;
+	struct irq_data *irq_data;
+	struct pci_dev *dev;
+
+	if (msg_type != MK_MSG_IO || subtype != MK_IO_IRQ_FORWARD ||
+	    payload_len != sizeof(*irq) ||
+	    !mk_pci_message_from_host(sender_cpu))
+		return;
+	if (!mk_pci_forward_irq_matches(irq, &irq_data)) {
+		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u with unmatched identity %#x vector %u\n",
+				    irq->irq_number, irq->device_id,
+				    irq->vector);
+		return;
+	}
+	dev = msi_desc_to_pci_dev(irq_data_get_msi_desc(irq_data));
+	if (READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_ACTIVE ||
+	    irq->lifecycle_generation !=
+		READ_ONCE(dev->multikernel_msi_generation) ||
+	    !root_instance->ipi_data ||
+	    irq->lifecycle_epoch !=
+		READ_ONCE(root_instance->ipi_data->spawn_epoch))
+		return;
+
+	if (irq_data_get_irq_chip(irq_data) != &mk_pci_forward_irq_chip) {
+		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u for %s vector %u before local binding\n",
+				    irq->irq_number, pci_name(dev),
+				    irq->vector);
+		return;
+	}
+
+	if (generic_handle_irq_safe(irq->irq_number))
+		pr_warn_ratelimited("Failed to dispatch host-forwarded PCI IRQ %u\n",
+				    irq->irq_number);
+}
+
+static int mk_pci_send_irq_request(struct mk_pci_irq_request *request)
+{
+	struct mk_reply_handle reply;
+	s32 status;
+	int ret;
+
+	if (WARN_ON_ONCE(irqs_disabled() || !in_task()))
+		return -EWOULDBLOCK;
+	might_sleep();
+	if (!request->lifecycle_generation || !root_instance ||
+	    !root_instance->ipi_data)
+		return -EINVAL;
+	request->lifecycle_epoch =
+		READ_ONCE(root_instance->ipi_data->spawn_epoch);
+	if (!request->lifecycle_epoch)
+		return -EPROTO;
+
+	request->request_id = atomic64_inc_return(&mk_pci_request_id);
+	request->sender_instance_id = root_instance ? root_instance->id : -1;
+	ret = mk_reply_reserve(root_instance->ipi_data, MK_REPLY_PCI_IRQ,
+			       request->request_id, &reply);
+	if (ret)
+		return ret;
+	request->reply_slot = reply.slot;
+	request->reply_generation = reply.generation;
+
+	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_IRQ_REQUEST,
+			      request, sizeof(*request));
+	if (ret) {
+		mk_reply_release(root_instance->ipi_data, &reply);
+		return ret;
+	}
+
+	ret = mk_reply_wait(root_instance->ipi_data, &reply, 1000,
+			    &status, NULL);
+	return ret ? ret : status;
+}
+
+bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return mk_pci_controlled(dev);
+}
+
+static int mk_pci_msi_teardown_generation(struct pci_dev *dev,
+					  u32 generation);
+
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	u32 generation;
+	u8 state;
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_SETUP,
+		.nr_vectors = nvec,
+		.msix = type == PCI_CAP_ID_MSIX,
+	};
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return 0;
+	state = READ_ONCE(dev->multikernel_msi_state);
+	if (state == MK_PCI_MSI_FAILED) {
+		generation = READ_ONCE(dev->multikernel_msi_generation);
+		ret = mk_pci_msi_teardown_generation(dev, generation);
+		if (ret)
+			return ret;
+		WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_IDLE);
+		state = MK_PCI_MSI_IDLE;
+	}
+	if (state != MK_PCI_MSI_IDLE)
+		return -EBUSY;
+
+	generation = READ_ONCE(dev->multikernel_msi_generation) + 1;
+	if (!generation)
+		generation = 1;
+	WRITE_ONCE(dev->multikernel_msi_generation, generation);
+	request.lifecycle_generation = generation;
+	ret = mk_pci_send_irq_request(&request);
+	if (ret) {
+		if (ret == -EINPROGRESS) {
+			int cleanup_ret;
+
+			cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
+			WRITE_ONCE(dev->multikernel_msi_state,
+				   cleanup_ret ? MK_PCI_MSI_FAILED :
+				   MK_PCI_MSI_IDLE);
+		}
+		return ret;
+	}
+	WRITE_ONCE(dev->multikernel_msi_nvec, nvec);
+	WRITE_ONCE(dev->multikernel_msi_msix, type == PCI_CAP_ID_MSIX);
+	WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_PREPARED);
+	return 0;
+}
+
+static int mk_pci_msi_bind(struct pci_dev *dev, unsigned int index,
+			   unsigned int irq, unsigned int nvec, bool msix,
+			   u32 generation)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_BIND,
+		.vector = index,
+		.nr_vectors = nvec,
+		.msix = msix,
+		.local_irq = irq,
+		.lifecycle_generation = generation,
+	};
+
+	/* The local descriptor must be dispatchable before the host unmasks. */
+	mk_pci_bind_local_irqs(irq, msix ? 1 : nvec);
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_teardown_generation(struct pci_dev *dev, u32 generation)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_TEARDOWN,
+		.lifecycle_generation = generation,
+	};
+
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_commit(struct pci_dev *dev, u32 generation)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_COMMIT,
+		.lifecycle_generation = generation,
+	};
+
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_host_activate(struct pci_dev *dev, u32 generation)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_ACTIVATE,
+		.lifecycle_generation = generation,
+	};
+
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_restore_begin(struct pci_dev *dev, u32 generation)
+{
+	struct mk_pci_irq_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+		.operation = MK_PCI_IRQ_RESTORE_BEGIN,
+		.lifecycle_generation = generation,
+	};
+
+	return mk_pci_send_irq_request(&request);
+}
+
+static int mk_pci_msi_bind_all(struct pci_dev *dev, u32 generation)
+{
+	struct msi_desc *desc;
+	unsigned int expected = READ_ONCE(dev->multikernel_msi_nvec);
+	unsigned int next = 0;
+	bool msix = READ_ONCE(dev->multikernel_msi_msix);
+	int ret;
+
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
+		unsigned int count = msix ? 1 : desc->nvec_used;
+
+		if (next >= expected || desc->msi_index != next || !count ||
+		    count > expected - next)
+			return -EINVAL;
+		ret = mk_pci_msi_bind(dev, desc->msi_index, desc->irq,
+				      desc->nvec_used, msix, generation);
+		if (ret)
+			return ret;
+		next += count;
+	}
+	if (next != expected)
+		return -EINVAL;
+	return mk_pci_msi_commit(dev, generation);
+}
+
+int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	u32 generation;
+	int cleanup_ret;
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return 0;
+	if (READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_PREPARED)
+		return -EIO;
+	generation = READ_ONCE(dev->multikernel_msi_generation);
+	ret = mk_pci_msi_bind_all(dev, generation);
+	if (ret) {
+		pr_err("Failed to activate host-owned MSI vectors for %s: %d\n",
+		       pci_name(dev), ret);
+		cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
+		WRITE_ONCE(dev->multikernel_msi_state,
+			   cleanup_ret ? MK_PCI_MSI_FAILED : MK_PCI_MSI_IDLE);
+		return ret;
+	}
+
+	/* The guest must be able to consume the first edge before host unmask. */
+	WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_ACTIVE);
+	ret = mk_pci_msi_host_activate(dev, generation);
+	if (ret) {
+		cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
+		WRITE_ONCE(dev->multikernel_msi_state,
+			   cleanup_ret ? MK_PCI_MSI_FAILED : MK_PCI_MSI_IDLE);
+		return ret;
+	}
+	return 0;
+}
+
+int mk_pci_msi_restore(struct pci_dev *dev)
+{
+	u32 generation;
+	int cleanup_ret;
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return 0;
+	if (READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_ACTIVE)
+		return -EIO;
+	generation = READ_ONCE(dev->multikernel_msi_generation);
+	ret = mk_pci_msi_restore_begin(dev, generation);
+	if (!ret)
+		ret = mk_pci_msi_bind_all(dev, generation);
+	if (!ret)
+		ret = mk_pci_msi_host_activate(dev, generation);
+	if (ret) {
+		cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
+		WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_FAILED);
+		if (cleanup_ret)
+			pr_err("Failed to quiesce host-owned MSI after restore failure for %s: %d\n",
+			       pci_name(dev), cleanup_ret);
+		return ret;
+	}
+	return 0;
+}
+
+int mk_pci_msi_teardown(struct pci_dev *dev)
+{
+	u32 generation;
+	int ret;
+
+	if (!mk_pci_msi_controlled(dev))
+		return 0;
+	if (READ_ONCE(dev->multikernel_msi_state) == MK_PCI_MSI_IDLE)
+		return 0;
+	generation = READ_ONCE(dev->multikernel_msi_generation);
+	ret = mk_pci_msi_teardown_generation(dev, generation);
+	WRITE_ONCE(dev->multikernel_msi_state,
+		   ret ? MK_PCI_MSI_FAILED : MK_PCI_MSI_IDLE);
+	return ret;
+}
+#endif /* CONFIG_PCI_MSI */
+
+bool mk_pci_controlled(struct pci_dev *dev)
+{
+	return root_instance && root_instance->id != 0 &&
+		mk_pci_get_assigned_identity_bdf(pci_domain_nr(dev->bus),
+						 dev->bus->number, dev->devfn,
+						 NULL, NULL);
+}
+
+int mk_pci_reset_flr(struct pci_dev *dev)
+{
+	struct mk_pci_reset_request request = {
+		.domain = pci_domain_nr(dev->bus),
+		.bus = dev->bus->number,
+		.devfn = dev->devfn,
+	};
+	struct mk_reply_handle reply;
+	u32 generation;
+	s32 status;
+	int ret;
+
+	if (WARN_ON_ONCE(irqs_disabled() || !in_task()))
+		return -EWOULDBLOCK;
+	might_sleep();
+	if (!root_instance || !root_instance->ipi_data)
+		return -ENODEV;
+	request.lifecycle_epoch =
+		READ_ONCE(root_instance->ipi_data->spawn_epoch);
+	if (!request.lifecycle_epoch)
+		return -EPROTO;
+
+	generation = READ_ONCE(dev->multikernel_reset_generation) + 1;
+	if (!generation)
+		generation = 1;
+	WRITE_ONCE(dev->multikernel_reset_generation, generation);
+	request.reset_generation = generation;
+	request.request_id = atomic64_inc_return(&mk_pci_request_id);
+	request.sender_instance_id = root_instance->id;
+	ret = mk_reply_reserve(root_instance->ipi_data, MK_REPLY_PCI_RESET,
+			       request.request_id, &reply);
+	if (ret)
+		return ret;
+	request.reply_slot = reply.slot;
+	request.reply_generation = reply.generation;
+
+	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_RESET_REQUEST,
+			      &request, sizeof(request));
+	if (ret) {
+		mk_reply_release(root_instance->ipi_data, &reply);
+		return ret;
+	}
+
+	ret = mk_reply_wait(root_instance->ipi_data, &reply,
+			    MK_PCI_RESET_TIMEOUT_MS,
+			    &status, NULL);
+	return ret ? ret : status;
+}
 
 static void mk_pci_record_latency(u64 start)
 {
@@ -69,6 +502,7 @@ static int mk_pci_remote_config(unsigned int domain, unsigned int bus,
 		goto out_error;
 	request.reply_slot = reply.slot;
 	request.reply_generation = reply.generation;
+
 	ret = mk_send_message(0, MK_MSG_PCI, MK_PCI_CFG_REQUEST,
 			      &request, sizeof(request));
 	if (ret) {
@@ -92,7 +526,6 @@ out_error:
 	if (ret < 0) {
 		pr_err_ratelimited("Multikernel PCI config request timed out or failed to send: %d\n",
 				   ret);
-		return PCIBIOS_SET_FAILED;
 	}
 	return PCIBIOS_SET_FAILED;
 }
@@ -105,6 +538,7 @@ static bool mk_pci_identity_read(u16 vendor, u16 device, int where, int size,
 
 	if (where < PCI_VENDOR_ID || where + size > PCI_COMMAND)
 		return false;
+
 	identity = vendor | (u32)device << 16;
 	mask = size == sizeof(identity) ? ~0U : (1U << (size * 8)) - 1;
 	*value = (identity >> (where * 8)) & mask;
@@ -124,6 +558,7 @@ static int mk_pci_raw_read(unsigned int domain, unsigned int bus,
 	}
 	if (mk_pci_identity_read(vendor, device, where, size, value))
 		return PCIBIOS_SUCCESSFUL;
+
 	return mk_pci_remote_config(domain, bus, devfn, where, size, false,
 				    value);
 }
@@ -134,6 +569,7 @@ static int mk_pci_raw_write(unsigned int domain, unsigned int bus,
 {
 	if (!mk_pci_get_assigned_identity_bdf(domain, bus, devfn, NULL, NULL))
 		return PCIBIOS_DEVICE_NOT_FOUND;
+
 	return mk_pci_remote_config(domain, bus, devfn, where, size, true,
 				    &value);
 }
@@ -142,19 +578,31 @@ static const struct pci_raw_ops mk_pci_filtered_raw_ops = {
 	.read = mk_pci_raw_read,
 	.write = mk_pci_raw_write,
 };
+
 static int __init x86_multikernel_pci_arch_init(void)
 {
 	if (!root_instance || !root_instance->pci_devices_valid)
 		return 0;
+#ifdef CONFIG_PCI_MSI
 	mk_pci_host_instance = mk_instance_find(0);
 	if (!mk_pci_host_instance) {
 		pr_err("Multikernel has no restored host instance for PCI control\n");
 		return 0;
 	}
+#endif
+#ifdef CONFIG_PCI_MSI
+	if (mk_register_msg_handler(MK_MSG_IO, mk_pci_irq_forward_handler,
+				    NULL)) {
+		pr_err("Multikernel failed to register PCI IRQ forwarding handler\n");
+		return 0;
+	}
+#endif
+
 	raw_pci_ops = &mk_pci_filtered_raw_ops;
 	raw_pci_ext_ops = &mk_pci_filtered_raw_ops;
 	mk_pci_roots_ready = true;
-	pr_notice("Multikernel selected filtered raw PCI config access\n");
+	pr_notice("Multikernel selected host-mediated PCI config access\n");
+
 	return 0;
 }
 
@@ -194,11 +642,12 @@ static struct pci_bus * __init mk_pci_get_root(u16 domain, u8 bus_number)
 		kfree(sd);
 		return ERR_PTR(-ENOMEM);
 	}
-	if (!has_busn_res &&
-	    !pci_bus_insert_busn_res(bus, bus_number, bus_number)) {
-		pci_remove_root_bus(bus);
-		kfree(sd);
-		return ERR_PTR(-EBUSY);
+	if (!has_busn_res) {
+		if (!pci_bus_insert_busn_res(bus, bus_number, bus_number)) {
+			pci_remove_root_bus(bus);
+			kfree(sd);
+			return ERR_PTR(-EBUSY);
+		}
 	}
 	pr_notice("Multikernel created synthetic PCI root %04x:%02x\n",
 		  domain, bus_number);
@@ -257,10 +706,9 @@ static int __init x86_multikernel_pci_init(void)
 			  atomic64_read(&mk_pci_cfg_max_ns));
 	}
 
-	/* Suppress legacy bus 0 probing after every assigned function is present. */
+	/* Suppress legacy bus 0 probing after every assigned root is present. */
 	return 0;
 }
-
 void __init x86_multikernel_pci_platform_init(void)
 {
 	pci_probe = PCI_PROBE_NOEARLY;
