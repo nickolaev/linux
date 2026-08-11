@@ -989,7 +989,8 @@ static int mk_handle_device_remove(struct mk_device_resource_payload *payload, u
  * message subtype.
  */
 static void mk_resource_msg_handler(u32 msg_type, u32 subtype,
-				    void *payload, u32 payload_len, void *ctx)
+				    void *payload, u32 payload_len,
+				    s32 sender_instance_id, void *ctx)
 {
 	int ret = 0;
 
@@ -1251,6 +1252,7 @@ int mk_pool_device_remove(u16 domain, u8 bus, u8 devfn,
  */
 int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 {
+	struct mk_cpu_set removing = { .nr = 1, .cap = 1, .ids = &cpu_id };
 	struct mk_cpu_resource_payload payload = {
 		.cpu_id = cpu_id,
 		.numa_node = 0,
@@ -1259,7 +1261,10 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
+	mk_phys_cpu_t route_cpu;
 	int ret;
+
+	raw_spin_lock_init(&removing.lock);
 
 	/* For self-removal, execute directly (we're in process context) */
 	if (instance_id == mk_self->id) {
@@ -1313,20 +1318,29 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
 		pr_err("Multikernel hotplug: CPU %llu not assigned to instance %d\n",
 		       cpu_id, instance_id);
-		mk_msg_pending_wait(pending, 0);
 		ret = -EINVAL;
-		goto unlock_ownership;
+		mk_cpu_ownership_unlock();
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_transaction;
 	}
 
 	ret = mk_cpu_set_reserve(mk_pool->cpus, 1);
 	if (ret) {
+		mk_cpu_ownership_unlock();
 		mk_msg_pending_wait(pending, 0);
-		goto unlock_ownership;
+		goto unlock_transaction;
 	}
 	mk_cpu_ownership_unlock();
+	ret = mk_instance_migrate_irq_route(target_instance, &removing);
+	if (ret) {
+		mk_msg_pending_wait(pending, 0);
+		goto unlock_transaction;
+	}
+	route_cpu = mk_instance_irq_route_load(target_instance);
 
-	ret = mk_send_message(target_instance->id, MK_MSG_RESOURCE,
-			      MK_RES_CPU_REMOVE, &payload, sizeof(payload));
+	ret = mk_send_message_to_cpu(target_instance, route_cpu,
+				     MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
+				     &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		goto unlock_transaction;
@@ -1351,6 +1365,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		goto unlock_transaction;
 	}
 
+	down_write(&target_instance->control_route_sem);
 	mk_cpu_ownership_lock();
 	if (!mk_cpu_set_contains(target_instance->cpus, cpu_id)) {
 		ret = -ESTALE;
@@ -1367,6 +1382,7 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	ret = 0;
 unlock_ownership:
 	mk_cpu_ownership_unlock();
+	up_write(&target_instance->control_route_sem);
 unlock_transaction:
 	mk_cpu_transaction_unlock();
 out:
@@ -1440,12 +1456,15 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		pr_err("Multikernel hotplug: CPU %llu not available in the pool\n",
 		       cpu_id);
 		ret = -EBUSY;
-		goto unlock_ownership;
+		mk_cpu_ownership_unlock();
+		goto unlock_transaction;
 	}
 
 	ret = mk_cpu_set_reserve(target_instance->cpus, 1);
-	if (ret)
-		goto unlock_ownership;
+	if (ret) {
+		mk_cpu_ownership_unlock();
+		goto unlock_transaction;
+	}
 	mk_cpu_ownership_unlock();
 
 	/*
@@ -1467,8 +1486,9 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		goto unlock_transaction;
 	}
 
-	ret = mk_send_message(target_instance->id, MK_MSG_RESOURCE,
-			      MK_RES_CPU_ADD, &payload, sizeof(payload));
+	ret = mk_send_message_to_instance(target_instance, MK_MSG_RESOURCE,
+					  MK_RES_CPU_ADD, &payload,
+					  sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		mk_repark_cpu_to_host(target_instance, cpu_id);
@@ -1487,6 +1507,7 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		goto unlock_transaction;
 	}
 
+	down_write(&target_instance->control_route_sem);
 	mk_cpu_ownership_lock();
 	if (!mk_cpu_set_contains(mk_pool->cpus, cpu_id)) {
 		ret = -ESTALE;
@@ -1499,10 +1520,13 @@ int mk_send_cpu_add(int instance_id, mk_phys_cpu_t cpu_id, u32 numa_node, u32 fl
 		goto unlock_ownership;
 	}
 	mk_cpu_set_del(mk_pool->cpus, cpu_id);
+	if (mk_instance_irq_route_load(target_instance) == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(target_instance, cpu_id);
 
 	ret = 0;
 unlock_ownership:
 	mk_cpu_ownership_unlock();
+	up_write(&target_instance->control_route_sem);
 unlock_transaction:
 	mk_cpu_transaction_unlock();
 out:

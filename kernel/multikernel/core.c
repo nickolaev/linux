@@ -16,7 +16,7 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
-/* CPU moves hold the transaction lock before the ownership lock. */
+/* Lock order: transaction -> route write -> ownership -> resources. */
 static DEFINE_MUTEX(mk_cpu_transaction_mutex);
 static DEFINE_MUTEX(mk_cpu_ownership_mutex);
 
@@ -43,6 +43,55 @@ void mk_cpu_ownership_unlock(void)
 void mk_cpu_ownership_assert_held(void)
 {
 	lockdep_assert_held(&mk_cpu_ownership_mutex);
+}
+
+static int __mk_instance_migrate_irq_route(struct mk_instance *instance,
+					   const struct mk_cpu_set *removing)
+{
+	mk_phys_cpu_t replacement = MK_PHYS_CPU_INVALID;
+	mk_phys_cpu_t route_cpu;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+
+	lockdep_assert_held_write(&instance->control_route_sem);
+	route_cpu = mk_instance_irq_route_load(instance);
+	if (route_cpu == MK_PHYS_CPU_INVALID ||
+	    !mk_cpu_set_contains(removing, route_cpu))
+		return 0;
+
+	mk_cpu_ownership_lock();
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		if (!mk_cpu_set_contains(removing, phys_cpu)) {
+			replacement = phys_cpu;
+			break;
+		}
+	}
+	mk_cpu_ownership_unlock();
+	if (replacement == MK_PHYS_CPU_INVALID &&
+	    READ_ONCE(instance->state) == MK_STATE_ACTIVE)
+		return -EBUSY;
+
+	mutex_lock(&instance->resource_mutex);
+	if (replacement != MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, replacement);
+	mk_pci_sync_instance_irq_route(instance);
+	if (replacement == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
+	mutex_unlock(&instance->resource_mutex);
+	return 0;
+}
+
+int mk_instance_migrate_irq_route(struct mk_instance *instance,
+				  const struct mk_cpu_set *removing)
+{
+	int ret;
+
+	if (!instance || !removing)
+		return -EINVAL;
+	down_write(&instance->control_route_sem);
+	ret = __mk_instance_migrate_irq_route(instance, removing);
+	up_write(&instance->control_route_sem);
+	return ret;
 }
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
@@ -270,6 +319,8 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 		goto err_free_name;
 
 	instance->state = MK_STATE_READY;
+	init_rwsem(&instance->control_route_sem);
+	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
 	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
 	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
@@ -371,6 +422,19 @@ void mk_instance_set_state(struct mk_instance *instance,
 	 * We should store a reference to the status file's kernfs node
 	 * and call kernfs_notify() on that specific file, not the directory.
 	 */
+}
+
+void mk_instance_mark_failed(struct mk_instance *instance)
+{
+	if (!instance)
+		return;
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	mk_instance_set_state(instance, MK_STATE_FAILED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
 }
 
 struct mk_instance *mk_instance_find_by_name(const char *name)
@@ -530,6 +594,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		return -ENOMEM;
 
 	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
 	mk_cpu_ownership_lock();
 	ret = mk_cpu_set_copy(requested, cpus);
 	if (ret)
@@ -557,6 +622,9 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			unavailable++;
 		}
 	}
+	if (mk_instance_irq_route_load(instance) == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance,
+					    mk_cpu_set_first(instance->cpus));
 
 	if (unavailable > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not available\n",
@@ -581,6 +649,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	ret = 0;
 out_unlock:
 	mk_cpu_ownership_unlock();
+	up_write(&instance->control_route_sem);
 	mk_cpu_transaction_unlock();
 	mk_cpu_set_free(requested);
 	return ret;
@@ -616,6 +685,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		return -ENOMEM;
 
 	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
 	mk_cpu_ownership_lock();
 	ret = mk_cpu_set_copy(requested, cpus);
 	if (ret)
@@ -650,6 +720,11 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		goto out_unlock;
 
 	mk_cpu_set_format(buf, sizeof(buf), requested);
+	mk_cpu_ownership_unlock();
+	ret = __mk_instance_migrate_irq_route(instance, requested);
+	if (ret)
+		goto out_route;
+	mk_cpu_ownership_lock();
 
 	mk_cpu_set_for_each(i, phys_cpu, requested) {
 		mk_cpu_set_add(mk_pool->cpus, phys_cpu);
@@ -662,6 +737,8 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	ret = 0;
 out_unlock:
 	mk_cpu_ownership_unlock();
+out_route:
+	up_write(&instance->control_route_sem);
 	mk_cpu_transaction_unlock();
 	mk_cpu_set_free(requested);
 	return ret;
@@ -1520,7 +1597,14 @@ static void mk_instance_settle_halted(struct mk_instance *instance)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
 }
 
 struct mk_halted_work {
@@ -1547,7 +1631,8 @@ static void mk_halted_work_fn(struct work_struct *work)
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,
-				  void *payload, u32 payload_len, void *ctx)
+				  void *payload, u32 payload_len,
+				  s32 sender_instance_id, void *ctx)
 {
 	if (msg_type != MK_MSG_SYSTEM)
 		return;
@@ -1560,7 +1645,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		if (payload_len < sizeof(*req))
 			return;
 
-		pr_info("Shutdown requested by instance %d\n", req->sender_instance_id);
+		pr_info("Shutdown requested by instance %d\n", sender_instance_id);
 
 		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
 		if (!sw)
@@ -1568,7 +1653,7 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 
 		INIT_WORK(&sw->work, mk_shutdown_work_fn);
 		sw->flags = req->flags;
-		sw->sender_instance_id = req->sender_instance_id;
+		sw->sender_instance_id = sender_instance_id;
 		schedule_work(&sw->work);
 		break;
 	}
@@ -1576,6 +1661,8 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		struct mk_resource_ack *ack = payload;
 
 		if (payload_len < sizeof(*ack))
+			return;
+		if (ack->resource_id != sender_instance_id)
 			return;
 		/*
 		 * Reply to a shutdown this kernel requested: wake the
@@ -1591,6 +1678,8 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		struct mk_halted_work *aw;
 
 		if (payload_len < sizeof(*ack))
+			return;
+		if (ack->resource_id != sender_instance_id)
 			return;
 
 		/*
@@ -1892,7 +1981,7 @@ int mk_instance_abort_spawn(struct mk_instance *instance)
 	mk_ipi_endpoint_close(instance);
 	ret = __mk_instance_force_halt(instance, true);
 	if (ret && instance)
-		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mk_instance_mark_failed(instance);
 	return ret;
 }
 
