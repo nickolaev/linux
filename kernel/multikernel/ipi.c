@@ -695,6 +695,9 @@ static void mk_ipi_drain_all(void)
 
 	if (!READ_ONCE(mk_handlers_ready))
 		return;
+	/* A kernel consumes only its own parent-link IRQ mailbox. */
+	if (mk_self && mk_self->ipi_data)
+		mk_pci_irq_mailbox_drain(mk_self->ipi_data);
 	rcu_read_lock();
 	list_for_each_entry_rcu(endpoint, &mk_ipi_endpoints, rx_node)
 		mk_ipi_drain_endpoint(endpoint);

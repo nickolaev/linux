@@ -1593,18 +1593,25 @@ static void mk_shutdown_work_fn(struct work_struct *work)
  * it corrupts the single-producer mailbox. The kexec path confirms the
  * CPUs are parked before it rewrites the image.
  */
-static void mk_instance_settle_halted(struct mk_instance *instance)
+static int mk_instance_settle_halted(struct mk_instance *instance)
 {
+	int ret;
+
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	ret = mk_instance_confirm_parked(instance);
+	if (ret)
+		return ret;
 	mk_cpu_transaction_lock();
 	down_write(&instance->control_route_sem);
 	mutex_lock(&instance->resource_mutex);
+	ret = mk_pci_quiesce_instance_irqs(instance, true);
 	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
-	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mk_instance_set_state(instance, ret ? MK_STATE_FAILED : MK_STATE_LOADED);
 	mutex_unlock(&instance->resource_mutex);
 	up_write(&instance->control_route_sem);
 	mk_cpu_transaction_unlock();
+	return ret;
 }
 
 struct mk_halted_work {
@@ -1620,7 +1627,9 @@ static void mk_halted_work_fn(struct work_struct *work)
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance);
+		if (mk_instance_settle_halted(instance))
+			pr_err("Instance %d halted but could not be made reusable\n",
+			       instance->id);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1749,12 +1758,9 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
-		if (mk_instance_confirm_parked(instance))
-			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
-				mk_id);
-
-		mk_instance_set_state(instance, MK_STATE_LOADED);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
+		ret = mk_instance_settle_halted(instance);
+		if (!ret)
+			pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
 	mk_instance_put(instance);
@@ -1967,7 +1973,7 @@ static int __mk_instance_force_halt(struct mk_instance *instance,
 			pr_err("Instance %d CPUs did not park after force halt: %d\n",
 			       instance->id, ret);
 		else
-			mk_instance_settle_halted(instance);
+			ret = mk_instance_settle_halted(instance);
 	}
 
 	mk_cpu_set_free(targets);

@@ -79,7 +79,8 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
-void mk_pci_quiesce_instance_irqs(struct mk_instance *instance);
+int mk_pci_quiesce_instance_irqs(struct mk_instance *instance,
+				 bool parked_force);
 unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance);
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
