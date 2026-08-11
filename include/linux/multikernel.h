@@ -18,8 +18,8 @@
 #include <linux/spinlock.h>
 #include <linux/multikernel_abi.h>
 #include <linux/rwsem.h>
-
 struct pci_bus;
+struct pci_dev;
 struct mk_instance;
 
 /**
@@ -77,7 +77,7 @@ bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 #define MK_IPI_SLOT_READY	2
 #define MK_IPI_SLOT_CONSUMING	3
 #define MK_IPI_SLOT_CANCELLED	4
-#define MK_IPI_ABI_MAGIC		0x4d4b495049303034ULL /* "MKIPI004" */
+#define MK_IPI_ABI_MAGIC		0x4d4b495049303036ULL /* "MKIPI006" */
 #define MK_IPI_READY_TIMEOUT_MS	120000
 
 #define MK_REPLY_SLOTS		16
@@ -96,6 +96,7 @@ enum mk_reply_state {
 enum mk_reply_kind {
 	MK_REPLY_PCI_CFG = 1,
 	MK_REPLY_PCI_IRQ,
+	MK_REPLY_PCI_RESET,
 };
 
 struct mk_reply_slot {
@@ -164,6 +165,8 @@ struct mk_shared_data {
 	atomic_t ready;
 	/* Appended direct synchronous replies; keep all older offsets stable. */
 	struct mk_reply_table replies;
+	/* Changes on every host launch; tags process-context device lifecycles. */
+	u64 spawn_epoch;
 };
 
 static inline void mk_reply_table_reset(struct mk_reply_table *table)
@@ -216,6 +219,7 @@ static inline void mk_shared_data_reset(struct mk_shared_data *shared)
 	WRITE_ONCE(shared->ready_instance_id, -1);
 	atomic_set(&shared->ready, 0);
 	mk_reply_table_reset(&shared->replies);
+	WRITE_ONCE(shared->spawn_epoch, 0);
 }
 
 /* Function pointer type for IPI callbacks */
@@ -313,6 +317,10 @@ int mk_ipi_ring_recover_halted(const struct mk_cpu_set *halted_cpus);
 /* Host-mediated PCI control-plane subtypes */
 #define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
 #define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+#define MK_PCI_IRQ_REQUEST  (MK_MSG_PCI + 3)
+#define MK_PCI_IRQ_RESPONSE (MK_MSG_PCI + 4)
+#define MK_PCI_RESET_REQUEST  (MK_MSG_PCI + 5)
+#define MK_PCI_RESET_RESPONSE (MK_MSG_PCI + 6)
 
 /**
  * Core message structure
@@ -335,7 +343,17 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+	u32 lifecycle_generation;
+	u32 reserved;
+	u64 lifecycle_epoch;
 };
+
+/* Pack a PCI segment and BDF into mk_io_irq_payload::device_id. */
+#define MK_PCI_IRQ_ID(domain, bus, devfn) \
+	(((u32)(domain) << 16) | ((u32)(bus) << 8) | (u32)(devfn))
+#define MK_PCI_IRQ_ID_DOMAIN(id)	((u16)((id) >> 16))
+#define MK_PCI_IRQ_ID_BUS(id)		((u8)((id) >> 8))
+#define MK_PCI_IRQ_ID_DEVFN(id)		((u8)(id))
 
 struct mk_pci_cfg_request {
 	u64 request_id;
@@ -356,6 +374,64 @@ struct mk_pci_cfg_response {
 	u64 request_id;
 	s32 status;
 	u32 value;
+};
+
+enum mk_pci_irq_operation {
+	MK_PCI_IRQ_SETUP = 1,
+	MK_PCI_IRQ_RESTORE_BEGIN,
+	MK_PCI_IRQ_BIND,
+	MK_PCI_IRQ_COMMIT,
+	MK_PCI_IRQ_ACTIVATE,
+	MK_PCI_IRQ_TEARDOWN,
+};
+
+enum mk_pci_msi_lifecycle {
+	MK_PCI_MSI_IDLE = 0,
+	MK_PCI_MSI_PREPARED,
+	MK_PCI_MSI_COMMITTED,
+	MK_PCI_MSI_ACTIVE,
+	MK_PCI_MSI_FAILED,
+};
+
+struct mk_pci_irq_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 operation;
+	u16 vector;
+	u16 nr_vectors;
+	u8 msix;
+	u8 reserved;
+	u32 local_irq;
+	u32 reply_slot;
+	u32 lifecycle_generation;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
+};
+
+struct mk_pci_irq_response {
+	u64 request_id;
+	s32 status;
+};
+
+struct mk_pci_reset_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u32 reset_generation;
+	u32 reply_slot;
+	u32 reserved;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
+};
+
+struct mk_pci_reset_response {
+	u64 request_id;
+	s32 status;
 };
 
 /* IRQ control flags */
@@ -947,6 +1023,7 @@ int mk_instance_set_kexec_active(int mk_id);
  */
 struct kimage;
 struct pci_bus;
+struct pci_dev;
 
 #ifdef CONFIG_MULTIKERNEL
 bool multikernel_allow_emergency_restart(void);
@@ -969,9 +1046,75 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 
 /* Device filtering against the instance metadata */
+#ifdef CONFIG_PCI
 bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
 				      unsigned int devfn, u16 *vendor,
 				      u16 *device);
+#if defined(CONFIG_X86)
+bool mk_pci_controlled(struct pci_dev *dev);
+int mk_pci_reset_flr(struct pci_dev *dev);
+#else
+static inline bool mk_pci_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_reset_flr(struct pci_dev *dev)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+#else
+static inline bool
+mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+				 unsigned int devfn, u16 *vendor, u16 *device)
+{
+	return false;
+}
+
+static inline bool mk_pci_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_reset_flr(struct pci_dev *dev)
+{
+	return -EOPNOTSUPP;
+}
+#endif
+#if defined(CONFIG_X86) && defined(CONFIG_PCI) && defined(CONFIG_PCI_MSI)
+bool mk_pci_msi_controlled(struct pci_dev *dev);
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
+int mk_pci_msi_activate(struct pci_dev *dev);
+int mk_pci_msi_restore(struct pci_dev *dev);
+int mk_pci_msi_teardown(struct pci_dev *dev);
+#else
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_restore(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_teardown(struct pci_dev *dev)
+{
+	return 0;
+}
+#endif
+
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -983,7 +1126,14 @@ bool mk_manifest_rejected(void);
 
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image);
+#ifdef CONFIG_PCI
 int mk_pci_prepare_instance_start(struct mk_instance *instance);
+#else
+static inline int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {
@@ -1029,6 +1179,42 @@ static inline bool mk_platform_device_allowed(const char *name, const char *hid)
 {
 	return true;
 }
+
+static inline bool mk_pci_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_reset_flr(struct pci_dev *dev)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
+{
+	return false;
+}
+
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_activate(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_restore(struct pci_dev *dev)
+{
+	return 0;
+}
+
+static inline int mk_pci_msi_teardown(struct pci_dev *dev)
+{
+	return 0;
+}
+
 static inline void mk_register_cpus_from_manifest(void)
 {
 }
@@ -1048,7 +1234,7 @@ static inline bool mk_manifest_rejected(void)
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
 /* Bumped whenever the shared-memory layout or message semantics change. */
-#define MK_FDT_COMPATIBLE "multikernel-v4"
+#define MK_FDT_COMPATIBLE "multikernel-v6"
 
 /**
  * Property Names

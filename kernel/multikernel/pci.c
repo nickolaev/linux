@@ -7,6 +7,8 @@
  * the current instance.
  */
 
+#include <linux/bitmap.h>
+#include <linux/delay.h>
 #include <linux/device/bus.h>
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
@@ -20,6 +22,19 @@
 #include <linux/workqueue.h>
 
 #include "internal.h"
+
+struct mk_pci_assignment;
+
+#define MK_PCI_FLR_SETTLE_MS	100
+
+struct mk_pci_irq_vector {
+	struct mk_pci_assignment *assignment;
+	unsigned int host_irq;
+	u32 local_irq;
+	atomic64_t forwarded;
+	bool requested;
+	bool disabled;
+};
 
 struct mk_pci_assignment {
 	struct list_head instance_node;
@@ -38,6 +53,17 @@ struct mk_pci_assignment {
 	bool iommu_dma_owner;
 	bool iommu_attached;
 	bool iommu_override_active;
+	struct mk_pci_irq_vector *irq_vectors;
+	unsigned long *irq_bound_map;
+	unsigned int nr_irq_vectors;
+	u64 irq_epoch;
+	u32 irq_generation;
+	u32 reset_generation;
+	u8 irq_state;
+	bool irq_msix;
+	bool irq_needs_reprogram;
+	unsigned long irq_flr_deadline;
+	bool device_enabled;
 	struct work_struct failure_work;
 	atomic_t failure_pending;
 	bool assigned;
@@ -60,9 +86,15 @@ static atomic64_t mk_pci_control_pool_exhausted = ATOMIC64_INIT(0);
 
 struct mk_pci_control_work {
 	struct work_struct work;
-	struct mk_pci_cfg_request request;
 	mk_phys_cpu_t sender_cpu;
+	union {
+		struct mk_pci_cfg_request cfg;
+		struct mk_pci_irq_request irq;
+		struct mk_pci_reset_request reset;
+	} request;
 };
+
+static void mk_pci_schedule_failure(struct mk_pci_assignment *assignment);
 
 static bool mk_pci_control_handler_get(void)
 {
@@ -117,6 +149,15 @@ static bool mk_pci_device_live(struct pci_dev *pdev)
 	return device_is_registered(&pdev->dev) &&
 	       !pci_dev_is_disconnected(pdev) &&
 	       pci_device_is_present(pdev);
+}
+
+static int mk_pci_forwarding_cpu(void)
+{
+	/* The host IPI manifest publishes logical CPU 0's physical ID. */
+	if (!cpu_online(0))
+		return -ENODEV;
+
+	return 0;
 }
 
 static bool mk_pci_device_matches_bdf(const struct mk_pci_device *device,
@@ -185,6 +226,408 @@ mk_pci_find_assignment(struct mk_instance *instance, u16 domain, u8 bus,
 	return NULL;
 }
 
+static irqreturn_t mk_pci_forward_irq(int irq, void *data)
+{
+	struct mk_pci_irq_vector *vector = data;
+	struct mk_pci_assignment *assignment = vector->assignment;
+	struct mk_io_irq_payload payload = {
+		.vector = vector - assignment->irq_vectors,
+		.device_id = MK_PCI_IRQ_ID(pci_domain_nr(assignment->vf->bus),
+					      assignment->vf->bus->number,
+					      assignment->vf->devfn),
+		.flags = MK_IRQ_LOW_LATENCY | MK_IRQ_EDGE_TRIGGERED,
+		.lifecycle_generation = READ_ONCE(assignment->irq_generation),
+		.lifecycle_epoch = READ_ONCE(assignment->irq_epoch),
+	};
+	u32 local_irq = READ_ONCE(vector->local_irq);
+
+	if (READ_ONCE(assignment->instance->state) != MK_STATE_ACTIVE ||
+	    READ_ONCE(assignment->irq_state) != MK_PCI_MSI_ACTIVE ||
+	    !local_irq)
+		return IRQ_HANDLED;
+
+	payload.irq_number = local_irq;
+	if (atomic64_inc_return(&vector->forwarded) == 1)
+		pr_info("Forwarding host IRQ %u as instance IRQ %u for %s vector %u\n",
+			irq, local_irq, pci_name(assignment->vf),
+			payload.vector);
+	if (mk_send_message_to_instance(assignment->instance, MK_MSG_IO,
+					MK_IO_IRQ_FORWARD, &payload,
+					sizeof(payload)))
+		pr_warn_ratelimited("Failed to forward IRQ %u for %s to instance %d\n",
+				    irq, pci_name(assignment->vf),
+				    assignment->instance->id);
+	return IRQ_HANDLED;
+}
+
+static unsigned int mk_pci_quiesce_irqs(struct mk_pci_assignment *assignment)
+{
+	unsigned int disabled = 0;
+	unsigned int i;
+
+	for (i = 0; i < assignment->nr_irq_vectors; i++)
+		WRITE_ONCE(assignment->irq_vectors[i].local_irq, 0);
+
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (vector->requested && !vector->disabled) {
+			disable_irq(vector->host_irq);
+			vector->disabled = true;
+			disabled++;
+		}
+	}
+	if (assignment->irq_bound_map)
+		bitmap_zero(assignment->irq_bound_map,
+			    assignment->nr_irq_vectors);
+	if (assignment->irq_state != MK_PCI_MSI_IDLE &&
+	    assignment->irq_state != MK_PCI_MSI_FAILED)
+		assignment->irq_state = MK_PCI_MSI_PREPARED;
+
+	return disabled;
+}
+
+static void mk_pci_release_irqs(struct mk_pci_assignment *assignment)
+{
+	unsigned int i;
+
+	mk_pci_quiesce_irqs(assignment);
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (vector->requested)
+			free_irq(vector->host_irq, vector);
+	}
+	if (assignment->nr_irq_vectors)
+		pci_free_irq_vectors(assignment->vf);
+	kfree(assignment->irq_vectors);
+	bitmap_free(assignment->irq_bound_map);
+	assignment->irq_vectors = NULL;
+	assignment->irq_bound_map = NULL;
+	assignment->nr_irq_vectors = 0;
+	assignment->irq_msix = false;
+	assignment->irq_needs_reprogram = false;
+	assignment->irq_flr_deadline = 0;
+}
+
+void mk_pci_quiesce_instance_irqs(struct mk_instance *instance)
+{
+	struct mk_pci_assignment *assignment;
+	unsigned int disabled = 0;
+
+	if (!instance || instance == root_instance)
+		return;
+
+	lockdep_assert_held(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	list_for_each_entry(assignment, &instance->pci_assignments,
+			    instance_node)
+		disabled += mk_pci_quiesce_irqs(assignment);
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	if (disabled)
+		pr_info("Quiesced %u host-owned PCI IRQ vectors for instance %d\n",
+			disabled, instance->id);
+}
+
+unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance)
+{
+	struct mk_pci_assignment *assignment;
+	unsigned int requested = 0;
+	unsigned int i;
+
+	lockdep_assert_held(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	list_for_each_entry(assignment, &instance->pci_assignments,
+			    instance_node) {
+		for (i = 0; i < assignment->nr_irq_vectors; i++) {
+			struct mk_pci_irq_vector *vector =
+				&assignment->irq_vectors[i];
+
+			if (vector->requested) {
+				requested++;
+				synchronize_irq(vector->host_irq);
+			}
+		}
+	}
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	return requested;
+}
+
+static bool mk_pci_generation_after(u32 generation, u32 last)
+{
+	return !last || (s32)(generation - last) > 0;
+}
+
+static int mk_pci_setup_irqs(struct mk_pci_assignment *assignment,
+			     const struct mk_pci_irq_request *request)
+{
+	struct mk_pci_irq_vector *vectors;
+	unsigned long *bound_map;
+	unsigned int flags;
+	int forwarding_cpu;
+	int i;
+	int nvec;
+	int ret;
+
+	if (!request->nr_vectors)
+		return -EINVAL;
+	if (!request->lifecycle_generation)
+		return -EINVAL;
+	if (assignment->irq_epoch &&
+	    assignment->irq_epoch != request->lifecycle_epoch)
+		return -ESTALE;
+	forwarding_cpu = mk_pci_forwarding_cpu();
+	if (forwarding_cpu < 0) {
+		pr_err("Host control CPU is unavailable for %s MSI forwarding\n",
+		       pci_name(assignment->vf));
+		return forwarding_cpu;
+	}
+	if (assignment->irq_generation == request->lifecycle_generation) {
+		if ((assignment->irq_state == MK_PCI_MSI_PREPARED ||
+		     assignment->irq_state == MK_PCI_MSI_COMMITTED ||
+		     assignment->irq_state == MK_PCI_MSI_ACTIVE) &&
+		    assignment->nr_irq_vectors == request->nr_vectors &&
+		    assignment->irq_msix == request->msix)
+			return 0;
+		return -ESTALE;
+	}
+	if (!mk_pci_generation_after(request->lifecycle_generation,
+				     assignment->irq_generation))
+		return -ESTALE;
+	if (assignment->nr_irq_vectors)
+		mk_pci_release_irqs(assignment);
+	assignment->irq_epoch = request->lifecycle_epoch;
+	assignment->irq_generation = request->lifecycle_generation;
+	assignment->irq_state = MK_PCI_MSI_FAILED;
+
+	vectors = kcalloc(request->nr_vectors, sizeof(*vectors), GFP_KERNEL);
+	if (!vectors)
+		return -ENOMEM;
+	bound_map = bitmap_zalloc(request->nr_vectors, GFP_KERNEL);
+	if (!bound_map) {
+		kfree(vectors);
+		return -ENOMEM;
+	}
+	flags = request->msix ? PCI_IRQ_MSIX : PCI_IRQ_MSI;
+	nvec = pci_alloc_irq_vectors(assignment->vf, request->nr_vectors,
+				     request->nr_vectors, flags);
+	if (nvec < 0) {
+		bitmap_free(bound_map);
+		kfree(vectors);
+		return nvec;
+	}
+
+	assignment->irq_vectors = vectors;
+	assignment->irq_bound_map = bound_map;
+	assignment->nr_irq_vectors = nvec;
+	assignment->irq_msix = request->msix;
+	for (i = 0; i < nvec; i++) {
+		vectors[i].assignment = assignment;
+		vectors[i].host_irq = pci_irq_vector(assignment->vf, i);
+	}
+	for (i = 0; i < nvec; i++) {
+		ret = request_irq(vectors[i].host_irq, mk_pci_forward_irq,
+				  IRQF_NO_AUTOEN | IRQF_NOBALANCING,
+				  "multikernel-pci-forward", &vectors[i]);
+		if (ret)
+			goto err_release;
+		vectors[i].requested = true;
+		vectors[i].disabled = true;
+		ret = irq_set_affinity(vectors[i].host_irq,
+				       cpumask_of(forwarding_cpu));
+		if (ret)
+			goto err_release;
+	}
+	assignment->irq_state = MK_PCI_MSI_PREPARED;
+	pr_info("Allocated %d host-owned %s vectors for %s (instance %d, CPU %d)\n",
+		nvec, request->msix ? "MSI-X" : "MSI",
+		pci_name(assignment->vf), assignment->instance->id,
+		forwarding_cpu);
+	return 0;
+
+err_release:
+	pr_err("Failed to configure host-owned IRQ for %s vector %d: %d\n",
+	       pci_name(assignment->vf), i, ret);
+	mk_pci_release_irqs(assignment);
+	return ret;
+}
+
+static int mk_pci_bind_irq(struct mk_pci_assignment *assignment,
+			   const struct mk_pci_irq_request *request)
+{
+	struct mk_pci_irq_vector *vector;
+	unsigned long delay;
+	unsigned int count;
+	unsigned int i;
+	u32 last_irq;
+	u32 local_irq;
+
+	if (mk_instance_irq_route_load(assignment->instance) ==
+	    MK_PHYS_CPU_INVALID)
+		return -ENODEV;
+	if (!request->lifecycle_generation ||
+	    assignment->irq_generation != request->lifecycle_generation)
+		return -ESTALE;
+	if (assignment->irq_epoch != request->lifecycle_epoch ||
+	    (assignment->irq_state != MK_PCI_MSI_PREPARED &&
+	     assignment->irq_state != MK_PCI_MSI_ACTIVE))
+		return -ESTALE;
+	if (!assignment->irq_vectors ||
+	    assignment->irq_msix != request->msix)
+		return -EINVAL;
+	count = request->msix ? 1 : request->nr_vectors;
+	if (!count || request->vector >= assignment->nr_irq_vectors ||
+	    count > assignment->nr_irq_vectors - request->vector)
+		return -EINVAL;
+	last_irq = request->local_irq + count - 1;
+	if (!request->local_irq || last_irq < request->local_irq)
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		vector = &assignment->irq_vectors[request->vector + i];
+		local_irq = READ_ONCE(vector->local_irq);
+		if (!vector->requested)
+			return -EINVAL;
+		if (local_irq && local_irq != request->local_irq + i)
+			return -EBUSY;
+	}
+
+	if (assignment->irq_needs_reprogram) {
+		if (time_before(jiffies, assignment->irq_flr_deadline)) {
+			delay = assignment->irq_flr_deadline - jiffies;
+			msleep(jiffies_to_msecs(delay) + 1);
+		}
+		pci_restore_msi_state(assignment->vf);
+		assignment->irq_needs_reprogram = false;
+		assignment->irq_flr_deadline = 0;
+		pr_info("Reprogrammed host-owned MSI state for %s during restore\n",
+			pci_name(assignment->vf));
+	}
+
+	for (i = 0; i < count; i++) {
+		vector = &assignment->irq_vectors[request->vector + i];
+		WRITE_ONCE(vector->local_irq, request->local_irq + i);
+	}
+	bitmap_set(assignment->irq_bound_map, request->vector, count);
+	return 0;
+}
+
+static int
+mk_pci_restore_irqs_begin(struct mk_pci_assignment *assignment,
+			  const struct mk_pci_irq_request *request)
+{
+	if (assignment->irq_epoch != request->lifecycle_epoch ||
+	    assignment->irq_generation != request->lifecycle_generation)
+		return -ESTALE;
+	if (assignment->irq_state == MK_PCI_MSI_PREPARED &&
+	    assignment->irq_needs_reprogram)
+		return 0;
+	if (assignment->irq_state != MK_PCI_MSI_ACTIVE)
+		return -ESTALE;
+
+	mk_pci_quiesce_irqs(assignment);
+	assignment->irq_needs_reprogram = true;
+	return 0;
+}
+
+static int mk_pci_commit_irqs(struct mk_pci_assignment *assignment,
+			      const struct mk_pci_irq_request *request)
+{
+	unsigned int i;
+
+	if (assignment->irq_epoch != request->lifecycle_epoch ||
+	    assignment->irq_generation != request->lifecycle_generation ||
+	    (assignment->irq_state != MK_PCI_MSI_PREPARED &&
+	     assignment->irq_state != MK_PCI_MSI_ACTIVE) ||
+	    !assignment->irq_bound_map ||
+	    !bitmap_full(assignment->irq_bound_map,
+			 assignment->nr_irq_vectors))
+		return -ESTALE;
+
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (!READ_ONCE(vector->local_irq))
+			return -EINVAL;
+	}
+	if (assignment->irq_state == MK_PCI_MSI_ACTIVE)
+		return 0;
+	assignment->irq_state = MK_PCI_MSI_COMMITTED;
+	return 0;
+}
+
+static int mk_pci_activate_irqs(struct mk_pci_assignment *assignment,
+				const struct mk_pci_irq_request *request)
+{
+	unsigned int i;
+
+	if (assignment->irq_epoch != request->lifecycle_epoch ||
+	    assignment->irq_generation != request->lifecycle_generation)
+		return -ESTALE;
+	if (assignment->irq_state == MK_PCI_MSI_ACTIVE)
+		return 0;
+	if (assignment->irq_state != MK_PCI_MSI_COMMITTED ||
+	    !assignment->nr_irq_vectors || !assignment->irq_bound_map ||
+	    !bitmap_full(assignment->irq_bound_map,
+			 assignment->nr_irq_vectors))
+		return -ESTALE;
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (!vector->requested || !READ_ONCE(vector->local_irq))
+			return -EINVAL;
+	}
+	assignment->irq_state = MK_PCI_MSI_ACTIVE;
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (vector->disabled) {
+			enable_irq(vector->host_irq);
+			vector->disabled = false;
+		}
+	}
+	return 0;
+}
+
+static int mk_pci_teardown_irqs(struct mk_pci_assignment *assignment,
+				const struct mk_pci_irq_request *request)
+{
+	if (assignment->irq_epoch &&
+	    assignment->irq_epoch != request->lifecycle_epoch)
+		return -ESTALE;
+	if (assignment->irq_generation != request->lifecycle_generation &&
+	    !mk_pci_generation_after(request->lifecycle_generation,
+				     assignment->irq_generation))
+		return -ESTALE;
+
+	if (assignment->nr_irq_vectors)
+		mk_pci_release_irqs(assignment);
+	assignment->irq_epoch = request->lifecycle_epoch;
+	assignment->irq_generation = request->lifecycle_generation;
+	assignment->irq_state = MK_PCI_MSI_IDLE;
+	return 0;
+}
+
+static bool mk_pci_is_flr_write(struct pci_dev *vf,
+				const struct mk_pci_cfg_request *request)
+{
+	u16 flr_byte;
+	unsigned int bit;
+
+	if (!request->write || !pci_is_pcie(vf))
+		return false;
+	flr_byte = pci_pcie_cap(vf) + PCI_EXP_DEVCTL + 1;
+	if (request->reg > flr_byte ||
+	    request->reg + request->len <= flr_byte)
+		return false;
+	bit = (flr_byte - request->reg) * 8 + 7;
+	return request->value & BIT(bit);
+}
+
 static bool mk_pci_request_route_stale(struct mk_instance *instance,
 				       mk_phys_cpu_t sender_cpu)
 {
@@ -204,6 +647,7 @@ static int mk_pci_config_access(struct mk_instance *instance,
 {
 	struct mk_pci_assignment *assignment;
 	struct pci_dev *vf;
+	bool flr;
 	int ret;
 
 	if (request->len != 1 && request->len != 2 && request->len != 4)
@@ -224,8 +668,14 @@ static int mk_pci_config_access(struct mk_instance *instance,
 	ret = mk_reply_begin_execute(instance, reply);
 	if (ret)
 		goto out;
+	/* Committed: complete and let publish reclaim an indeterminate timeout. */
 
 	vf = assignment->vf;
+	flr = mk_pci_is_flr_write(vf, request);
+	if (flr) {
+		ret = PCIBIOS_SET_FAILED;
+		goto out;
+	}
 	if (request->write) {
 		switch (request->len) {
 		case 1:
@@ -273,17 +723,123 @@ static void mk_pci_cfg_work_fn(struct work_struct *work)
 {
 	struct mk_pci_control_work *control_work =
 		container_of(work, struct mk_pci_control_work, work);
+	struct mk_pci_cfg_request *request = &control_work->request.cfg;
 	struct mk_reply_handle reply = {
-		.slot = control_work->request.reply_slot,
+		.slot = request->reply_slot,
 		.kind = MK_REPLY_PCI_CFG,
-		.request_id = control_work->request.request_id,
-		.generation = control_work->request.reply_generation,
+		.request_id = request->request_id,
+		.generation = request->reply_generation,
 	};
 	struct mk_instance *instance;
 	u32 value = ~0U;
 	s32 status;
 
-	instance = mk_instance_find(control_work->request.sender_instance_id);
+	instance = mk_instance_find(request->sender_instance_id);
+	if (!instance)
+		goto out;
+	down_read(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	status = mk_pci_request_route_stale(instance, control_work->sender_cpu) ?
+		-ESTALE : 0;
+	mk_cpu_ownership_unlock();
+	/* An untrusted payload ID must never select another instance's slot. */
+	if (status)
+		goto unlock_route;
+	if (mk_reply_claim(instance, &reply))
+		goto unlock_route;
+	status = mk_pci_config_access(instance, request, &value, &reply);
+	if (mk_reply_publish(instance, &reply, status, value))
+		pr_warn_ratelimited("Failed to return PCI config response to instance %d\n",
+				    instance->id);
+unlock_route:
+	up_read(&instance->control_route_sem);
+	mk_instance_put(instance);
+out:
+	mempool_free(control_work, mk_pci_control_pool);
+}
+
+static int mk_pci_irq_access(struct mk_instance *instance,
+			     const struct mk_pci_irq_request *request,
+			     const struct mk_reply_handle *reply)
+{
+	struct mk_pci_assignment *assignment;
+	int ret;
+
+	mutex_lock(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	if (request->operation != MK_PCI_IRQ_TEARDOWN &&
+	    READ_ONCE(instance->state) != MK_STATE_ACTIVE) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+	assignment = mk_pci_find_assignment(instance, request->domain,
+					    request->bus, request->devfn);
+	if (!assignment || !assignment->assigned ||
+	    !mk_pci_device_live(assignment->vf)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!instance->ipi_data || !request->lifecycle_epoch ||
+	    request->lifecycle_epoch !=
+		READ_ONCE(instance->ipi_data->spawn_epoch)) {
+		ret = -ESTALE;
+		goto out;
+	}
+	ret = mk_reply_begin_execute(instance, reply);
+	if (ret)
+		goto out;
+	/*
+	 * This CAS is the sole cancellation boundary.  IRQ programming is
+	 * non-cancellable once EXECUTING; a timed-out waiter moves the exact
+	 * generation to COMMITTED for mk_reply_publish() to reclaim afterwards.
+	 */
+
+	switch (request->operation) {
+	case MK_PCI_IRQ_SETUP:
+		ret = mk_pci_setup_irqs(assignment, request);
+		break;
+	case MK_PCI_IRQ_RESTORE_BEGIN:
+		ret = mk_pci_restore_irqs_begin(assignment, request);
+		break;
+	case MK_PCI_IRQ_BIND:
+		ret = mk_pci_bind_irq(assignment, request);
+		break;
+	case MK_PCI_IRQ_COMMIT:
+		ret = mk_pci_commit_irqs(assignment, request);
+		break;
+	case MK_PCI_IRQ_ACTIVATE:
+		ret = mk_pci_activate_irqs(assignment, request);
+		break;
+	case MK_PCI_IRQ_TEARDOWN:
+		ret = mk_pci_teardown_irqs(assignment, request);
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+out:
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
+}
+
+static void mk_pci_irq_work_fn(struct work_struct *work)
+{
+	struct mk_pci_control_work *control_work =
+		container_of(work, struct mk_pci_control_work, work);
+	struct mk_pci_irq_request *request = &control_work->request.irq;
+	struct mk_reply_handle reply = {
+		.slot = request->reply_slot,
+		.kind = MK_REPLY_PCI_IRQ,
+		.request_id = request->request_id,
+		.generation = request->reply_generation,
+	};
+	struct mk_instance *instance;
+	s32 status;
+
+	instance = mk_instance_find(request->sender_instance_id);
 	if (!instance)
 		goto out;
 	down_read(&instance->control_route_sem);
@@ -295,10 +851,103 @@ static void mk_pci_cfg_work_fn(struct work_struct *work)
 		goto unlock_route;
 	if (mk_reply_claim(instance, &reply))
 		goto unlock_route;
-	status = mk_pci_config_access(instance, &control_work->request,
-				      &value, &reply);
-	if (mk_reply_publish(instance, &reply, status, value))
-		pr_warn_ratelimited("Failed to return PCI config response to instance %d\n",
+	status = mk_pci_irq_access(instance, request, &reply);
+	if (mk_reply_publish(instance, &reply, status, 0))
+		pr_warn_ratelimited("Failed to return PCI IRQ response to instance %d\n",
+				    instance->id);
+unlock_route:
+	up_read(&instance->control_route_sem);
+	mk_instance_put(instance);
+out:
+	mempool_free(control_work, mk_pci_control_pool);
+}
+
+static int mk_pci_reset_access(struct mk_instance *instance,
+			       const struct mk_pci_reset_request *request,
+			       const struct mk_reply_handle *reply)
+{
+	struct mk_pci_assignment *assignment;
+	int ret;
+
+	mutex_lock(&instance->resource_mutex);
+	mutex_lock(&mk_pci_lease_mutex);
+	pci_lock_rescan_remove();
+	if (READ_ONCE(instance->state) != MK_STATE_ACTIVE) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+	assignment = mk_pci_find_assignment(instance, request->domain,
+					    request->bus, request->devfn);
+	if (!assignment || !assignment->assigned ||
+	    !mk_pci_device_live(assignment->vf) || !assignment->vf->is_virtfn) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (!instance->ipi_data || !request->lifecycle_epoch ||
+	    request->lifecycle_epoch !=
+		READ_ONCE(instance->ipi_data->spawn_epoch) ||
+	    !request->reset_generation ||
+	    !mk_pci_generation_after(request->reset_generation,
+				     assignment->reset_generation)) {
+		ret = -ESTALE;
+		goto out;
+	}
+	ret = mk_reply_begin_execute(instance, reply);
+	if (ret)
+		goto out;
+
+	/* Tombstone this serial before side effects so delayed replays reject. */
+	assignment->reset_generation = request->reset_generation;
+	mk_pci_quiesce_irqs(assignment);
+	ret = pcie_reset_flr(assignment->vf, false);
+	if (ret) {
+		assignment->irq_state = MK_PCI_MSI_FAILED;
+		mk_pci_schedule_failure(assignment);
+		goto out;
+	}
+	if (assignment->nr_irq_vectors) {
+		assignment->irq_needs_reprogram = true;
+		assignment->irq_flr_deadline =
+			jiffies + msecs_to_jiffies(MK_PCI_FLR_SETTLE_MS);
+	}
+	pr_info("Invalidated host-owned MSI bindings for spawn-triggered FLR of %s\n",
+		pci_name(assignment->vf));
+out:
+	pci_unlock_rescan_remove();
+	mutex_unlock(&mk_pci_lease_mutex);
+	mutex_unlock(&instance->resource_mutex);
+	return ret;
+}
+
+static void mk_pci_reset_work_fn(struct work_struct *work)
+{
+	struct mk_pci_control_work *control_work =
+		container_of(work, struct mk_pci_control_work, work);
+	struct mk_pci_reset_request *request = &control_work->request.reset;
+	struct mk_reply_handle reply = {
+		.slot = request->reply_slot,
+		.kind = MK_REPLY_PCI_RESET,
+		.request_id = request->request_id,
+		.generation = request->reply_generation,
+	};
+	struct mk_instance *instance;
+	s32 status;
+
+	instance = mk_instance_find(request->sender_instance_id);
+	if (!instance)
+		goto out;
+	down_read(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	status = mk_pci_request_route_stale(instance, control_work->sender_cpu) ?
+		-ESTALE : 0;
+	mk_cpu_ownership_unlock();
+	if (status)
+		goto unlock_route;
+	if (mk_reply_claim(instance, &reply))
+		goto unlock_route;
+	status = mk_pci_reset_access(instance, request, &reply);
+	if (mk_reply_publish(instance, &reply, status, 0))
+		pr_warn_ratelimited("Failed to return PCI reset response to instance %d\n",
 				    instance->id);
 unlock_route:
 	up_read(&instance->control_route_sem);
@@ -311,26 +960,51 @@ static void mk_pci_control_msg_handler(u32 msg_type, u32 subtype,
 				       void *payload, u32 payload_len,
 				       mk_phys_cpu_t sender_cpu, void *ctx)
 {
-	struct mk_pci_control_work *work;
+	struct mk_pci_control_work *control_work;
+	size_t request_size;
+	work_func_t work_fn;
 
-	if (msg_type != MK_MSG_PCI || subtype != MK_PCI_CFG_REQUEST ||
-	    payload_len != sizeof(work->request))
+	if (msg_type != MK_MSG_PCI)
 		return;
 	if (!mk_pci_control_handler_get())
 		return;
 
-	/* One reserve object exists for every valid outstanding reply slot. */
-	work = mempool_alloc(mk_pci_control_pool, GFP_ATOMIC);
-	if (!work) {
+	switch (subtype) {
+	case MK_PCI_CFG_REQUEST:
+		request_size = sizeof(control_work->request.cfg);
+		work_fn = mk_pci_cfg_work_fn;
+		break;
+	case MK_PCI_IRQ_REQUEST:
+		request_size = sizeof(control_work->request.irq);
+		work_fn = mk_pci_irq_work_fn;
+		break;
+	case MK_PCI_RESET_REQUEST:
+		request_size = sizeof(control_work->request.reset);
+		work_fn = mk_pci_reset_work_fn;
+		break;
+	default:
+		goto out;
+	}
+	if (payload_len != request_size)
+		goto out;
+	/*
+	 * Valid senders reserve one of MK_REPLY_SLOTS before publishing. Every
+	 * active instance owns at least one disjoint possible CPU, so the pool
+	 * covers the maximum number of valid requests across all instances. This
+	 * keeps the hardirq receive path allocation-safe without changing reply
+	 * or route validation. Duplicate traffic is outside the cooperative ABI.
+	 */
+	control_work = mempool_alloc(mk_pci_control_pool, GFP_ATOMIC);
+	if (!control_work) {
 		atomic64_inc(&mk_pci_control_pool_exhausted);
 		pr_warn_ratelimited("Multikernel PCI control work pool exhausted\n");
 		goto out;
 	}
-	INIT_WORK(&work->work, mk_pci_cfg_work_fn);
-	memcpy(&work->request, payload, sizeof(work->request));
-	work->sender_cpu = sender_cpu;
-	if (!queue_work(mk_pci_control_wq, &work->work))
-		mempool_free(work, mk_pci_control_pool);
+	INIT_WORK(&control_work->work, work_fn);
+	memcpy(&control_work->request, payload, request_size);
+	control_work->sender_cpu = sender_cpu;
+	if (!queue_work(mk_pci_control_wq, &control_work->work))
+		mempool_free(control_work, mk_pci_control_pool);
 out:
 	mk_pci_control_handler_put();
 }
@@ -574,6 +1248,7 @@ mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
 	bool transactions_drained;
 	int ret;
 
+	mk_pci_release_irqs(assignment);
 	if (!mk_pci_device_live(vf))
 		return 0;
 
@@ -610,6 +1285,11 @@ mk_pci_reset_assignment_for_start(struct mk_pci_assignment *assignment)
 	struct pci_dev *vf = assignment->vf;
 	int ret;
 
+	mk_pci_release_irqs(assignment);
+	assignment->irq_epoch = 0;
+	assignment->irq_generation = 0;
+	assignment->reset_generation = 0;
+	assignment->irq_state = MK_PCI_MSI_IDLE;
 	if (!assignment->assigned || !assignment->iommu_attached)
 		return -EINVAL;
 	if (!mk_pci_device_live(vf))
@@ -780,9 +1460,22 @@ static int mk_pci_iommu_assignment_probe(struct pci_dev *pdev,
 
 	ret = iommu_attach_group(assignment->iommu_domain,
 				 assignment->iommu_group);
-	if (ret)
+	if (ret) {
+		iommu_device_release_dma_owner(&assignment->vf->dev);
+		assignment->iommu_dma_owner = false;
 		return ret;
+	}
 	assignment->iommu_attached = true;
+	ret = pci_enable_device(pdev);
+	if (ret) {
+		iommu_detach_group(assignment->iommu_domain,
+				   assignment->iommu_group);
+		assignment->iommu_attached = false;
+		iommu_device_release_dma_owner(&assignment->vf->dev);
+		assignment->iommu_dma_owner = false;
+		return ret;
+	}
+	assignment->device_enabled = true;
 	pr_info("Attached %s to host-owned IOMMU domain for instance %d\n",
 		pci_name(assignment->vf), assignment->instance->id);
 	return 0;
@@ -797,6 +1490,10 @@ static void mk_pci_iommu_assignment_remove(struct pci_dev *pdev)
 		return;
 
 	if (READ_ONCE(assignment->expected_unbind)) {
+		if (assignment->device_enabled) {
+			pci_disable_device(pdev);
+			assignment->device_enabled = false;
+		}
 		pci_set_drvdata(pdev, NULL);
 		return;
 	}
@@ -808,6 +1505,10 @@ static void mk_pci_iommu_assignment_remove(struct pci_dev *pdev)
 		mk_pci_schedule_failure(assignment);
 	} else {
 		mk_pci_iommu_deactivate_assignment(assignment);
+	}
+	if (assignment->device_enabled) {
+		pci_disable_device(pdev);
+		assignment->device_enabled = false;
 	}
 	pci_set_drvdata(pdev, NULL);
 }
