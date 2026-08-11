@@ -10,7 +10,6 @@
 #include <asm/multikernel.h>
 #include <asm/bios_ebda.h>
 #include <asm/x86_init.h>
-#include <asm/pci_x86.h>
 #include <asm/e820/api.h>
 #include <asm/apic.h>
 #include <asm/apicdef.h>
@@ -171,6 +170,7 @@ void __init x86_early_init_platform_quirks(void)
 		break;
 	case X86_SUBARCH_MULTIKERNEL:
 		multikernel_setup_calibration();
+		x86_multikernel_pci_platform_init();
 		x86_platform.legacy.devices.pnpbios = 0;
 		x86_platform.legacy.i8042 = X86_LEGACY_I8042_PLATFORM_ABSENT;
 		x86_platform.legacy.rtc = 0;
@@ -194,9 +194,6 @@ void __init x86_early_init_platform_quirks(void)
 		x86_init.paging.pagetable_init = multikernel_pagetable_init;
 #endif
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
-#ifdef CONFIG_PCI
-		x86_init.pci.init = pci_multikernel_init;
-#endif
 #endif
 		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
 		/*
