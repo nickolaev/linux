@@ -17,8 +17,10 @@
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/multikernel_abi.h>
+#include <linux/rwsem.h>
 
 struct pci_bus;
+struct mk_instance;
 
 /**
  * Physical CPU identifiers
@@ -620,6 +622,9 @@ struct mk_instance {
 
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
+	/* Pins the CPU selected for control messages and forwarded IRQs. */
+	struct rw_semaphore control_route_sem;
+	mk_phys_cpu_t irq_route_cpu;      /* IRQ-safe cached forwarding target */
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -680,6 +685,20 @@ struct mk_instance {
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
 };
+
+static inline mk_phys_cpu_t
+mk_instance_irq_route_load(const struct mk_instance *instance)
+{
+	/* Pairs with route publication before old-target IRQs are drained. */
+	return smp_load_acquire(&instance->irq_route_cpu);
+}
+
+static inline void mk_instance_irq_route_store(struct mk_instance *instance,
+					       mk_phys_cpu_t target)
+{
+	/* Publish the new target before synchronize_irq() drains old users. */
+	smp_store_release(&instance->irq_route_cpu, target);
+}
 
 /**
  * Device Tree Parsing Functions
@@ -838,9 +857,11 @@ void mk_instance_free_memory(struct mk_instance *instance);
 
 
 int mk_instance_transfer_cpus(struct mk_instance *instance,
-			       const struct mk_cpu_set *cpus);
+			      const struct mk_cpu_set *cpus);
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus);
+void mk_cpu_transaction_lock(void);
+void mk_cpu_transaction_unlock(void);
 int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 				  int node);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
@@ -895,6 +916,7 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+void mk_instance_mark_failed(struct mk_instance *instance);
 int mk_instance_abort_spawn(struct mk_instance *instance);
 
 /* Kimage-based access to the instance memory pool */
