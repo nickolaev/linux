@@ -15,7 +15,12 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
-/* Lock order: transaction -> route write -> ownership -> resources. */
+/*
+ * CPU moves take transaction, then the affected instance's route write side,
+ * then ownership while inspecting or publishing paired CPU sets. PCI request
+ * work takes the route read side, validates under ownership, drops ownership
+ * before sleeping, and retains the route pin through reply publication.
+ */
 static DEFINE_MUTEX(mk_cpu_transaction_mutex);
 static DEFINE_MUTEX(mk_cpu_ownership_mutex);
 
@@ -289,6 +294,26 @@ void mk_instance_mark_failed(struct mk_instance *instance)
 	mk_cpu_transaction_unlock();
 }
 
+static int mk_instance_finish_halt(struct mk_instance *instance,
+				   bool transaction_held)
+{
+	int ret;
+
+	if (!transaction_held)
+		mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	/* Every caller has confirmed that all spawn CPUs are parked. */
+	ret = mk_pci_quiesce_instance_irqs(instance, true);
+	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
+	mk_instance_set_state(instance, ret ? MK_STATE_FAILED : MK_STATE_LOADED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	if (!transaction_held)
+		mk_cpu_transaction_unlock();
+	return ret;
+}
+
 struct mk_instance *mk_instance_find_by_name(const char *name)
 {
 	struct mk_instance *instance;
@@ -424,8 +449,8 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 			failed++;
 		}
 	}
-	mk_cpu_set_free(snapshot);
 
+	mk_cpu_set_free(snapshot);
 	return failed ? -EBUSY : 0;
 }
 
@@ -454,9 +479,11 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		pr_err("Invalid CPU sets for transfer\n");
 		return -EINVAL;
 	}
+
 	snapshot = mk_cpu_set_alloc();
 	if (!snapshot)
 		return -ENOMEM;
+
 	mk_cpu_transaction_lock();
 	down_write(&instance->control_route_sem);
 	mk_cpu_ownership_lock();
@@ -515,7 +542,6 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	ret = 0;
 unlock:
 	mk_cpu_ownership_unlock();
 	up_write(&instance->control_route_sem);
@@ -548,9 +574,11 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		pr_err("Invalid CPU sets for return\n");
 		return -EINVAL;
 	}
+
 	snapshot = mk_cpu_set_alloc();
 	if (!snapshot)
 		return -ENOMEM;
+
 	mk_cpu_transaction_lock();
 	down_write(&instance->control_route_sem);
 	mk_cpu_ownership_lock();
@@ -592,6 +620,7 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	if (ret)
 		goto unlock_route;
 	mk_cpu_ownership_lock();
+
 	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_cpu_set_add(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
@@ -600,7 +629,6 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	ret = 0;
 unlock:
 	mk_cpu_ownership_unlock();
 unlock_route:
@@ -1584,27 +1612,37 @@ static void mk_shutdown_work_fn(struct work_struct *work)
 }
 
 /*
- * Mark a halted instance re-spawnable. No wakeups are published here:
- * the instance's CPUs may still be on their way to the park loop, and
- * poking its context while its (old or next) kernel also publishes on
- * it corrupts the single-producer mailbox. The kexec path confirms the
- * CPUs are parked before it rewrites the image.
+ * Mark a halted instance re-spawnable only after every CPU is parked. This
+ * proof permits recovery of a mailbox consumer interrupted by shutdown and
+ * prevents the next image from racing the old kernel in shared memory.
  */
-static void mk_instance_settle_halted(struct mk_instance *instance,
-				      bool transaction_held)
+static int mk_instance_settle_halted(struct mk_instance *instance,
+				     bool transaction_held,
+				     bool parked_confirmed)
 {
+	int ret;
+
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
 	if (!transaction_held)
 		mk_cpu_transaction_lock();
-	down_write(&instance->control_route_sem);
-	mutex_lock(&instance->resource_mutex);
-	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
-	mk_instance_set_state(instance, MK_STATE_LOADED);
-	mutex_unlock(&instance->resource_mutex);
-	up_write(&instance->control_route_sem);
+	if (!parked_confirmed) {
+		ret = mk_instance_confirm_parked(instance);
+		if (ret) {
+			down_write(&instance->control_route_sem);
+			mutex_lock(&instance->resource_mutex);
+			mk_instance_set_state(instance, MK_STATE_FAILED);
+			mutex_unlock(&instance->resource_mutex);
+			up_write(&instance->control_route_sem);
+			if (!transaction_held)
+				mk_cpu_transaction_unlock();
+			return ret;
+		}
+	}
+	ret = mk_instance_finish_halt(instance, true);
 	if (!transaction_held)
 		mk_cpu_transaction_unlock();
+	return ret;
 }
 
 struct mk_halted_work {
@@ -1620,7 +1658,9 @@ static void mk_halted_work_fn(struct work_struct *work)
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance, false);
+		if (mk_instance_settle_halted(instance, false, false))
+			pr_err("Instance %d halted but could not be made reusable\n",
+			       instance->id);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1745,83 +1785,13 @@ int multikernel_halt_by_id(int mk_id)
 
 	ret = mk_msg_pending_wait(pending, 30000);
 	if (ret == 0) {
-		if (mk_instance_confirm_parked(instance))
-			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
+		ret = mk_instance_settle_halted(instance, false, false);
+		if (!ret)
+			pr_info("Multikernel instance %d halted (graceful)\n",
 				mk_id);
-
-		mk_instance_settle_halted(instance, false);
-		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
 	mk_instance_put(instance);
-	return ret;
-}
-
-static int __mk_instance_force_halt(struct mk_instance *instance,
-				    bool allow_loaded)
-{
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
-	int cpu_count = 0;
-	int ret;
-
-	if (!instance)
-		return -EINVAL;
-
-	/*
-	 * LOADED is allowed for the retry case: a previous halt already
-	 * settled the state, but a CPU that missed its NMI is still
-	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good.
-	 */
-	if (instance->state != MK_STATE_ACTIVE &&
-	    (!allow_loaded ||
-	     (instance->state != MK_STATE_LOADED &&
-	      instance->state != MK_STATE_FAILED))) {
-		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
-			instance->id, instance->state);
-		return -EINVAL;
-	}
-
-	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", instance->id);
-		return -EINVAL;
-	}
-
-	pr_info("Force halting multikernel instance %d via NMI\n",
-		instance->id);
-
-	ret = mk_arm_force_halt(instance);
-	if (ret)
-		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
-
-	/* Send NMI to each CPU in the instance */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
-		mk_force_stop_cpu(phys_cpu);
-		cpu_count++;
-	}
-
-	pr_info("Sent NMI to %d CPUs in instance %d\n",
-		cpu_count, instance->id);
-
-	ret = mk_instance_confirm_parked(instance);
-	if (ret) {
-		pr_err("Instance %d CPUs did not park after force halt: %d\n",
-		       instance->id, ret);
-		return ret;
-	}
-
-	mk_instance_settle_halted(instance, false);
-	return 0;
-}
-
-int mk_instance_abort_spawn(struct mk_instance *instance)
-{
-	int ret;
-
-	ret = __mk_instance_force_halt(instance, true);
-	if (ret && instance)
-		mk_instance_mark_failed(instance);
 	return ret;
 }
 
@@ -1838,9 +1808,88 @@ int mk_instance_abort_spawn(struct mk_instance *instance)
  *
  * Returns: 0 on success, negative error code on failure
  */
+static int __mk_instance_force_halt(struct mk_instance *instance,
+				    bool allow_loaded)
+{
+	struct mk_cpu_set *snapshot;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+	int cpu_count = 0;
+	int ret;
+
+	if (!instance)
+		return -EINVAL;
+	if (instance->state != MK_STATE_ACTIVE &&
+	    (!allow_loaded ||
+	     (instance->state != MK_STATE_LOADED &&
+	      instance->state != MK_STATE_FAILED))) {
+		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
+			instance->id, instance->state);
+		return -EINVAL;
+	}
+
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	mk_cpu_transaction_lock();
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, instance->cpus);
+	mk_cpu_ownership_unlock();
+	if (ret) {
+		mk_cpu_transaction_unlock();
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	if (mk_cpu_set_empty(snapshot)) {
+		pr_err("Instance %d has no CPUs assigned\n", instance->id);
+		mk_cpu_transaction_unlock();
+		mk_cpu_set_free(snapshot);
+		return -EINVAL;
+	}
+
+	pr_info("Force halting multikernel instance %d via NMI\n", instance->id);
+	ret = mk_arm_force_halt(instance);
+	if (ret)
+		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n",
+		       ret);
+
+	/* Send NMI to each CPU in the instance */
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
+		mk_force_stop_cpu(phys_cpu);
+		cpu_count++;
+	}
+
+	pr_info("Sent NMI to %d CPUs in instance %d\n",
+		cpu_count, instance->id);
+	ret = mk_instance_confirm_parked(instance);
+	if (ret) {
+		pr_err("Instance %d CPUs did not park after force halt: %d\n",
+		       instance->id, ret);
+		mk_cpu_set_free(snapshot);
+		mk_cpu_transaction_unlock();
+		return ret;
+	}
+	mk_cpu_set_free(snapshot);
+	/* Quiesce host-owned resources before making the instance reusable. */
+	ret = mk_instance_settle_halted(instance, true, true);
+	mk_cpu_transaction_unlock();
+	return ret;
+}
+
 int mk_instance_force_halt(struct mk_instance *instance)
 {
 	return __mk_instance_force_halt(instance, false);
+}
+
+int mk_instance_abort_spawn(struct mk_instance *instance)
+{
+	int ret;
+
+	ret = __mk_instance_force_halt(instance, true);
+	if (ret && instance)
+		mk_instance_mark_failed(instance);
+	return ret;
 }
 
 int multikernel_force_halt_by_id(int mk_id)
@@ -1910,6 +1959,7 @@ static int __init multikernel_init(void)
 		mk_hotplug_cleanup();
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
 		return ret;
 	}
 

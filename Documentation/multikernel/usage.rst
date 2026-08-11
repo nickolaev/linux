@@ -93,6 +93,30 @@ Phase 1: Instance Creation (Automatic from DTB)
       cat /sys/fs/multikernel/instances/web-server/status
       # Output: ready
 
+      cat /sys/fs/multikernel/instances/web-server/stats
+
+   ``stats`` is a read-only, append-only key/value interface.  Version 1
+   starts with ``stats_version 1`` and reports the shared ordered-IPI, direct
+   reply, and pending-IRQ transport counters for the instance.  New keys may
+   be appended; readers must ignore keys they do not understand.
+
+   The output is an observational snapshot rather than an atomic transaction.
+   Shared transport counters are unsigned 32-bit values and may wrap.  They
+   are reinitialized for a new ``spawn_epoch``, are not writable or resettable
+   through this interface, and must only be compared as modulo-32-bit deltas
+   between samples carrying the same nonzero epoch.
+
+Shared Transport Compatibility
+==============================
+
+The private kernel-to-kernel shared transport requires an exact match between
+the host and spawn.  The loader compares the spawn image note before launch;
+the spawn manifest and transport initialization acknowledgment confirm the
+same layout before shared memory is used.  These checks establish transport
+compatibility and do not authenticate the kernel artifact.  A mismatched
+bzImage or vmlinux is rejected; there is no translation or backward-
+compatibility promise between transport versions.
+
       # View instance device tree
       cat /sys/fs/multikernel/instances/web-server/device_tree_source
       # Output: DTS format showing the instance configuration

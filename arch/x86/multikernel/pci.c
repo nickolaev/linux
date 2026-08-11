@@ -29,16 +29,22 @@ static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
 #define MK_PCI_RESET_TIMEOUT_MS	70000
 #ifdef CONFIG_PCI_MSI
-static struct mk_instance *mk_pci_host_instance;
-
-static bool mk_pci_message_from_host(mk_phys_cpu_t sender_cpu)
-{
-	return mk_pci_host_instance &&
-		mk_cpu_set_contains(mk_pci_host_instance->cpus, sender_cpu);
-}
+static void mk_pci_forward_irq_set_mask(struct irq_data *data, bool masked);
+static void mk_pci_irq_mailbox_requeue(struct mk_irq_mailbox *mailbox,
+				       unsigned int slot);
 
 static void mk_pci_forward_irq_noop(struct irq_data *data)
 {
+}
+
+static void mk_pci_forward_irq_mask(struct irq_data *data)
+{
+	mk_pci_forward_irq_set_mask(data, true);
+}
+
+static void mk_pci_forward_irq_unmask(struct irq_data *data)
+{
+	mk_pci_forward_irq_set_mask(data, false);
 }
 
 static void mk_pci_forward_irq_write_msg(struct irq_data *data,
@@ -50,8 +56,8 @@ static struct irq_chip mk_pci_forward_irq_chip = {
 	.name = "multikernel-pci-forward",
 	.irq_ack = mk_pci_forward_irq_noop,
 	/* Host process-context lifecycle owns physical mask state. */
-	.irq_mask = mk_pci_forward_irq_noop,
-	.irq_unmask = mk_pci_forward_irq_noop,
+	.irq_mask = mk_pci_forward_irq_mask,
+	.irq_unmask = mk_pci_forward_irq_unmask,
 	.irq_write_msi_msg = mk_pci_forward_irq_write_msg,
 };
 
@@ -64,10 +70,11 @@ static void mk_pci_bind_local_irqs(unsigned int irq, unsigned int count)
 					 handle_edge_irq);
 }
 
-static bool mk_pci_forward_irq_matches(const struct mk_io_irq_payload *irq,
+static bool mk_pci_forward_irq_matches(u32 irq_number, u32 vector,
+				       u32 device_id,
 				       struct irq_data **irq_data)
 {
-	struct irq_data *data = irq_get_irq_data(irq->irq_number);
+	struct irq_data *data = irq_get_irq_data(irq_number);
 	struct msi_desc *desc;
 	struct pci_dev *dev;
 	unsigned int offset;
@@ -75,58 +82,251 @@ static bool mk_pci_forward_irq_matches(const struct mk_io_irq_payload *irq,
 	if (!data)
 		return false;
 	desc = irq_data_get_msi_desc(data);
-	if (!desc || irq->vector < desc->msi_index)
+	if (!desc || vector < desc->msi_index)
 		return false;
 
 	dev = msi_desc_to_pci_dev(desc);
-	offset = irq->vector - desc->msi_index;
-	if (offset >= desc->nvec_used || desc->irq + offset != irq->irq_number ||
-	    pci_domain_nr(dev->bus) != MK_PCI_IRQ_ID_DOMAIN(irq->device_id) ||
-	    dev->bus->number != MK_PCI_IRQ_ID_BUS(irq->device_id) ||
-	    dev->devfn != MK_PCI_IRQ_ID_DEVFN(irq->device_id))
+	offset = vector - desc->msi_index;
+	if (offset >= desc->nvec_used || desc->irq + offset != irq_number ||
+	    pci_domain_nr(dev->bus) != MK_PCI_IRQ_ID_DOMAIN(device_id) ||
+	    dev->bus->number != MK_PCI_IRQ_ID_BUS(device_id) ||
+	    dev->devfn != MK_PCI_IRQ_ID_DEVFN(device_id))
 		return false;
 
 	*irq_data = data;
 	return true;
 }
 
-static void mk_pci_irq_forward_handler(u32 msg_type, u32 subtype,
-				       void *payload, u32 payload_len,
-				       mk_phys_cpu_t sender_cpu, void *ctx)
+static void mk_pci_forward_irq_set_mask(struct irq_data *data, bool masked)
 {
-	struct mk_io_irq_payload *irq = payload;
+	struct msi_desc *desc = irq_data_get_msi_desc(data);
+	struct mk_irq_mailbox *mailbox;
+	struct pci_dev *dev;
+	u32 device_id;
+	u32 generation;
+	u32 vector;
+	unsigned int slot;
+	u64 epoch;
+
+	if (!desc || !root_instance || !root_instance->ipi_data)
+		return;
+	dev = msi_desc_to_pci_dev(desc);
+	generation = READ_ONCE(dev->multikernel_msi_generation);
+	epoch = READ_ONCE(root_instance->ipi_data->spawn_epoch);
+	device_id = MK_PCI_IRQ_ID(pci_domain_nr(dev->bus), dev->bus->number,
+				  dev->devfn);
+	vector = desc->msi_index + data->irq - desc->irq;
+	mailbox = &root_instance->ipi_data->irq_mailbox;
+	for (slot = 0; slot < MK_IRQ_MAILBOX_SLOTS; slot++) {
+		struct mk_irq_mailbox_entry *entry = &mailbox->entries[slot];
+		u64 old, new;
+		u32 slot_generation;
+
+		old = atomic64_read_acquire(&entry->pending_generation);
+		if (!mk_irq_mailbox_generation(old) ||
+		    READ_ONCE(entry->lifecycle_epoch) != epoch ||
+		    READ_ONCE(entry->lifecycle_generation) != generation ||
+		    READ_ONCE(entry->device_id) != device_id ||
+		    READ_ONCE(entry->local_irq) != data->irq ||
+		    READ_ONCE(entry->vector) != vector)
+			continue;
+		slot_generation = mk_irq_mailbox_generation(old);
+		for (;;) {
+			new = masked ? old | MK_IRQ_MAILBOX_MASKED :
+				old & ~MK_IRQ_MAILBOX_MASKED;
+			if (new == old ||
+			    atomic64_cmpxchg(&entry->pending_generation,
+					     old, new) == old)
+				break;
+			old = atomic64_read_acquire(&entry->pending_generation);
+			if (mk_irq_mailbox_generation(old) != slot_generation)
+				return;
+		}
+		if (!masked && mk_irq_mailbox_pending(new)) {
+			mk_phys_cpu_t target;
+
+			mk_pci_irq_mailbox_requeue(mailbox, slot);
+			target = arch_cpu_physical_id(smp_processor_id());
+			if (target != MK_PHYS_CPU_INVALID)
+				mk_arch_send_ipi(target);
+		}
+		return;
+	}
+}
+
+static void mk_pci_irq_mailbox_requeue(struct mk_irq_mailbox *mailbox,
+				       unsigned int slot)
+{
+	atomic64_or(BIT_ULL(slot & 63),
+		    &mailbox->pending_bitmap[slot / 64]);
+}
+
+static void mk_pci_irq_mailbox_drain_slot(struct mk_shared_data *shared,
+					  unsigned int slot)
+{
+	struct mk_irq_mailbox *mailbox = &shared->irq_mailbox;
+	struct mk_irq_mailbox_entry *entry = &mailbox->entries[slot];
 	struct irq_data *irq_data;
 	struct pci_dev *dev;
+	u64 lifecycle_epoch;
+	u64 token, base, claim;
+	u32 lifecycle_generation;
+	u32 pending;
+	u32 device_id;
+	u32 local_irq;
+	u16 vector;
 
-	if (msg_type != MK_MSG_IO || subtype != MK_IO_IRQ_FORWARD ||
-	    payload_len != sizeof(*irq) ||
-	    !mk_pci_message_from_host(sender_cpu))
+	token = atomic64_read_acquire(&entry->pending_generation);
+	pending = mk_irq_mailbox_pending(token);
+	if (!mk_irq_mailbox_generation(token) || !pending)
 		return;
-	if (!mk_pci_forward_irq_matches(irq, &irq_data)) {
-		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u with unmatched identity %#x vector %u\n",
-				    irq->irq_number, irq->device_id,
-				    irq->vector);
+	if (mk_irq_mailbox_consuming(token)) {
+		mk_pci_irq_mailbox_requeue(mailbox, slot);
 		return;
 	}
+	lifecycle_epoch = READ_ONCE(entry->lifecycle_epoch);
+	lifecycle_generation = READ_ONCE(entry->lifecycle_generation);
+	device_id = READ_ONCE(entry->device_id);
+	local_irq = READ_ONCE(entry->local_irq);
+	vector = READ_ONCE(entry->vector);
+	base = token & ~MK_IRQ_MAILBOX_PENDING_MASK;
+
+	if (!local_irq || !root_instance || !root_instance->ipi_data ||
+	    lifecycle_epoch != READ_ONCE(shared->spawn_epoch))
+		goto stale;
+	if (mk_irq_mailbox_masked(token)) {
+		atomic_inc(&mailbox->masked_deferred);
+		mk_pci_irq_mailbox_requeue(mailbox, slot);
+		return;
+	}
+	claim = base | MK_IRQ_MAILBOX_CONSUMING;
+	if (atomic64_cmpxchg_acquire(&entry->pending_generation,
+				     token, claim) != token) {
+		mk_pci_irq_mailbox_requeue(mailbox, slot);
+		return;
+	}
+	token = atomic64_read_acquire(&entry->pending_generation);
+	if (mk_irq_mailbox_generation(token) !=
+	    mk_irq_mailbox_generation(claim))
+		goto claimed_stale;
+	if (mk_irq_mailbox_masked(token)) {
+		atomic_inc(&mailbox->masked_deferred);
+		goto claimed_defer;
+	}
+	if (!mk_pci_forward_irq_matches(local_irq, vector, device_id,
+					&irq_data))
+		goto claimed_stale;
 	dev = msi_desc_to_pci_dev(irq_data_get_msi_desc(irq_data));
-	if (READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_ACTIVE ||
-	    irq->lifecycle_generation !=
+	if (lifecycle_epoch != READ_ONCE(entry->lifecycle_epoch) ||
+	    lifecycle_generation !=
+		READ_ONCE(entry->lifecycle_generation) ||
+	    device_id != READ_ONCE(entry->device_id) ||
+	    local_irq != READ_ONCE(entry->local_irq) ||
+	    vector != READ_ONCE(entry->vector) ||
+	    READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_ACTIVE ||
+	    lifecycle_generation !=
 		READ_ONCE(dev->multikernel_msi_generation) ||
-	    !root_instance->ipi_data ||
-	    irq->lifecycle_epoch !=
-		READ_ONCE(root_instance->ipi_data->spawn_epoch))
-		return;
+	    irq_data_get_irq_chip(irq_data) != &mk_pci_forward_irq_chip)
+		goto claimed_stale;
+	if (pending > 1)
+		atomic_add(pending - 1, &mailbox->coalesced);
+	if (generic_handle_irq_safe(local_irq))
+		atomic_inc(&mailbox->dispatch_failed);
 
-	if (irq_data_get_irq_chip(irq_data) != &mk_pci_forward_irq_chip) {
-		pr_warn_ratelimited("Rejected host-forwarded PCI IRQ %u for %s vector %u before local binding\n",
-				    irq->irq_number, pci_name(dev),
-				    irq->vector);
+	for (;;) {
+		u64 new;
+
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    mk_irq_mailbox_generation(claim) ||
+		    !mk_irq_mailbox_consuming(token))
+			return;
+		new = token & ~MK_IRQ_MAILBOX_CONSUMING;
+		if (atomic64_cmpxchg_release(&entry->pending_generation,
+					     token, new) != token)
+			continue;
+		if (mk_irq_mailbox_pending(new))
+			mk_pci_irq_mailbox_requeue(mailbox, slot);
 		return;
 	}
 
-	if (generic_handle_irq_safe(irq->irq_number))
-		pr_warn_ratelimited("Failed to dispatch host-forwarded PCI IRQ %u\n",
-				    irq->irq_number);
+claimed_defer:
+	for (;;) {
+		u32 new_pending;
+		u64 new;
+
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    mk_irq_mailbox_generation(claim) ||
+		    !mk_irq_mailbox_consuming(token))
+			return;
+		new_pending = mk_irq_mailbox_pending(token);
+		if (new_pending < MK_IRQ_MAILBOX_PENDING_MASK)
+			new_pending++;
+		new = mk_irq_mailbox_token(mk_irq_mailbox_generation(token),
+					   new_pending) |
+			(token & MK_IRQ_MAILBOX_MASKED);
+		if (atomic64_cmpxchg_release(&entry->pending_generation,
+					     token, new) != token)
+			continue;
+		mk_pci_irq_mailbox_requeue(mailbox, slot);
+		if (!mk_irq_mailbox_masked(new)) {
+			mk_phys_cpu_t target =
+				arch_cpu_physical_id(smp_processor_id());
+
+			if (target != MK_PHYS_CPU_INVALID)
+				mk_arch_send_ipi(target);
+		}
+		return;
+	}
+
+claimed_stale:
+	atomic_inc(&mailbox->stale);
+	for (;;) {
+		u64 new;
+
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    mk_irq_mailbox_generation(claim) ||
+		    !mk_irq_mailbox_consuming(token))
+			return;
+		new = token & ~MK_IRQ_MAILBOX_CONSUMING;
+		if (atomic64_cmpxchg_release(&entry->pending_generation,
+					     token, new) != token)
+			continue;
+		if (mk_irq_mailbox_pending(new))
+			mk_pci_irq_mailbox_requeue(mailbox, slot);
+		return;
+	}
+	return;
+
+stale:
+	if (atomic64_cmpxchg_acquire(&entry->pending_generation,
+				     token, base) != token)
+		mk_pci_irq_mailbox_requeue(mailbox, slot);
+	atomic_inc(&mailbox->stale);
+}
+
+void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared)
+{
+	unsigned int word;
+
+	if (!shared)
+		return;
+	for (word = 0; word < MK_IRQ_MAILBOX_WORDS; word++) {
+		atomic64_t *pending_bitmap;
+		unsigned long bits;
+
+		pending_bitmap = &shared->irq_mailbox.pending_bitmap[word];
+		bits = atomic64_xchg_acquire(pending_bitmap, 0);
+
+		while (bits) {
+			unsigned int bit = __ffs(bits);
+
+			bits &= bits - 1;
+			mk_pci_irq_mailbox_drain_slot(shared, word * 64 + bit);
+		}
+	}
 }
 
 static int mk_pci_send_irq_request(struct mk_pci_irq_request *request)
@@ -241,10 +441,26 @@ static int mk_pci_msi_bind(struct pci_dev *dev, unsigned int index,
 		.local_irq = irq,
 		.lifecycle_generation = generation,
 	};
+	unsigned int count = msix ? 1 : nvec;
+	unsigned int i;
+	int ret;
 
 	/* The local descriptor must be dispatchable before the host unmasks. */
-	mk_pci_bind_local_irqs(irq, msix ? 1 : nvec);
-	return mk_pci_send_irq_request(&request);
+	mk_pci_bind_local_irqs(irq, count);
+	ret = mk_pci_send_irq_request(&request);
+	if (ret)
+		return ret;
+	/* Publish the irqdesc's initial logical mask state into the token. */
+	for (i = 0; i < count; i++) {
+		struct irq_data *data = irq_get_irq_data(irq + i);
+
+		if (!data)
+			return -EINVAL;
+		mk_pci_forward_irq_set_mask(data,
+					    irqd_irq_disabled(data) ||
+					    irqd_irq_masked(data));
+	}
+	return 0;
 }
 
 static int mk_pci_msi_teardown_generation(struct pci_dev *dev, u32 generation)
@@ -324,6 +540,69 @@ static int mk_pci_msi_bind_all(struct pci_dev *dev, u32 generation)
 	return mk_pci_msi_commit(dev, generation);
 }
 
+static int mk_pci_msi_mask_mailbox(struct pci_dev *dev)
+{
+	struct msi_desc *desc;
+	unsigned long deadline;
+	u64 epoch;
+	u32 device_id;
+	u32 generation;
+	unsigned int slot;
+
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
+		unsigned int count = desc->pci.msi_attrib.is_msix ?
+			1 : desc->nvec_used;
+		unsigned int i;
+
+		for (i = 0; i < count; i++) {
+			struct irq_data *data = irq_get_irq_data(desc->irq + i);
+
+			if (data)
+				mk_pci_forward_irq_set_mask(data, true);
+		}
+	}
+
+	epoch = READ_ONCE(root_instance->ipi_data->spawn_epoch);
+	generation = READ_ONCE(dev->multikernel_msi_generation);
+	device_id = MK_PCI_IRQ_ID(pci_domain_nr(dev->bus), dev->bus->number,
+				  dev->devfn);
+	deadline = jiffies + msecs_to_jiffies(1000);
+	for (;;) {
+		bool consuming = false;
+
+		for (slot = 0; slot < MK_IRQ_MAILBOX_SLOTS; slot++) {
+			struct mk_irq_mailbox_entry *entry =
+				&root_instance->ipi_data->irq_mailbox.entries[slot];
+			u64 token;
+
+			token = atomic64_read_acquire(&entry->pending_generation);
+
+			if (mk_irq_mailbox_generation(token) &&
+			    mk_irq_mailbox_consuming(token) &&
+			    READ_ONCE(entry->lifecycle_epoch) == epoch &&
+			    READ_ONCE(entry->lifecycle_generation) == generation &&
+			    READ_ONCE(entry->device_id) == device_id) {
+				consuming = true;
+				break;
+			}
+		}
+		if (!consuming)
+			break;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		usleep_range(50, 100);
+	}
+	msi_for_each_desc(desc, &dev->dev, MSI_DESC_ALL) {
+		unsigned int count = desc->pci.msi_attrib.is_msix ?
+			1 : desc->nvec_used;
+		unsigned int i;
+
+		for (i = 0; i < count; i++)
+			synchronize_irq(desc->irq + i);
+	}
+	return 0;
+}
+
 int mk_pci_msi_activate(struct pci_dev *dev)
 {
 	u32 generation;
@@ -349,7 +628,9 @@ int mk_pci_msi_activate(struct pci_dev *dev)
 	WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_ACTIVE);
 	ret = mk_pci_msi_host_activate(dev, generation);
 	if (ret) {
-		cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
+		cleanup_ret = mk_pci_msi_mask_mailbox(dev);
+		if (!cleanup_ret)
+			cleanup_ret = mk_pci_msi_teardown_generation(dev, generation);
 		WRITE_ONCE(dev->multikernel_msi_state,
 			   cleanup_ret ? MK_PCI_MSI_FAILED : MK_PCI_MSI_IDLE);
 		return ret;
@@ -368,6 +649,11 @@ int mk_pci_msi_restore(struct pci_dev *dev)
 	if (READ_ONCE(dev->multikernel_msi_state) != MK_PCI_MSI_ACTIVE)
 		return -EIO;
 	generation = READ_ONCE(dev->multikernel_msi_generation);
+	ret = mk_pci_msi_mask_mailbox(dev);
+	if (ret) {
+		WRITE_ONCE(dev->multikernel_msi_state, MK_PCI_MSI_FAILED);
+		return ret;
+	}
 	ret = mk_pci_msi_restore_begin(dev, generation);
 	if (!ret)
 		ret = mk_pci_msi_bind_all(dev, generation);
@@ -394,7 +680,9 @@ int mk_pci_msi_teardown(struct pci_dev *dev)
 	if (READ_ONCE(dev->multikernel_msi_state) == MK_PCI_MSI_IDLE)
 		return 0;
 	generation = READ_ONCE(dev->multikernel_msi_generation);
-	ret = mk_pci_msi_teardown_generation(dev, generation);
+	ret = mk_pci_msi_mask_mailbox(dev);
+	if (!ret)
+		ret = mk_pci_msi_teardown_generation(dev, generation);
 	WRITE_ONCE(dev->multikernel_msi_state,
 		   ret ? MK_PCI_MSI_FAILED : MK_PCI_MSI_IDLE);
 	return ret;
@@ -583,20 +871,6 @@ static int __init x86_multikernel_pci_arch_init(void)
 {
 	if (!root_instance || !root_instance->pci_devices_valid)
 		return 0;
-#ifdef CONFIG_PCI_MSI
-	mk_pci_host_instance = mk_instance_find(0);
-	if (!mk_pci_host_instance) {
-		pr_err("Multikernel has no restored host instance for PCI control\n");
-		return 0;
-	}
-#endif
-#ifdef CONFIG_PCI_MSI
-	if (mk_register_msg_handler(MK_MSG_IO, mk_pci_irq_forward_handler,
-				    NULL)) {
-		pr_err("Multikernel failed to register PCI IRQ forwarding handler\n");
-		return 0;
-	}
-#endif
 
 	raw_pci_ops = &mk_pci_filtered_raw_ops;
 	raw_pci_ext_ops = &mk_pci_filtered_raw_ops;
