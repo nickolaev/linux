@@ -89,6 +89,31 @@ Instance States
 - **active**: the kernel is running
 - **failed**: an error occurred; check ``dmesg``
 
+Transport Reliability Statistics
+================================
+
+Each instance exposes a read-only ``stats`` file. Version 1 is an
+append-only key/value interface covering the duplex IPI transport, direct
+reply slots, and pending IRQ mailbox. Readers must ignore unknown keys.
+
+The snapshot is observational rather than atomic. ``transport_available``
+reports whether the instance currently has shared transport state, and
+``spawn_epoch`` identifies the launch whose counters are shown. Transport
+counters are unsigned 32-bit values which may wrap and are reset when a new
+epoch is initialized; compare them as modulo-32-bit deltas only between
+samples with the same nonzero epoch.
+
+``ipi.*`` reports producer failures and current per-direction slot occupancy,
+``reply.*`` reports timeout/recovery counters and reply-slot states, and
+``irq.*`` reports recorded, coalesced, deferred, stale, failed, saturated,
+active, pending, masked, and consuming mailbox state. Gauge values describe
+only the instant at which each field was sampled.
+
+The duplex ready-bit protocol has no shared producer gate or intermediate
+WRITING, CONSUMING, CANCELLED, or invalid states. The corresponding legacy
+version-1 keys remain present and report zero; ``ipi.slot_ready`` and
+``ipi.full_failures`` are summed across both link directions.
+
 Restrictions
 ============
 
