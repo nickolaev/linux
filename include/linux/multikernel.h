@@ -101,6 +101,7 @@ enum mk_reply_state {
 enum mk_reply_kind {
 	MK_REPLY_PCI_CFG = 1,
 	MK_REPLY_PCI_IRQ,
+	MK_REPLY_PCI_RESET,
 };
 
 struct mk_reply_slot {
@@ -352,6 +353,10 @@ void mk_reply_scan(struct mk_shared_data *shared);
 /* Host-mediated PCI control-plane subtypes */
 #define MK_PCI_CFG_REQUEST  (MK_MSG_PCI + 1)
 #define MK_PCI_CFG_RESPONSE (MK_MSG_PCI + 2)
+#define MK_PCI_IRQ_REQUEST  (MK_MSG_PCI + 3)
+#define MK_PCI_IRQ_RESPONSE (MK_MSG_PCI + 4)
+#define MK_PCI_RESET_REQUEST  (MK_MSG_PCI + 5)
+#define MK_PCI_RESET_RESPONSE (MK_MSG_PCI + 6)
 
 /**
  * Core message structure
@@ -374,7 +379,16 @@ struct mk_io_irq_payload {
 	u32 vector;             /* Interrupt vector */
 	u32 device_id;          /* Device identifier (optional) */
 	u32 flags;              /* Control flags (priority, etc.) */
+	u32 lifecycle_generation;
+	u32 reserved;
+	u64 lifecycle_epoch;
 };
+
+#define MK_PCI_IRQ_ID(domain, bus, devfn) \
+	(((u32)(domain) << 16) | ((u32)(bus) << 8) | (u32)(devfn))
+#define MK_PCI_IRQ_ID_DOMAIN(id)	((u16)((id) >> 16))
+#define MK_PCI_IRQ_ID_BUS(id)		((u8)((id) >> 8))
+#define MK_PCI_IRQ_ID_DEVFN(id)		((u8)(id))
 
 struct mk_pci_cfg_request {
 	u64 request_id;
@@ -396,6 +410,54 @@ struct mk_pci_cfg_response {
 	u64 request_id;
 	s32 status;
 	u32 value;
+};
+
+enum mk_pci_irq_operation {
+	MK_PCI_IRQ_SETUP = 1,
+	MK_PCI_IRQ_RESTORE_BEGIN,
+	MK_PCI_IRQ_BIND,
+	MK_PCI_IRQ_COMMIT,
+	MK_PCI_IRQ_ACTIVATE,
+	MK_PCI_IRQ_TEARDOWN,
+};
+
+enum mk_pci_msi_lifecycle {
+	MK_PCI_MSI_IDLE = 0,
+	MK_PCI_MSI_PREPARED,
+	MK_PCI_MSI_COMMITTED,
+	MK_PCI_MSI_ACTIVE,
+	MK_PCI_MSI_FAILED,
+};
+
+struct mk_pci_irq_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 operation;
+	u16 vector;
+	u16 nr_vectors;
+	u8 msix;
+	u8 reserved;
+	u32 local_irq;
+	u32 reply_slot;
+	u32 lifecycle_generation;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
+};
+
+struct mk_pci_reset_request {
+	u64 request_id;
+	s32 sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u32 reset_generation;
+	u32 reply_slot;
+	u32 reserved;
+	u64 reply_generation;
+	u64 lifecycle_epoch;
 };
 
 /* IRQ control flags */
@@ -1127,6 +1189,26 @@ bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
 				      unsigned int devfn, u16 *vendor,
 				      u16 *device);
+#if defined(CONFIG_X86) && defined(CONFIG_PCI)
+bool mk_pci_controlled(struct pci_dev *dev);
+int mk_pci_reset_flr(struct pci_dev *dev);
+#else
+static inline bool mk_pci_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_reset_flr(struct pci_dev *dev) { return -EOPNOTSUPP; }
+#endif
+#if defined(CONFIG_X86) && defined(CONFIG_PCI) && defined(CONFIG_PCI_MSI)
+bool mk_pci_msi_controlled(struct pci_dev *dev);
+int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
+int mk_pci_msi_activate(struct pci_dev *dev);
+int mk_pci_msi_restore(struct pci_dev *dev);
+int mk_pci_msi_teardown(struct pci_dev *dev);
+#else
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type) { return 0; }
+static inline int mk_pci_msi_activate(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_restore(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_teardown(struct pci_dev *dev) { return 0; }
+#endif
 bool mk_platform_device_allowed(const char *name, const char *hid);
 
 /* Early CPU registration from the manifest (spawn kernels) */
@@ -1152,6 +1234,14 @@ static inline bool mk_crash_notes_wanted(void)
 {
 	return false;
 }
+
+static inline bool mk_pci_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_reset_flr(struct pci_dev *dev) { return -EOPNOTSUPP; }
+static inline bool mk_pci_msi_controlled(struct pci_dev *dev) { return false; }
+static inline int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type) { return 0; }
+static inline int mk_pci_msi_activate(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_restore(struct pci_dev *dev) { return 0; }
+static inline int mk_pci_msi_teardown(struct pci_dev *dev) { return 0; }
 
 static inline int multikernel_force_halt_by_id(int mk_id)
 {

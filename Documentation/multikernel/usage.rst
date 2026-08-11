@@ -97,3 +97,5 @@ Restrictions
 - Instance files are read-only; an instance's resources change through
   overlays targeting ``/instances/<name>``.
 - Rollback (``rmdir`` on a transaction) cannot destroy a running instance.
+- Logical CPU 0 handles assigned-device MSI forwarding and must remain online
+  while those devices are active.
