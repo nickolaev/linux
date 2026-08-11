@@ -99,3 +99,6 @@ Restrictions
 - Rollback (``rmdir`` on a transaction) cannot destroy a running instance.
 - Logical CPU 0 handles assigned-device MSI forwarding and must remain online
   while those devices are active.
+- Assigned MSI events are recorded in per-instance shared mailboxes before a
+  doorbell is sent. Masked events remain pending and lost doorbells are retried;
+  each spawn drains only its own parent-link mailbox.
