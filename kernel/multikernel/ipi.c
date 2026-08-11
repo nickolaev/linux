@@ -624,6 +624,7 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared)
 	mk_ipi_ring_reset_contents(ring);
 	WRITE_ONCE(shared->force_halt, 0);
 	mk_reply_table_reset(&shared->replies);
+	mk_irq_mailbox_reset(&shared->irq_mailbox);
 	epoch = READ_ONCE(shared->spawn_epoch) + 1;
 	if (!epoch)
 		epoch = 1;
@@ -1038,6 +1039,7 @@ static void multikernel_interrupt_handler(void)
 	if (!root_instance || !root_instance->ipi_data)
 		return;
 	mk_reply_scan(root_instance->ipi_data);
+	mk_pci_irq_mailbox_drain(root_instance->ipi_data);
 
 	/*
 	 * Drain here rather than from irq_work. We are already in interrupt

@@ -77,11 +77,18 @@ bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 #define MK_IPI_SLOT_READY	2
 #define MK_IPI_SLOT_CONSUMING	3
 #define MK_IPI_SLOT_CANCELLED	4
-#define MK_IPI_ABI_MAGIC		0x4d4b495049303036ULL /* "MKIPI006" */
+#define MK_IPI_ABI_MAGIC		0x4d4b495049303037ULL /* "MKIPI007" */
 #define MK_IPI_READY_TIMEOUT_MS	120000
 
 #define MK_REPLY_SLOTS		16
 #define MK_REPLY_STATE_BITS	3
+#define MK_IRQ_MAILBOX_SLOTS	256
+#define MK_IRQ_MAILBOX_WORDS	(MK_IRQ_MAILBOX_SLOTS / 64)
+#define MK_IRQ_MAILBOX_SLOT_INVALID	((u32)~0U)
+#define MK_IRQ_MAILBOX_PENDING_MASK	0x3fffffffULL
+#define MK_IRQ_MAILBOX_CONSUMING		0x40000000ULL
+#define MK_IRQ_MAILBOX_MASKED		0x80000000ULL
+#define MK_IRQ_MAILBOX_GENERATION_SHIFT	32
 
 enum mk_reply_state {
 	MK_REPLY_FREE = 0,
@@ -146,6 +153,54 @@ struct mk_ipi_ring {
 	atomic_t cancelled_writes;              /* Halted producer writes recovered */
 };
 
+struct mk_irq_mailbox_entry {
+	/* Upper 32 bits are slot generation; lower 32 bits are pending count. */
+	atomic64_t pending_generation;
+	u64 lifecycle_epoch;
+	u32 lifecycle_generation;
+	u32 device_id;
+	u32 local_irq;
+	u16 vector;
+	u16 reserved;
+};
+
+struct mk_irq_mailbox {
+	atomic64_t pending_bitmap[MK_IRQ_MAILBOX_WORDS];
+	struct mk_irq_mailbox_entry entries[MK_IRQ_MAILBOX_SLOTS];
+	atomic_t next_generation;
+	atomic_t recorded;
+	atomic_t coalesced;
+	atomic_t masked_deferred;
+	atomic_t stale;
+	atomic_t dispatch_failed;
+	atomic_t saturated;
+};
+
+static inline u64 mk_irq_mailbox_token(u32 generation, u32 pending)
+{
+	return (u64)generation << MK_IRQ_MAILBOX_GENERATION_SHIFT | pending;
+}
+
+static inline u32 mk_irq_mailbox_generation(u64 token)
+{
+	return token >> MK_IRQ_MAILBOX_GENERATION_SHIFT;
+}
+
+static inline u32 mk_irq_mailbox_pending(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_PENDING_MASK;
+}
+
+static inline bool mk_irq_mailbox_masked(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_MASKED;
+}
+
+static inline bool mk_irq_mailbox_consuming(u64 token)
+{
+	return token & MK_IRQ_MAILBOX_CONSUMING;
+}
+
 /* Shared memory structures - per-instance design */
 struct mk_shared_data {
 	struct mk_ipi_ring ring;  /* IPI message ring buffer */
@@ -167,6 +222,8 @@ struct mk_shared_data {
 	struct mk_reply_table replies;
 	/* Changes on every host launch; tags process-context device lifecycles. */
 	u64 spawn_epoch;
+	/* Preallocated hardirq-safe PCI interrupt forwarding transport. */
+	struct mk_irq_mailbox irq_mailbox;
 };
 
 static inline void mk_reply_table_reset(struct mk_reply_table *table)
@@ -185,6 +242,32 @@ static inline void mk_reply_table_reset(struct mk_reply_table *table)
 	atomic_set(&table->atomic_timeouts, 0);
 	atomic_set(&table->indeterminate_timeouts, 0);
 	atomic_set(&table->occupied_failures, 0);
+}
+
+static inline void mk_irq_mailbox_reset(struct mk_irq_mailbox *mailbox)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_IRQ_MAILBOX_WORDS; i++)
+		atomic64_set(&mailbox->pending_bitmap[i], 0);
+	for (i = 0; i < MK_IRQ_MAILBOX_SLOTS; i++) {
+		struct mk_irq_mailbox_entry *entry = &mailbox->entries[i];
+
+		atomic64_set(&entry->pending_generation, 0);
+		WRITE_ONCE(entry->lifecycle_epoch, 0);
+		WRITE_ONCE(entry->lifecycle_generation, 0);
+		WRITE_ONCE(entry->device_id, 0);
+		WRITE_ONCE(entry->local_irq, 0);
+		WRITE_ONCE(entry->vector, 0);
+		WRITE_ONCE(entry->reserved, 0);
+	}
+	atomic_set(&mailbox->next_generation, 0);
+	atomic_set(&mailbox->recorded, 0);
+	atomic_set(&mailbox->coalesced, 0);
+	atomic_set(&mailbox->masked_deferred, 0);
+	atomic_set(&mailbox->stale, 0);
+	atomic_set(&mailbox->dispatch_failed, 0);
+	atomic_set(&mailbox->saturated, 0);
 }
 
 static inline void mk_ipi_ring_reset_contents(struct mk_ipi_ring *ring)
@@ -220,6 +303,7 @@ static inline void mk_shared_data_reset(struct mk_shared_data *shared)
 	atomic_set(&shared->ready, 0);
 	mk_reply_table_reset(&shared->replies);
 	WRITE_ONCE(shared->spawn_epoch, 0);
+	mk_irq_mailbox_reset(&shared->irq_mailbox);
 }
 
 /* Function pointer type for IPI callbacks */
@@ -747,6 +831,7 @@ struct mk_instance {
 	/* Pins the CPU selected for control messages and forwarded IRQs. */
 	struct rw_semaphore control_route_sem;
 	mk_phys_cpu_t irq_route_cpu;      /* IRQ-safe cached forwarding target */
+	struct delayed_work irq_retry_work; /* Re-rings pending IRQ mailboxes. */
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -1088,6 +1173,7 @@ int mk_pci_msi_prepare(struct pci_dev *dev, int nvec, int type);
 int mk_pci_msi_activate(struct pci_dev *dev);
 int mk_pci_msi_restore(struct pci_dev *dev);
 int mk_pci_msi_teardown(struct pci_dev *dev);
+void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared);
 #else
 static inline bool mk_pci_msi_controlled(struct pci_dev *dev)
 {
@@ -1112,6 +1198,10 @@ static inline int mk_pci_msi_restore(struct pci_dev *dev)
 static inline int mk_pci_msi_teardown(struct pci_dev *dev)
 {
 	return 0;
+}
+
+static inline void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared)
+{
 }
 #endif
 
@@ -1215,6 +1305,10 @@ static inline int mk_pci_msi_teardown(struct pci_dev *dev)
 	return 0;
 }
 
+static inline void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared)
+{
+}
+
 static inline void mk_register_cpus_from_manifest(void)
 {
 }
@@ -1234,7 +1328,7 @@ static inline bool mk_manifest_rejected(void)
 #define MK_DT_CONFIG_VERSION_1  1
 #define MK_DT_CONFIG_CURRENT    MK_DT_CONFIG_VERSION_1
 /* Bumped whenever the shared-memory layout or message semantics change. */
-#define MK_FDT_COMPATIBLE "multikernel-v6"
+#define MK_FDT_COMPATIBLE "multikernel-v7"
 
 /**
  * Property Names

@@ -14,8 +14,6 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
 			    mk_phys_cpu_t target, void *data,
 			    size_t data_size, unsigned long type);
-void mk_poll_ipi_messages(void);
-
 /* messaging.c */
 int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
 				u32 subtype, void *payload, u32 payload_len);
@@ -31,14 +29,6 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
 int mk_instance_release_resources(struct mk_instance *instance);
-void mk_cpu_transaction_lock(void);
-void mk_cpu_transaction_unlock(void);
-void mk_cpu_ownership_lock(void);
-void mk_cpu_ownership_unlock(void);
-void mk_cpu_ownership_assert_held(void);
-/* Caller serializes CPU ownership changes with mk_cpu_transaction_lock(). */
-int mk_instance_migrate_irq_route(struct mk_instance *instance,
-				  const struct mk_cpu_set *removing);
 
 /* dts.c */
 int mk_dt_parse_resources(const void *fdt, int resources_node,
@@ -48,14 +38,18 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
 
-/* CPU ownership serialization: transaction must be acquired first. */
+/* CPU ownership serialization: transaction must be acquired before ownership. */
 void mk_cpu_transaction_lock(void);
 void mk_cpu_transaction_unlock(void);
 void mk_cpu_ownership_lock(void);
 void mk_cpu_ownership_unlock(void);
 void mk_cpu_ownership_assert_held(void);
+/* Caller serializes CPU ownership changes with mk_cpu_transaction_lock(). */
+int mk_instance_migrate_irq_route(struct mk_instance *instance,
+				  const struct mk_cpu_set *removing);
 
 /* pci.c */
+#ifdef CONFIG_PCI
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
@@ -68,9 +62,78 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
-void mk_pci_quiesce_instance_irqs(struct mk_instance *instance);
+
+/* Caller must hold instance->resource_mutex. */
+int mk_pci_quiesce_instance_irqs(struct mk_instance *instance,
+				 bool parked_force);
 unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance);
+#else
+static inline int mk_pci_lease_system_init(void)
+{
+	return 0;
+}
+
+static inline void mk_pci_lease_system_cleanup(void)
+{
+}
+
+static inline void mk_pci_lease_instance_init(struct mk_instance *instance)
+{
+	mutex_init(&instance->resource_mutex);
+	INIT_LIST_HEAD(&instance->pci_assignments);
+}
+
+static inline bool
+mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
+{
+	return false;
+}
+
+static inline int
+mk_pci_assign_devices(struct mk_instance *instance,
+		      const struct list_head *requested_devices,
+		      int requested_count)
+{
+	if (requested_count < 0)
+		return -EINVAL;
+
+	return requested_count ? -EOPNOTSUPP : 0;
+}
+
+static inline int mk_pci_assign_device(struct mk_instance *instance,
+				       u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int mk_pci_unassign_device(struct mk_instance *instance,
+					 u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int mk_pci_release_assignments(struct mk_instance *instance)
+{
+	return 0;
+}
+
+/* Caller must hold instance->resource_mutex. */
+static inline int
+mk_pci_quiesce_instance_irqs(struct mk_instance *instance, bool parked_force)
+{
+	return 0;
+}
+
+static inline unsigned int
+mk_pci_sync_instance_irq_route(struct mk_instance *instance)
+{
+	return 0;
+}
+
+#endif
+
 int mk_instance_force_halt(struct mk_instance *instance);
+
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 int mk_overlay_init(void);
