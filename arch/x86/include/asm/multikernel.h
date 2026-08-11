@@ -11,6 +11,7 @@
 #ifndef __ASSEMBLY__
 
 #include <linux/build_bug.h>
+#include <linux/init.h>
 #include <linux/stddef.h>
 #include <linux/types.h>
 #include <linux/cpumask.h>
@@ -189,6 +190,11 @@ int multikernel_wakeup_secondary_cpu_64(u32 apicid, unsigned long start_eip,
 int multikernel_restore_ap(unsigned int cpu, unsigned long cr3,
 			   unsigned long gs_base, unsigned long stack,
 			   unsigned long entry);
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_PCI)
+void __init x86_multikernel_pci_platform_init(void);
+#else
+static inline void x86_multikernel_pci_platform_init(void) { }
+#endif
 
 #endif /* __ASSEMBLY__ */
 
