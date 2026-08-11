@@ -57,13 +57,6 @@ bool mk_pci_get_assigned_identity(struct pci_bus *bus, int devfn,
 		*device_id = device->device;
 	return true;
 }
-bool mk_pci_should_probe(struct pci_bus *bus, int devfn,
-			 const struct pci_ops *ops)
-{
-	(void)ops;
-	return mk_pci_get_assigned_identity(bus, devfn, NULL, NULL);
-}
-
 
 static void mk_pci_restore_resources(struct pci_dev *dev)
 {
