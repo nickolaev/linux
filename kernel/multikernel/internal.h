@@ -70,6 +70,7 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
+u64 mk_pci_control_pool_exhausted_read(void);
 
 /* Caller must hold instance->resource_mutex. */
 int mk_pci_quiesce_instance_irqs(struct mk_instance *instance,
@@ -121,6 +122,11 @@ static inline int mk_pci_unassign_device(struct mk_instance *instance,
 }
 
 static inline int mk_pci_release_assignments(struct mk_instance *instance)
+{
+	return 0;
+}
+
+static inline u64 mk_pci_control_pool_exhausted_read(void)
 {
 	return 0;
 }
