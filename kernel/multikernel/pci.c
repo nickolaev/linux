@@ -5,6 +5,12 @@
  * Keeps assigned-device discovery, identity presentation, bridge traversal,
  * and resource restoration independent from the manifest that populated
  * the current instance.
+ *
+ * Configuration-space filtering constrains normal PCI access by a cooperative
+ * spawn kernel. It is not a security boundary: a privileged kernel can issue
+ * configuration cycles or map physical configuration windows directly. The
+ * host-owned IOMMU domain separately constrains DMA initiated by an assigned
+ * device.
  */
 
 #include <linux/bitmap.h>
@@ -28,11 +34,19 @@
 struct mk_pci_assignment;
 
 #define MK_PCI_FLR_SETTLE_MS	100
+#define MK_PCI_MAILBOX_QUIESCE_MS	1000
+
+static unsigned long mk_pci_mailbox_deadline(void)
+{
+	return jiffies + msecs_to_jiffies(MK_PCI_MAILBOX_QUIESCE_MS);
+}
 
 struct mk_pci_irq_vector {
 	struct mk_pci_assignment *assignment;
 	unsigned int host_irq;
 	u32 local_irq;
+	u32 mailbox_slot;
+	u32 mailbox_generation;
 	atomic64_t forwarded;
 	bool requested;
 	bool disabled;
@@ -64,6 +78,7 @@ struct mk_pci_assignment {
 	u8 irq_state;
 	bool irq_msix;
 	bool irq_needs_reprogram;
+	bool irq_mailbox_failed;
 	unsigned long irq_flr_deadline;
 	bool device_enabled;
 	struct work_struct failure_work;
@@ -228,45 +243,249 @@ mk_pci_find_assignment(struct mk_instance *instance, u16 domain, u8 bus,
 	return NULL;
 }
 
+static void mk_pci_mailbox_clear_bit(struct mk_irq_mailbox *mailbox,
+				     unsigned int slot)
+{
+	atomic64_andnot(BIT_ULL(slot & 63),
+			&mailbox->pending_bitmap[slot / 64]);
+}
+
+static bool mk_pci_mailbox_quiesce(struct mk_pci_irq_vector *vector,
+				   bool parked_force,
+				   unsigned long deadline)
+{
+	struct mk_shared_data *shared = vector->assignment->instance->ipi_data;
+	struct mk_irq_mailbox *mailbox;
+	struct mk_irq_mailbox_entry *entry;
+	u64 base, token;
+
+	if (!shared || vector->mailbox_slot == MK_IRQ_MAILBOX_SLOT_INVALID ||
+	    !vector->mailbox_generation)
+		return true;
+	mailbox = &shared->irq_mailbox;
+	entry = &mailbox->entries[vector->mailbox_slot];
+	base = mk_irq_mailbox_token(vector->mailbox_generation, 0) |
+		MK_IRQ_MAILBOX_MASKED;
+	for (;;) {
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    vector->mailbox_generation) {
+			atomic_inc(&mailbox->stale);
+			return false;
+		}
+		if (mk_irq_mailbox_consuming(token)) {
+			if (parked_force) {
+				if (atomic64_cmpxchg_release(&entry->pending_generation,
+							     token, base) == token)
+					break;
+				continue;
+			}
+			if (!mk_irq_mailbox_masked(token))
+				atomic64_cmpxchg(&entry->pending_generation,
+						 token,
+						 token | MK_IRQ_MAILBOX_MASKED);
+			if (time_after_eq(jiffies, deadline))
+				return false;
+			usleep_range(50, 100);
+			continue;
+		}
+		if (atomic64_cmpxchg_release(&entry->pending_generation,
+					     token, base) == token)
+			break;
+		cpu_relax();
+	}
+	mk_pci_mailbox_clear_bit(mailbox, vector->mailbox_slot);
+	WRITE_ONCE(entry->local_irq, 0);
+	return true;
+}
+
+static void mk_pci_mailbox_release(struct mk_pci_irq_vector *vector)
+{
+	struct mk_shared_data *shared = vector->assignment->instance->ipi_data;
+	struct mk_irq_mailbox *mailbox;
+	struct mk_irq_mailbox_entry *entry;
+	u64 token;
+
+	if (!shared || vector->mailbox_slot == MK_IRQ_MAILBOX_SLOT_INVALID ||
+	    !vector->mailbox_generation)
+		return;
+	mailbox = &shared->irq_mailbox;
+	entry = &mailbox->entries[vector->mailbox_slot];
+	for (;;) {
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    vector->mailbox_generation) {
+			atomic_inc(&mailbox->stale);
+			return;
+		}
+		if (atomic64_cmpxchg_release(&entry->pending_generation,
+					     token, 0) == token)
+			break;
+		cpu_relax();
+	}
+	mk_pci_mailbox_clear_bit(mailbox, vector->mailbox_slot);
+	WRITE_ONCE(entry->lifecycle_epoch, 0);
+	WRITE_ONCE(entry->lifecycle_generation, 0);
+	WRITE_ONCE(entry->device_id, 0);
+	WRITE_ONCE(entry->local_irq, 0);
+	WRITE_ONCE(entry->vector, 0);
+	vector->mailbox_slot = MK_IRQ_MAILBOX_SLOT_INVALID;
+	vector->mailbox_generation = 0;
+}
+
+static int mk_pci_mailbox_reserve(struct mk_pci_irq_vector *vector,
+				  unsigned int vector_index)
+{
+	struct mk_pci_assignment *assignment = vector->assignment;
+	struct mk_shared_data *shared = assignment->instance->ipi_data;
+	struct mk_irq_mailbox *mailbox;
+	struct mk_irq_mailbox_entry *entry;
+	u32 generation;
+	u32 device_id;
+	unsigned int slot;
+	u64 base;
+
+	if (!shared)
+		return -ENODEV;
+	mailbox = &shared->irq_mailbox;
+	generation = (u32)atomic_inc_return(&mailbox->next_generation);
+	if (!generation)
+		generation = (u32)atomic_inc_return(&mailbox->next_generation);
+	if (!generation)
+		return -EOVERFLOW;
+	device_id = MK_PCI_IRQ_ID(pci_domain_nr(assignment->vf->bus),
+				  assignment->vf->bus->number,
+				  assignment->vf->devfn);
+	base = mk_irq_mailbox_token(generation, 0) | MK_IRQ_MAILBOX_MASKED;
+	for (slot = 0; slot < MK_IRQ_MAILBOX_SLOTS; slot++) {
+		entry = &mailbox->entries[slot];
+		if (atomic64_read(&entry->pending_generation))
+			continue;
+		if (atomic64_cmpxchg_release(&entry->pending_generation, 0,
+					     base))
+			continue;
+		WRITE_ONCE(entry->lifecycle_epoch, assignment->irq_epoch);
+		WRITE_ONCE(entry->lifecycle_generation,
+			   assignment->irq_generation);
+		WRITE_ONCE(entry->device_id, device_id);
+		WRITE_ONCE(entry->local_irq, 0);
+		WRITE_ONCE(entry->vector, vector_index);
+		vector->mailbox_slot = slot;
+		vector->mailbox_generation = generation;
+		return 0;
+	}
+	return -ENOSPC;
+}
+
+static void mk_pci_irq_retry_workfn(struct work_struct *work)
+{
+	struct mk_instance *instance = container_of(to_delayed_work(work),
+						   struct mk_instance,
+						   irq_retry_work);
+	struct mk_shared_data *shared = READ_ONCE(instance->ipi_data);
+	bool any_pending = false;
+	bool unmasked_pending = false;
+	mk_phys_cpu_t target;
+	unsigned int slot;
+
+	if (!shared)
+		return;
+	for (slot = 0; slot < MK_IRQ_MAILBOX_SLOTS; slot++) {
+		struct mk_irq_mailbox_entry *entry;
+		u64 token;
+
+		entry = &shared->irq_mailbox.entries[slot];
+		token = atomic64_read_acquire(&entry->pending_generation);
+
+		if (!mk_irq_mailbox_generation(token))
+			continue;
+		if (mk_irq_mailbox_pending(token)) {
+			any_pending = true;
+			atomic64_or(BIT_ULL(slot & 63),
+				    &shared->irq_mailbox.pending_bitmap[slot / 64]);
+			if (!mk_irq_mailbox_masked(token))
+				unmasked_pending = true;
+		} else if (mk_irq_mailbox_consuming(token)) {
+			any_pending = true;
+		}
+	}
+	if (unmasked_pending) {
+		target = mk_instance_irq_route_load(instance);
+		if (target != MK_PHYS_CPU_INVALID)
+			mk_arch_send_ipi(target);
+	}
+	if (any_pending)
+		mod_delayed_work(system_wq, &instance->irq_retry_work,
+				 msecs_to_jiffies(unmasked_pending ? 10 : 100));
+}
+
 static irqreturn_t mk_pci_forward_irq(int irq, void *data)
 {
 	struct mk_pci_irq_vector *vector = data;
 	struct mk_pci_assignment *assignment = vector->assignment;
-	struct mk_io_irq_payload payload = {
-		.vector = vector - assignment->irq_vectors,
-		.device_id = MK_PCI_IRQ_ID(pci_domain_nr(assignment->vf->bus),
-					      assignment->vf->bus->number,
-					      assignment->vf->devfn),
-		.flags = MK_IRQ_LOW_LATENCY | MK_IRQ_EDGE_TRIGGERED,
-		.lifecycle_generation = READ_ONCE(assignment->irq_generation),
-		.lifecycle_epoch = READ_ONCE(assignment->irq_epoch),
-	};
-	u32 local_irq = READ_ONCE(vector->local_irq);
+	struct mk_shared_data *shared = assignment->instance->ipi_data;
+	struct mk_irq_mailbox *mailbox;
+	struct mk_irq_mailbox_entry *entry;
+	mk_phys_cpu_t target;
+	u64 old, new;
+	u32 pending;
+	u32 local_irq;
+
+	/* Pair with BIND's publication of the shared mailbox identity. */
+	local_irq = smp_load_acquire(&vector->local_irq);
 
 	if (READ_ONCE(assignment->instance->state) != MK_STATE_ACTIVE ||
 	    READ_ONCE(assignment->irq_state) != MK_PCI_MSI_ACTIVE ||
-	    !local_irq)
+	    !local_irq || !shared ||
+	    vector->mailbox_slot == MK_IRQ_MAILBOX_SLOT_INVALID ||
+	    !vector->mailbox_generation)
 		return IRQ_HANDLED;
-
-	payload.irq_number = local_irq;
+	mailbox = &shared->irq_mailbox;
+	entry = &mailbox->entries[vector->mailbox_slot];
+	for (;;) {
+		old = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(old) !=
+		    vector->mailbox_generation) {
+			atomic_inc(&mailbox->stale);
+			return IRQ_HANDLED;
+		}
+		pending = mk_irq_mailbox_pending(old);
+		if (pending == MK_IRQ_MAILBOX_PENDING_MASK) {
+			atomic_inc(&mailbox->saturated);
+			break;
+		}
+		new = mk_irq_mailbox_token(vector->mailbox_generation,
+					   pending + 1) |
+			(old & (MK_IRQ_MAILBOX_MASKED |
+				MK_IRQ_MAILBOX_CONSUMING));
+		if (atomic64_cmpxchg(&entry->pending_generation, old, new) == old)
+			break;
+		cpu_relax();
+	}
+	atomic64_or(BIT_ULL(vector->mailbox_slot & 63),
+		    &mailbox->pending_bitmap[vector->mailbox_slot / 64]);
+	atomic_inc(&mailbox->recorded);
+	if (!pending)
+		mod_delayed_work(system_wq, &assignment->instance->irq_retry_work,
+				 msecs_to_jiffies(10));
 	if (atomic64_inc_return(&vector->forwarded) == 1)
 		pr_info("Forwarding host IRQ %u as instance IRQ %u for %s vector %u\n",
 			irq, local_irq, pci_name(assignment->vf),
-			payload.vector);
-	if (mk_send_message_to_instance(assignment->instance, MK_MSG_IO,
-					MK_IO_IRQ_FORWARD, &payload,
-					sizeof(payload)))
-		pr_warn_ratelimited("Failed to forward IRQ %u for %s to instance %d\n",
-				    irq, pci_name(assignment->vf),
-				    assignment->instance->id);
+			(unsigned int)(vector - assignment->irq_vectors));
+	target = mk_instance_irq_route_load(assignment->instance);
+	if (target != MK_PHYS_CPU_INVALID)
+		mk_arch_send_ipi(target);
 	return IRQ_HANDLED;
 }
 
-static unsigned int mk_pci_quiesce_irqs(struct mk_pci_assignment *assignment)
+static unsigned int mk_pci_quiesce_irqs(struct mk_pci_assignment *assignment,
+					bool parked_force,
+					unsigned long deadline)
 {
 	unsigned int disabled = 0;
 	unsigned int i;
 
+	assignment->irq_mailbox_failed = false;
 	for (i = 0; i < assignment->nr_irq_vectors; i++)
 		WRITE_ONCE(assignment->irq_vectors[i].local_irq, 0);
 
@@ -279,6 +498,12 @@ static unsigned int mk_pci_quiesce_irqs(struct mk_pci_assignment *assignment)
 			disabled++;
 		}
 	}
+	for (i = 0; i < assignment->nr_irq_vectors; i++) {
+		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
+
+		if (!mk_pci_mailbox_quiesce(vector, parked_force, deadline))
+			assignment->irq_mailbox_failed = true;
+	}
 	if (assignment->irq_bound_map)
 		bitmap_zero(assignment->irq_bound_map,
 			    assignment->nr_irq_vectors);
@@ -289,16 +514,21 @@ static unsigned int mk_pci_quiesce_irqs(struct mk_pci_assignment *assignment)
 	return disabled;
 }
 
-static void mk_pci_release_irqs(struct mk_pci_assignment *assignment)
+static int mk_pci_release_irqs(struct mk_pci_assignment *assignment,
+			       bool parked_force)
 {
+	unsigned long deadline = mk_pci_mailbox_deadline();
 	unsigned int i;
 
-	mk_pci_quiesce_irqs(assignment);
+	mk_pci_quiesce_irqs(assignment, parked_force, deadline);
+	if (assignment->irq_mailbox_failed)
+		return -ETIMEDOUT;
 	for (i = 0; i < assignment->nr_irq_vectors; i++) {
 		struct mk_pci_irq_vector *vector = &assignment->irq_vectors[i];
 
 		if (vector->requested)
 			free_irq(vector->host_irq, vector);
+		mk_pci_mailbox_release(vector);
 	}
 	if (assignment->nr_irq_vectors)
 		pci_free_irq_vectors(assignment->vf);
@@ -310,27 +540,37 @@ static void mk_pci_release_irqs(struct mk_pci_assignment *assignment)
 	assignment->irq_msix = false;
 	assignment->irq_needs_reprogram = false;
 	assignment->irq_flr_deadline = 0;
+	assignment->irq_mailbox_failed = false;
+	return 0;
 }
 
-void mk_pci_quiesce_instance_irqs(struct mk_instance *instance)
+int mk_pci_quiesce_instance_irqs(struct mk_instance *instance,
+				 bool parked_force)
 {
 	struct mk_pci_assignment *assignment;
+	unsigned long deadline = mk_pci_mailbox_deadline();
 	unsigned int disabled = 0;
+	int ret = 0;
 
 	if (!instance || instance == root_instance)
-		return;
+		return 0;
 
 	lockdep_assert_held(&instance->resource_mutex);
 	mutex_lock(&mk_pci_lease_mutex);
 	pci_lock_rescan_remove();
 	list_for_each_entry(assignment, &instance->pci_assignments,
-			    instance_node)
-		disabled += mk_pci_quiesce_irqs(assignment);
+			    instance_node) {
+		disabled += mk_pci_quiesce_irqs(assignment, parked_force,
+						deadline);
+		if (assignment->irq_mailbox_failed)
+			ret = -ETIMEDOUT;
+	}
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	if (disabled)
 		pr_info("Quiesced %u host-owned PCI IRQ vectors for instance %d\n",
 			disabled, instance->id);
+	return ret;
 }
 
 unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance)
@@ -356,6 +596,12 @@ unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance)
 	}
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
+	if (requested) {
+		mk_phys_cpu_t target = mk_instance_irq_route_load(instance);
+
+		if (target != MK_PHYS_CPU_INVALID)
+			mk_arch_send_ipi(target);
+	}
 	return requested;
 }
 
@@ -375,7 +621,8 @@ static int mk_pci_setup_irqs(struct mk_pci_assignment *assignment,
 	int nvec;
 	int ret;
 
-	if (!request->nr_vectors)
+	if (!request->nr_vectors ||
+	    request->nr_vectors > MK_IRQ_MAILBOX_SLOTS)
 		return -EINVAL;
 	if (!request->lifecycle_generation)
 		return -EINVAL;
@@ -400,8 +647,11 @@ static int mk_pci_setup_irqs(struct mk_pci_assignment *assignment,
 	if (!mk_pci_generation_after(request->lifecycle_generation,
 				     assignment->irq_generation))
 		return -ESTALE;
-	if (assignment->nr_irq_vectors)
-		mk_pci_release_irqs(assignment);
+	if (assignment->nr_irq_vectors) {
+		ret = mk_pci_release_irqs(assignment, false);
+		if (ret)
+			return ret;
+	}
 	assignment->irq_epoch = request->lifecycle_epoch;
 	assignment->irq_generation = request->lifecycle_generation;
 	assignment->irq_state = MK_PCI_MSI_FAILED;
@@ -430,6 +680,10 @@ static int mk_pci_setup_irqs(struct mk_pci_assignment *assignment,
 	for (i = 0; i < nvec; i++) {
 		vectors[i].assignment = assignment;
 		vectors[i].host_irq = pci_irq_vector(assignment->vf, i);
+		vectors[i].mailbox_slot = MK_IRQ_MAILBOX_SLOT_INVALID;
+		ret = mk_pci_mailbox_reserve(&vectors[i], i);
+		if (ret)
+			goto err_release;
 	}
 	for (i = 0; i < nvec; i++) {
 		ret = request_irq(vectors[i].host_irq, mk_pci_forward_irq,
@@ -454,13 +708,15 @@ static int mk_pci_setup_irqs(struct mk_pci_assignment *assignment,
 err_release:
 	pr_err("Failed to configure host-owned IRQ for %s vector %d: %d\n",
 	       pci_name(assignment->vf), i, ret);
-	mk_pci_release_irqs(assignment);
+	if (mk_pci_release_irqs(assignment, false))
+		return -ETIMEDOUT;
 	return ret;
 }
 
 static int mk_pci_bind_irq(struct mk_pci_assignment *assignment,
 			   const struct mk_pci_irq_request *request)
 {
+	struct mk_shared_data *shared = assignment->instance->ipi_data;
 	struct mk_pci_irq_vector *vector;
 	unsigned long delay;
 	unsigned int count;
@@ -478,6 +734,7 @@ static int mk_pci_bind_irq(struct mk_pci_assignment *assignment,
 	    (assignment->irq_state != MK_PCI_MSI_PREPARED &&
 	     assignment->irq_state != MK_PCI_MSI_ACTIVE))
 		return -ESTALE;
+
 	if (!assignment->irq_vectors ||
 	    assignment->irq_msix != request->msix)
 		return -EINVAL;
@@ -490,10 +747,24 @@ static int mk_pci_bind_irq(struct mk_pci_assignment *assignment,
 		return -EINVAL;
 
 	for (i = 0; i < count; i++) {
+		struct mk_irq_mailbox_entry *entry;
+		u64 token;
+
 		vector = &assignment->irq_vectors[request->vector + i];
 		local_irq = READ_ONCE(vector->local_irq);
-		if (!vector->requested)
+		if (!vector->requested ||
+		    vector->mailbox_slot == MK_IRQ_MAILBOX_SLOT_INVALID ||
+		    !vector->mailbox_generation)
 			return -EINVAL;
+		entry = &shared->irq_mailbox.entries[vector->mailbox_slot];
+		token = atomic64_read_acquire(&entry->pending_generation);
+		if (mk_irq_mailbox_generation(token) !=
+		    vector->mailbox_generation ||
+		    READ_ONCE(entry->lifecycle_epoch) != assignment->irq_epoch ||
+		    READ_ONCE(entry->lifecycle_generation) !=
+			assignment->irq_generation ||
+		    READ_ONCE(entry->vector) != request->vector + i)
+			return -ESTALE;
 		if (local_irq && local_irq != request->local_irq + i)
 			return -EBUSY;
 	}
@@ -511,8 +782,13 @@ static int mk_pci_bind_irq(struct mk_pci_assignment *assignment,
 	}
 
 	for (i = 0; i < count; i++) {
+		struct mk_irq_mailbox_entry *entry;
+
 		vector = &assignment->irq_vectors[request->vector + i];
-		WRITE_ONCE(vector->local_irq, request->local_irq + i);
+		entry = &shared->irq_mailbox.entries[vector->mailbox_slot];
+		WRITE_ONCE(entry->local_irq, request->local_irq + i);
+		/* Make the shared identity visible before routing this vector. */
+		smp_store_release(&vector->local_irq, request->local_irq + i);
 	}
 	bitmap_set(assignment->irq_bound_map, request->vector, count);
 	return 0;
@@ -531,7 +807,9 @@ mk_pci_restore_irqs_begin(struct mk_pci_assignment *assignment,
 	if (assignment->irq_state != MK_PCI_MSI_ACTIVE)
 		return -ESTALE;
 
-	mk_pci_quiesce_irqs(assignment);
+	mk_pci_quiesce_irqs(assignment, false, mk_pci_mailbox_deadline());
+	if (assignment->irq_mailbox_failed)
+		return -ETIMEDOUT;
 	assignment->irq_needs_reprogram = true;
 	return 0;
 }
@@ -606,8 +884,12 @@ static int mk_pci_teardown_irqs(struct mk_pci_assignment *assignment,
 				     assignment->irq_generation))
 		return -ESTALE;
 
-	if (assignment->nr_irq_vectors)
-		mk_pci_release_irqs(assignment);
+	if (assignment->nr_irq_vectors) {
+		int ret = mk_pci_release_irqs(assignment, false);
+
+		if (ret)
+			return ret;
+	}
 	assignment->irq_epoch = request->lifecycle_epoch;
 	assignment->irq_generation = request->lifecycle_generation;
 	assignment->irq_state = MK_PCI_MSI_IDLE;
@@ -900,7 +1182,13 @@ static int mk_pci_reset_access(struct mk_instance *instance,
 
 	/* Tombstone this serial before side effects so delayed replays reject. */
 	assignment->reset_generation = request->reset_generation;
-	mk_pci_quiesce_irqs(assignment);
+	mk_pci_quiesce_irqs(assignment, false, mk_pci_mailbox_deadline());
+	if (assignment->irq_mailbox_failed) {
+		assignment->irq_state = MK_PCI_MSI_FAILED;
+		mk_pci_schedule_failure(assignment);
+		ret = -ETIMEDOUT;
+		goto out;
+	}
 	ret = pcie_reset_flr(assignment->vf, false);
 	if (ret) {
 		assignment->irq_state = MK_PCI_MSI_FAILED;
@@ -1028,7 +1316,7 @@ static void mk_pci_assignment_failure_work(struct work_struct *work)
 			       instance->id, ret);
 	}
 
-	mk_instance_set_state(instance, MK_STATE_FAILED);
+	mk_instance_mark_failed(instance);
 }
 
 static void mk_pci_schedule_failure(struct mk_pci_assignment *assignment)
@@ -1128,8 +1416,6 @@ static int mk_pci_iommu_validate_group(struct mk_pci_assignment *assignment)
 	struct mk_pci_iommu_group_check check = {
 		.vf = &assignment->vf->dev,
 	};
-	struct iommu_resv_region *region;
-	LIST_HEAD(resv_regions);
 	int ret;
 
 	ret = iommu_group_for_each_dev(assignment->iommu_group, &check,
@@ -1148,28 +1434,65 @@ static int mk_pci_iommu_validate_group(struct mk_pci_assignment *assignment)
 		return -EPERM;
 	}
 
+	return 0;
+}
+
+static int
+mk_pci_iommu_validate_resv_regions(struct mk_pci_assignment *assignment)
+{
+	struct iommu_resv_region *region;
+	struct mk_memory_region *memory;
+	LIST_HEAD(resv_regions);
+	u64 memory_end, resv_end;
+	int ret;
+
 	ret = iommu_get_group_resv_regions(assignment->iommu_group,
 					   &resv_regions);
-	if (ret) {
-		mk_pci_iommu_free_resv_regions(&resv_regions);
-		return ret;
-	}
+	if (ret)
+		goto out;
 
 	list_for_each_entry(region, &resv_regions, list) {
-		if (region->type != IOMMU_RESV_DIRECT &&
-		    region->type != IOMMU_RESV_DIRECT_RELAXABLE &&
-		    region->type != IOMMU_RESV_SW_MSI)
+		if (region->type == IOMMU_RESV_DIRECT_RELAXABLE)
 			continue;
-		pr_err("IOMMU group %d for %s requires unsupported reserved region %#llx-%#llx type %u\n",
-		       iommu_group_id(assignment->iommu_group),
-		       pci_name(assignment->vf),
-		       (unsigned long long)region->start,
-		       (unsigned long long)(region->start + region->length - 1),
-		       region->type);
-		ret = -EPERM;
-		break;
+		if (!region->length ||
+		    check_add_overflow((u64)region->start,
+				       (u64)region->length - 1, &resv_end)) {
+			pr_err("IOMMU group %d for %s has invalid reserved region at %#llx\n",
+			       iommu_group_id(assignment->iommu_group),
+			       pci_name(assignment->vf),
+			       (unsigned long long)region->start);
+			ret = -EOVERFLOW;
+			goto out;
+		}
+
+		list_for_each_entry(memory,
+				    &assignment->instance->memory_regions, list) {
+			resource_size_t size = resource_size(&memory->res);
+
+			if (!size ||
+			    check_add_overflow((u64)memory->res.start,
+					       (u64)size - 1, &memory_end)) {
+				ret = -EOVERFLOW;
+				goto out;
+			}
+			if ((u64)memory->res.start > resv_end ||
+			    memory_end < (u64)region->start)
+				continue;
+
+			pr_err("Instance %d IOVA %#llx-%#llx overlaps IOMMU reserved region %#llx-%#llx type %u for %s\n",
+			       assignment->instance->id,
+			       (unsigned long long)memory->res.start,
+			       (unsigned long long)memory_end,
+			       (unsigned long long)region->start,
+			       (unsigned long long)resv_end, region->type,
+			       pci_name(assignment->vf));
+			ret = -EPERM;
+			goto out;
+		}
 	}
 
+	ret = 0;
+out:
 	mk_pci_iommu_free_resv_regions(&resv_regions);
 	return ret;
 }
@@ -1250,7 +1573,9 @@ mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
 	bool transactions_drained;
 	int ret;
 
-	mk_pci_release_irqs(assignment);
+	ret = mk_pci_release_irqs(assignment, false);
+	if (ret)
+		return ret;
 	if (!mk_pci_device_live(vf))
 		return 0;
 
@@ -1287,7 +1612,9 @@ mk_pci_reset_assignment_for_start(struct mk_pci_assignment *assignment)
 	struct pci_dev *vf = assignment->vf;
 	int ret;
 
-	mk_pci_release_irqs(assignment);
+	ret = mk_pci_release_irqs(assignment, true);
+	if (ret)
+		return ret;
 	assignment->irq_epoch = 0;
 	assignment->irq_generation = 0;
 	assignment->reset_generation = 0;
@@ -1367,6 +1694,12 @@ static int mk_pci_iommu_prepare_assignment(struct mk_pci_assignment *assignment)
 		       pci_name(assignment->vf));
 		return -EOPNOTSUPP;
 	}
+	if (!device_iommu_capable(&assignment->vf->dev,
+				  IOMMU_CAP_CACHE_COHERENCY)) {
+		pr_err("Cannot assign %s without coherent IOMMU mappings\n",
+		       pci_name(assignment->vf));
+		return -EOPNOTSUPP;
+	}
 	if (!assignment->instance->region_count ||
 	    list_empty(&assignment->instance->memory_regions))
 		return -EINVAL;
@@ -1376,6 +1709,9 @@ static int mk_pci_iommu_prepare_assignment(struct mk_pci_assignment *assignment)
 		return -ENODEV;
 
 	ret = mk_pci_iommu_validate_group(assignment);
+	if (ret)
+		goto err_release;
+	ret = mk_pci_iommu_validate_resv_regions(assignment);
 	if (ret)
 		goto err_release;
 
@@ -1394,8 +1730,8 @@ static int mk_pci_iommu_prepare_assignment(struct mk_pci_assignment *assignment)
 		if (ret)
 			goto err_release;
 		ret = iommu_map(assignment->iommu_domain, region->res.start,
-				region->res.start, size, IOMMU_READ | IOMMU_WRITE,
-				GFP_KERNEL);
+				region->res.start, size,
+				IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE, GFP_KERNEL);
 		if (ret)
 			goto err_release;
 		assignment->iommu_mapped_regions++;
@@ -1781,7 +2117,8 @@ static int mk_pci_commit_assignment(struct mk_pci_assignment *assignment)
 	return 0;
 }
 
-static int mk_pci_release_assignment(struct mk_pci_assignment *assignment)
+static int mk_pci_release_assignment(struct mk_pci_assignment *assignment,
+				     struct list_head *released)
 {
 	struct mk_instance *instance = assignment->instance;
 	struct pci_dev *vf = assignment->vf;
@@ -1812,9 +2149,9 @@ static int mk_pci_release_assignment(struct mk_pci_assignment *assignment)
 
 release_resources:
 	mk_pci_iommu_release_assignment(assignment);
-	cancel_work_sync(&assignment->failure_work);
 
 	if (assignment->inventory_moved && root_instance) {
+		assignment->inventory->resources_valid = false;
 		list_move_tail(&assignment->inventory->list,
 			       &root_instance->pci_devices);
 		instance->pci_device_count--;
@@ -1823,20 +2160,32 @@ release_resources:
 		assignment->inventory_moved = false;
 	}
 
-	kfree(assignment->host_driver_override);
-	if (assignment->host_driver && assignment->host_driver->owner)
-		module_put(assignment->host_driver->owner);
 	if (!list_empty(&assignment->transaction_node))
 		list_del_init(&assignment->transaction_node);
 	list_del_init(&assignment->instance_node);
-	pci_dev_put(assignment->pf);
-	pci_dev_put(vf);
-	kfree(assignment);
+	list_add_tail(&assignment->transaction_node, released);
 
 	return 0;
 }
 
-static int mk_pci_rollback_transaction(struct list_head *transaction)
+static void mk_pci_finalize_releases(struct list_head *released)
+{
+	struct mk_pci_assignment *assignment, *tmp;
+
+	list_for_each_entry_safe(assignment, tmp, released, transaction_node) {
+		list_del_init(&assignment->transaction_node);
+		cancel_work_sync(&assignment->failure_work);
+		kfree(assignment->host_driver_override);
+		if (assignment->host_driver && assignment->host_driver->owner)
+			module_put(assignment->host_driver->owner);
+		pci_dev_put(assignment->pf);
+		pci_dev_put(assignment->vf);
+		kfree(assignment);
+	}
+}
+
+static int mk_pci_rollback_transaction(struct list_head *transaction,
+				       struct list_head *released)
 {
 	struct mk_pci_assignment *assignment, *tmp;
 	int rollback_ret = 0;
@@ -1844,7 +2193,7 @@ static int mk_pci_rollback_transaction(struct list_head *transaction)
 
 	list_for_each_entry_safe_reverse(assignment, tmp, transaction,
 					 transaction_node) {
-		ret = mk_pci_release_assignment(assignment);
+		ret = mk_pci_release_assignment(assignment, released);
 		if (!ret)
 			continue;
 		pr_crit("Failed to roll back PCI assignment for %s: %d\n",
@@ -1882,6 +2231,7 @@ void mk_pci_lease_instance_init(struct mk_instance *instance)
 {
 	mutex_init(&instance->resource_mutex);
 	INIT_LIST_HEAD(&instance->pci_assignments);
+	INIT_DELAYED_WORK(&instance->irq_retry_work, mk_pci_irq_retry_workfn);
 }
 
 bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
@@ -1898,6 +2248,7 @@ int mk_pci_assign_devices(struct mk_instance *instance,
 			  int requested_count)
 {
 	struct mk_pci_device *requested;
+	LIST_HEAD(released);
 	LIST_HEAD(transaction);
 	int prepared = 0;
 	int ret = 0;
@@ -1932,13 +2283,14 @@ int mk_pci_assign_devices(struct mk_instance *instance,
 	goto out;
 
 rollback:
-	rollback_ret = mk_pci_rollback_transaction(&transaction);
+	rollback_ret = mk_pci_rollback_transaction(&transaction, &released);
 	if (rollback_ret)
 		ret = rollback_ret;
 out:
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	mutex_unlock(&instance->resource_mutex);
+	mk_pci_finalize_releases(&released);
 	return ret;
 }
 
@@ -1946,6 +2298,7 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			 u8 devfn)
 {
 	struct mk_pci_device *inventory;
+	LIST_HEAD(released);
 	LIST_HEAD(transaction);
 	int ret;
 	int rollback_ret;
@@ -1981,13 +2334,14 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 	goto out;
 
 rollback:
-	rollback_ret = mk_pci_rollback_transaction(&transaction);
+	rollback_ret = mk_pci_rollback_transaction(&transaction, &released);
 	if (rollback_ret)
 		ret = rollback_ret;
 out:
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	mutex_unlock(&instance->resource_mutex);
+	mk_pci_finalize_releases(&released);
 	return ret;
 }
 
@@ -1995,6 +2349,7 @@ int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn)
 {
 	struct mk_pci_assignment *assignment;
+	LIST_HEAD(released);
 	int ret;
 
 	if (!instance || instance == root_instance)
@@ -2015,22 +2370,26 @@ int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 		goto out;
 	}
 
-	ret = mk_pci_release_assignment(assignment);
+	ret = mk_pci_release_assignment(assignment, &released);
 out:
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	mutex_unlock(&instance->resource_mutex);
+	mk_pci_finalize_releases(&released);
 	return ret;
 }
 
 int mk_pci_release_assignments(struct mk_instance *instance)
 {
 	struct mk_pci_assignment *assignment;
+	LIST_HEAD(released);
 	int ret = 0;
 
 	if (!instance || instance == root_instance)
 		return 0;
 
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
 	mutex_lock(&instance->resource_mutex);
 	mutex_lock(&mk_pci_lease_mutex);
 	pci_lock_rescan_remove();
@@ -2038,7 +2397,7 @@ int mk_pci_release_assignments(struct mk_instance *instance)
 		assignment = list_last_entry(&instance->pci_assignments,
 					     struct mk_pci_assignment,
 					     instance_node);
-		ret = mk_pci_release_assignment(assignment);
+		ret = mk_pci_release_assignment(assignment, &released);
 		if (ret) {
 			pr_crit("Instance %d retains unsafe PCI lease for %s: %d\n",
 				instance->id, pci_name(assignment->vf), ret);
@@ -2048,6 +2407,16 @@ int mk_pci_release_assignments(struct mk_instance *instance)
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+	/*
+	 * The assignment is no longer reachable by routed requests.  Cancel its
+	 * failure work after dropping the route and transaction locks because the
+	 * worker may itself force-halt the instance and take both locks.
+	 */
+	mk_pci_finalize_releases(&released);
+	if (!ret)
+		cancel_delayed_work_sync(&instance->irq_retry_work);
 	return ret;
 }
 
@@ -2152,7 +2521,8 @@ void mk_pci_lease_system_cleanup(void)
 static struct mk_pci_device *
 mk_pci_find_assigned_bdf(u16 domain, u8 bus, u8 devfn)
 {
-	if (!root_instance || !root_instance->dtb_data ||
+	if (!root_instance || root_instance->id == 0 ||
+	    !root_instance->dtb_data ||
 	    !root_instance->pci_devices_valid)
 		return NULL;
 

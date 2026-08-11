@@ -660,6 +660,10 @@ static void mk_ipi_drain_all(void)
 {
 	struct mk_ipi_endpoint *endpoint;
 
+	if (root_instance && root_instance->ipi_data) {
+		mk_reply_scan(root_instance->ipi_data);
+		mk_pci_irq_mailbox_drain(root_instance->ipi_data);
+	}
 	if (!READ_ONCE(mk_handlers_ready))
 		return;
 	rcu_read_lock();
@@ -679,16 +683,12 @@ void mk_poll_ipi_messages(void)
 	unsigned long flags;
 
 	local_irq_save(flags);
-	if (root_instance)
-		mk_reply_scan(root_instance->ipi_data);
 	mk_ipi_drain_all();
 	local_irq_restore(flags);
 }
 
 void generic_multikernel_interrupt(void)
 {
-	if (root_instance)
-		mk_reply_scan(root_instance->ipi_data);
 	mk_ipi_drain_all();
 }
 
