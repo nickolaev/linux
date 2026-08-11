@@ -422,6 +422,8 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 		goto err_free_ipi;
 
 	instance->state = MK_STATE_READY;
+	init_rwsem(&instance->control_route_sem);
+	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);
