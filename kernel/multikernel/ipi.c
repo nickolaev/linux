@@ -103,8 +103,8 @@ static int mk_reply_take_ready(struct mk_shared_data *shared,
 	return 0;
 }
 
-static bool mk_reply_cancel(struct mk_shared_data *shared,
-			    struct mk_reply_handle *reply, bool atomic_timeout)
+static int mk_reply_cancel(struct mk_shared_data *shared,
+			   struct mk_reply_handle *reply, bool atomic_timeout)
 {
 	struct mk_reply_table *table = &shared->replies;
 	struct mk_reply_slot *slot = &table->slots[reply->slot];
@@ -124,7 +124,7 @@ static bool mk_reply_cancel(struct mk_shared_data *shared,
 	for (;;) {
 		token = atomic64_read_acquire(&slot->state_generation);
 		if (token == ready)
-			return true;
+			return 1;
 		if (token == writing &&
 		    atomic64_cmpxchg_release(&slot->state_generation, writing,
 					     abandoned) == writing)
@@ -133,7 +133,9 @@ static bool mk_reply_cancel(struct mk_shared_data *shared,
 		    atomic64_cmpxchg_release(&slot->state_generation, executing,
 					     committed) == executing) {
 			atomic_inc(&table->indeterminate_timeouts);
-			goto timed_out;
+			if (atomic_timeout)
+				atomic_inc(&table->atomic_timeouts);
+			return -EINPROGRESS;
 		}
 		if (token != writing && token != executing)
 			break;
@@ -141,10 +143,9 @@ static bool mk_reply_cancel(struct mk_shared_data *shared,
 
 cancelled:
 	atomic_inc(&table->cancelled_slots);
-timed_out:
 	if (atomic_timeout)
 		atomic_inc(&table->atomic_timeouts);
-	return false;
+	return 0;
 }
 
 static bool mk_reply_wait_done(struct mk_shared_data *shared,
@@ -164,6 +165,7 @@ int mk_reply_wait_atomic(struct mk_shared_data *shared,
 			 s32 *status, u32 *value)
 {
 	u64 deadline;
+	int cancelled;
 
 	if (!shared || !reply || reply->slot >= MK_REPLY_SLOTS)
 		return -EINVAL;
@@ -180,8 +182,11 @@ int mk_reply_wait_atomic(struct mk_shared_data *shared,
 		cpu_relax();
 	}
 
-	if (mk_reply_cancel(shared, reply, true))
+	cancelled = mk_reply_cancel(shared, reply, true);
+	if (cancelled > 0)
 		return mk_reply_take_ready(shared, reply, status, value);
+	if (cancelled < 0)
+		return cancelled;
 	return -ETIMEDOUT;
 }
 
@@ -190,6 +195,7 @@ int mk_reply_wait(struct mk_shared_data *shared,
 		  s32 *status, u32 *value)
 {
 	long waited;
+	int cancelled;
 	int ret;
 
 	if (!shared || !reply || reply->slot >= MK_REPLY_SLOTS)
@@ -198,8 +204,11 @@ int mk_reply_wait(struct mk_shared_data *shared,
 				    mk_reply_wait_done(shared, reply),
 				    msecs_to_jiffies(timeout_ms));
 	if (!waited) {
-		if (mk_reply_cancel(shared, reply, false))
+		cancelled = mk_reply_cancel(shared, reply, false);
+		if (cancelled > 0)
 			return mk_reply_take_ready(shared, reply, status, value);
+		if (cancelled < 0)
+			return cancelled;
 		return -ETIMEDOUT;
 	}
 	ret = mk_reply_take_ready(shared, reply, status, value);
@@ -429,15 +438,20 @@ void mk_ipi_link_reset(struct mk_instance *instance, int parent_id,
 		       mk_phys_cpu_t child_cpu)
 {
 	struct mk_shared_data *shared = mk_instance_ipi_area(instance);
+	u64 epoch;
 
 	if (!shared)
 		return;
+	epoch = READ_ONCE(shared->spawn_epoch) + 1;
+	if (!epoch)
+		epoch = 1;
 	mk_ipi_endpoint_unregister(instance);
 	mk_shared_data_reset(shared);
 	WRITE_ONCE(shared->parent_id, parent_id);
 	WRITE_ONCE(shared->child_id, child_id);
 	WRITE_ONCE(shared->parent_doorbell_cpu, parent_cpu);
 	WRITE_ONCE(shared->child_doorbell_cpu, child_cpu);
+	WRITE_ONCE(shared->spawn_epoch, epoch);
 	mk_ipi_endpoint_init(instance, true);
 }
 
