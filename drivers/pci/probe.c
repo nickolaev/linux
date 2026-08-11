@@ -2606,7 +2606,8 @@ static struct pci_dev *pci_scan_device(struct pci_bus *bus, int devfn)
 	 * BEFORE any config space access. This prevents hardware conflicts
 	 * when the host kernel is also using PCI devices.
 	 */
-	if (IS_ENABLED(CONFIG_MULTIKERNEL) && !mk_pci_should_probe(bus, devfn))
+	if (IS_ENABLED(CONFIG_MULTIKERNEL) &&
+	    !mk_pci_should_probe(bus, devfn, bus->ops))
 		return NULL;
 
 	if (!pci_bus_read_dev_vendor_id(bus, devfn, &l, 60*1000))
