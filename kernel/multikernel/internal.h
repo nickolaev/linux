@@ -23,7 +23,17 @@ int mk_instance_force_halt(struct mk_instance *instance);
 int mk_send_ipi_data(struct mk_instance *instance, void *data,
 		     size_t data_size, unsigned long type);
 struct mk_shared_data *mk_instance_halt_data(struct mk_instance *instance);
+int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
+			    mk_phys_cpu_t target, void *data,
+			    size_t data_size, unsigned long type);
 void mk_poll_ipi_messages(void);
+
+/* messaging.c */
+int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
+				u32 subtype, void *payload, u32 payload_len);
+int mk_send_message_to_cpu(struct mk_instance *instance,
+			   mk_phys_cpu_t target, u32 msg_type, u32 subtype,
+			   void *payload, u32 payload_len);
 
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
@@ -33,6 +43,12 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 struct mk_instance *mk_instance_find_by_name(const char *name);
 int mk_instance_destroy(struct mk_instance *instance);
 int mk_instance_release_resources(struct mk_instance *instance);
+void mk_cpu_ownership_lock(void);
+void mk_cpu_ownership_unlock(void);
+void mk_cpu_ownership_assert_held(void);
+/* Caller serializes CPU ownership changes with mk_cpu_transaction_lock(). */
+int mk_instance_migrate_irq_route(struct mk_instance *instance,
+				  const struct mk_cpu_set *removing);
 
 /* dts.c */
 int mk_dt_parse_chosen(const void *fdt, int chosen_node,
@@ -47,11 +63,6 @@ int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
 
-/* CPU ownership serialization: transaction must be acquired first. */
-void mk_cpu_ownership_lock(void);
-void mk_cpu_ownership_unlock(void);
-void mk_cpu_ownership_assert_held(void);
-
 /* pci.c */
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
@@ -65,7 +76,11 @@ int mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus,
 int mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
 			   u8 devfn);
 int mk_pci_release_assignments(struct mk_instance *instance);
-int mk_instance_force_halt(struct mk_instance *instance);
+static inline unsigned int
+mk_pci_sync_instance_irq_route(struct mk_instance *instance)
+{
+	return 0;
+}
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 extern struct mutex mk_overlay_mutex;

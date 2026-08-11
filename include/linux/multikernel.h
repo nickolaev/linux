@@ -18,6 +18,7 @@
 #include <linux/sizes.h>
 #include <linux/spinlock.h>
 #include <linux/multikernel_abi.h>
+#include <linux/rwsem.h>
 
 struct pci_bus;
 struct mk_instance;
@@ -437,7 +438,8 @@ struct mk_shutdown_payload {
  * Message handler callback type
  */
 typedef void (*mk_msg_handler_t)(u32 msg_type, u32 subtype,
-				 void *payload, u32 payload_len, void *ctx);
+				 void *payload, u32 payload_len,
+				 s32 sender_instance_id, void *ctx);
 
 /* Opaque type for pending message tracking */
 struct mk_pending_msg;
@@ -779,6 +781,9 @@ struct mk_instance {
 
 	/* CPU resources */
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
+	/* Pins the CPU selected for control messages and forwarded IRQs. */
+	struct rw_semaphore control_route_sem;
+	mk_phys_cpu_t irq_route_cpu;
 
 	/* PCI device resources */
 	struct list_head pci_devices;    /* List of struct mk_pci_device */
@@ -865,6 +870,20 @@ struct mk_instance {
 	/* Reference counting */
 	struct kref refcount;           /* Reference count for cleanup */
 };
+
+static inline mk_phys_cpu_t
+mk_instance_irq_route_load(const struct mk_instance *instance)
+{
+	/* Pair with the release store that publishes route changes. */
+	return smp_load_acquire(&instance->irq_route_cpu);
+}
+
+static inline void mk_instance_irq_route_store(struct mk_instance *instance,
+					       mk_phys_cpu_t target)
+{
+	/* Publish the route after its associated control state. */
+	smp_store_release(&instance->irq_route_cpu, target);
+}
 
 /**
  * Device Tree Parsing Functions
@@ -1069,6 +1088,7 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+void mk_instance_mark_failed(struct mk_instance *instance);
 int mk_instance_abort_spawn(struct mk_instance *instance);
 
 /* Kimage-based access to the instance memory pool */

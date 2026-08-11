@@ -370,6 +370,7 @@ static int __init mk_restore_host_instance(void)
 	if (!hi)
 		return -ENOMEM;
 	hi->ipi_target = parent_cpu;
+	mk_instance_irq_route_store(hi, parent_cpu);
 	ret = mk_cpu_set_add(hi->cpus, parent_cpu);
 	if (ret)
 		goto err_free;

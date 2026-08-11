@@ -396,10 +396,11 @@ int mk_reply_publish(struct mk_instance *instance,
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
 		return -EINVAL;
+	down_read(&instance->control_route_sem);
 	shared = instance->ipi_data;
 	ret = shared ? 0 : -ENODEV;
 	if (ret)
-		return ret;
+		goto unlock_route;
 	slot = &shared->replies.slots[reply->slot];
 	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
 	executing = mk_reply_token(reply->generation, MK_REPLY_EXECUTING);
@@ -417,25 +418,31 @@ int mk_reply_publish(struct mk_instance *instance,
 	if (old == abandoned) {
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
-		return -ESTALE;
+		ret = -ESTALE;
+		goto unlock_route;
 	}
 	if (old == committed) {
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
-		return -ESTALE;
+		ret = -ESTALE;
+		goto unlock_route;
 	}
 	if (old != executing && old != writing) {
 		atomic_inc(&shared->replies.late_replies);
-		return -EIO;
+		ret = -EIO;
+		goto unlock_route;
 	}
 
-	target = READ_ONCE(instance->ipi_target);
-	if (target == MK_PHYS_CPU_INVALID)
-		target = mk_cpu_set_first(instance->cpus);
-	if (target == MK_PHYS_CPU_INVALID)
-		return -ENODEV;
+	target = mk_instance_irq_route_load(instance);
+	if (target == MK_PHYS_CPU_INVALID) {
+		ret = -ENODEV;
+		goto unlock_route;
+	}
+	ret = 0;
 	mk_arch_send_ipi(target);
-	return 0;
+unlock_route:
+	up_read(&instance->control_route_sem);
+	return ret;
 }
 
 void mk_reply_scan(struct mk_shared_data *shared)
@@ -508,18 +515,19 @@ int mk_arm_force_halt(struct mk_instance *instance)
 	return 0;
 }
 
-int mk_send_ipi_data(struct mk_instance *instance, void *data,
-		     size_t data_size, unsigned long type)
+static int __mk_send_ipi_data(struct mk_instance *instance,
+			      mk_phys_cpu_t target, void *data,
+			      size_t data_size, unsigned long type)
 {
 	struct mk_ipi_endpoint *endpoint;
 	struct mk_ipi_data *slot;
 	struct mk_shared_data *shared;
-	mk_phys_cpu_t target;
 	unsigned long flags;
 	u32 idx;
 	int ret = 0;
 
-	if (!instance || data_size > MK_MAX_DATA_SIZE || (data_size && !data))
+	if (!instance || target == MK_PHYS_CPU_INVALID ||
+	    data_size > MK_MAX_DATA_SIZE || (data_size && !data))
 		return -EINVAL;
 	endpoint = &instance->ipi_endpoint;
 	if (!READ_ONCE(endpoint->registered))
@@ -531,12 +539,6 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 	}
 	shared = READ_ONCE(instance->ipi_data);
 	if (!shared) {
-		ret = -ENODEV;
-		goto unlock;
-	}
-	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
-		 READ_ONCE(shared->parent_doorbell_cpu);
-	if (target == MK_PHYS_CPU_INVALID) {
 		ret = -ENODEV;
 		goto unlock;
 	}
@@ -565,6 +567,28 @@ unlock:
 		printk_deferred(KERN_WARNING
 				"multikernel: IPI ring full for instance %d\n",
 				instance->id);
+	return ret;
+}
+
+int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
+			    mk_phys_cpu_t target, void *data,
+			    size_t data_size, unsigned long type)
+{
+	return __mk_send_ipi_data(instance, target, data, data_size, type);
+}
+
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type)
+{
+	mk_phys_cpu_t target;
+	int ret;
+
+	if (!instance)
+		return -EINVAL;
+	down_read(&instance->control_route_sem);
+	target = mk_instance_irq_route_load(instance);
+	ret = __mk_send_ipi_data(instance, target, data, data_size, type);
+	up_read(&instance->control_route_sem);
 	return ret;
 }
 
