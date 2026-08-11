@@ -149,6 +149,7 @@ struct mk_ipi_data {
 /* IPI ring buffer for queuing messages */
 struct mk_ipi_ring {
 	struct mk_ipi_data entries[MK_IPI_RING_SIZE]; /* Ring buffer entries */
+	atomic_t full_failures;
 };
 
 struct mk_irq_mailbox_entry {
@@ -265,6 +266,7 @@ static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
 
 	for (i = 0; i < MK_IPI_RING_SIZE; i++)
 		WRITE_ONCE(ring->entries[i].ready, 0);
+	atomic_set(&ring->full_failures, 0);
 }
 
 static inline void mk_irq_mailbox_reset(struct mk_irq_mailbox *mailbox)

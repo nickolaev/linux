@@ -560,6 +560,7 @@ static int __mk_send_ipi_data(struct mk_instance *instance,
 	slot = &endpoint->tx->entries[idx];
 	/* Pair with the receiver's release when it makes the slot reusable. */
 	if (smp_load_acquire(&slot->ready)) {
+		atomic_inc(&endpoint->tx->full_failures);
 		ret = -ENOSPC;
 		goto unlock;
 	}
