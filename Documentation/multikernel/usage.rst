@@ -230,3 +230,6 @@ The new kernfs interface has the following restrictions:
 - **No direct DTB upload to instances**: Instances don't have writable ``device_tree`` files
 - **Centralized DTB management**: All instances must be created via the root ``device_tree`` file
 - **Read-only instance files**: All instance attributes are read-only for consistency
+- **Host control CPU**: Logical CPU 0 is the PCI forwarding and control CPU and
+  must remain online while assigned devices are active. Selecting another
+  control CPU is a future policy extension.

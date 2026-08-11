@@ -380,12 +380,12 @@ xloadflags:
 #endif
 
 #ifdef CONFIG_MULTIKERNEL
-# define XLF10 XLF_MULTIKERNEL_IPI_V4
+# define XLF12 XLF_MULTIKERNEL_IPI_V6
 #else
-# define XLF10 0
+# define XLF12 0
 #endif
 
-			.word XLF0 | XLF1 | XLF23 | XLF4 | XLF56 | XLF10
+			.word XLF0 | XLF1 | XLF23 | XLF4 | XLF56 | XLF12
 
 cmdline_size:   .long   COMMAND_LINE_SIZE-1     #length of the command line,
                                                 #added with boot protocol
