@@ -154,25 +154,22 @@ int mk_arm_force_halt(struct mk_instance *instance)
 	return 0;
 }
 
-int mk_send_ipi_data(struct mk_instance *instance, void *data,
-		     size_t data_size, unsigned long type)
+static int __mk_send_ipi_data(struct mk_instance *instance,
+			      mk_phys_cpu_t target, void *data,
+			      size_t data_size, unsigned long type)
 {
 	struct mk_ipi_endpoint *endpoint;
 	struct mk_ipi_data *slot;
-	mk_phys_cpu_t target;
 	unsigned long flags;
 	u32 idx;
 	int ret = 0;
 
-	if (!instance || data_size > MK_MAX_DATA_SIZE || (data_size && !data))
+	if (!instance || target == MK_PHYS_CPU_INVALID ||
+	    data_size > MK_MAX_DATA_SIZE || (data_size && !data))
 		return -EINVAL;
 	endpoint = &instance->ipi_endpoint;
 	if (!READ_ONCE(endpoint->registered))
 		return -ESHUTDOWN;
-	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
-		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
-	if (target == MK_PHYS_CPU_INVALID)
-		return -ENODEV;
 	if (endpoint->parent_side)
 		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
 	raw_spin_lock_irqsave(&endpoint->tx_lock, flags);
@@ -200,6 +197,38 @@ unlock:
 	if (!ret)
 		mk_arch_send_ipi(target);
 	return ret;
+}
+
+int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
+			    mk_phys_cpu_t target, void *data,
+			    size_t data_size, unsigned long type)
+{
+	return __mk_send_ipi_data(instance, target, data, data_size, type);
+}
+
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type)
+{
+	struct mk_ipi_endpoint *endpoint;
+	mk_phys_cpu_t target;
+	int ret;
+
+	if (!instance)
+		return -EINVAL;
+	endpoint = &instance->ipi_endpoint;
+	if (!endpoint->registered) {
+		ret = mk_ipi_endpoint_init(instance, true);
+		if (ret)
+			return ret;
+	}
+	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
+		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
+	if (target == MK_PHYS_CPU_INVALID) {
+		pr_err("Instance %d has no CPUs to receive the IPI\n",
+		       instance->id);
+		return -ENODEV;
+	}
+	return __mk_send_ipi_data(instance, target, data, data_size, type);
 }
 
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,

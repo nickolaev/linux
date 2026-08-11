@@ -447,6 +447,7 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 		unsigned long i;
 
 		cond_resched();
+
 		if (hole_end > KEXEC_CRASH_CONTROL_MEMORY_LIMIT)
 			break;
 		/* See if I overlap any of the segments */
@@ -594,6 +595,7 @@ void kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
 	kimage_entry_t ind = 0;
+	struct mk_instance *route_instance = NULL;
 
 	if (!image)
 		return;
@@ -608,7 +610,9 @@ void kimage_free(struct kimage *image)
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
 
-		/* Stop delivery before image-owned shared pages are returned. */
+		route_instance = image->mk_instance;
+		if (route_instance)
+			down_write(&route_instance->control_route_sem);
 		if (image->mk_instance)
 			mk_ipi_endpoint_unregister(image->mk_instance);
 
@@ -632,7 +636,6 @@ void kimage_free(struct kimage *image)
 			image->mk_instance->ipi_phys = 0;
 			image->mk_instance->kimage = NULL;
 			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
-			mk_instance_put(image->mk_instance);
 			image->mk_instance = NULL;
 		}
 
@@ -646,6 +649,10 @@ void kimage_free(struct kimage *image)
 			unsigned int order = get_order(ipi_buffer_size);
 			__free_pages(phys_to_page(image->mk_ipi), order);
 			image->mk_ipi = 0;
+		}
+		if (route_instance) {
+			up_write(&route_instance->control_route_sem);
+			mk_instance_put(route_instance);
 		}
 	}
 #ifdef CONFIG_CRASH_DUMP
@@ -1691,6 +1698,8 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	bool transaction_locked = false;
+	bool route_locked = false;
 	int cpu = -1;
 	int i, rc;
 
@@ -1711,9 +1720,16 @@ int multikernel_kexec_by_id(int mk_id)
 		rc = -EINVAL;
 		goto unlock;
 	}
+	mk_cpu_transaction_lock();
+	transaction_locked = true;
+	down_write(&instance->control_route_sem);
+	route_locked = true;
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
+		if (!mk_cpu_set_contains(instance->cpus,
+					 mk_instance_irq_route_load(instance)))
+			mk_instance_irq_route_store(instance, phys_cpu);
 		cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
@@ -1813,18 +1829,36 @@ int multikernel_kexec_by_id(int mk_id)
 	 */
 	rc = mk_instance_set_kexec_active(mk_image->mk_id);
 	if (rc) {
-		int abort_ret = mk_instance_abort_spawn(instance);
+		int abort_ret;
 
+		mutex_lock(&instance->resource_mutex);
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mutex_unlock(&instance->resource_mutex);
+		up_write(&instance->control_route_sem);
+		route_locked = false;
+		mk_cpu_transaction_unlock();
+		transaction_locked = false;
+		abort_ret = mk_instance_abort_spawn(instance);
 		if (abort_ret)
 			pr_crit("Instance %d activation abort failed: %d\n",
 				mk_id, abort_ret);
 		goto unlock;
 	}
 
+	/* The launch no longer needs the CPU route or transaction pinned. */
+	up_write(&instance->control_route_sem);
+	route_locked = false;
+	mk_cpu_transaction_unlock();
+	transaction_locked = false;
+
 	kexec_unlock();
 	return 0;
 
 unlock:
+	if (route_locked)
+		up_write(&instance->control_route_sem);
+	if (transaction_locked)
+		mk_cpu_transaction_unlock();
 	kexec_unlock();
 	return rc;
 }
