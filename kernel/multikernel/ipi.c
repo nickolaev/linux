@@ -632,6 +632,7 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared,
 	WRITE_ONCE(shared->force_halt, 0);
 	mk_reply_table_reset(&shared->replies);
 	mk_irq_mailbox_reset(&shared->irq_mailbox);
+	mk_pci_stats_reset(&shared->pci_stats);
 	epoch = READ_ONCE(shared->spawn_epoch) + 1;
 	if (!epoch)
 		epoch = 1;

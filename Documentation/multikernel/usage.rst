@@ -106,17 +106,6 @@ Phase 1: Instance Creation (Automatic from DTB)
    through this interface, and must only be compared as modulo-32-bit deltas
    between samples carrying the same nonzero epoch.
 
-Shared Transport Compatibility
-==============================
-
-The private kernel-to-kernel shared transport requires an exact match between
-the host and spawn.  The loader compares the spawn image note before launch;
-the spawn manifest and transport initialization acknowledgment confirm the
-same layout before shared memory is used.  These checks establish transport
-compatibility and do not authenticate the kernel artifact.  A mismatched
-bzImage or vmlinux is rejected; there is no translation or backward-
-compatibility promise between transport versions.
-
       # View instance device tree
       cat /sys/fs/multikernel/instances/web-server/device_tree_source
       # Output: DTS format showing the instance configuration

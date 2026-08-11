@@ -176,6 +176,12 @@ struct mk_irq_mailbox {
 	atomic_t saturated;
 };
 
+struct mk_pci_stats {
+	atomic64_t config_requests;
+	atomic64_t config_total_ns;
+	atomic64_t config_max_ns;
+};
+
 static inline u64 mk_irq_mailbox_token(u32 generation, u32 pending)
 {
 	return (u64)generation << MK_IRQ_MAILBOX_GENERATION_SHIFT | pending;
@@ -224,6 +230,8 @@ struct mk_shared_data {
 	u64 spawn_epoch;
 	/* Preallocated hardirq-safe PCI interrupt forwarding transport. */
 	struct mk_irq_mailbox irq_mailbox;
+	/* Spawn-written PCI config round-trip measurements. */
+	struct mk_pci_stats pci_stats;
 };
 
 static inline void mk_reply_table_reset(struct mk_reply_table *table)
@@ -270,6 +278,13 @@ static inline void mk_irq_mailbox_reset(struct mk_irq_mailbox *mailbox)
 	atomic_set(&mailbox->saturated, 0);
 }
 
+static inline void mk_pci_stats_reset(struct mk_pci_stats *stats)
+{
+	atomic64_set(&stats->config_requests, 0);
+	atomic64_set(&stats->config_total_ns, 0);
+	atomic64_set(&stats->config_max_ns, 0);
+}
+
 static inline void mk_ipi_ring_reset_contents(struct mk_ipi_ring *ring)
 {
 	unsigned int i;
@@ -304,6 +319,7 @@ static inline void mk_shared_data_reset(struct mk_shared_data *shared)
 	mk_reply_table_reset(&shared->replies);
 	WRITE_ONCE(shared->spawn_epoch, 0);
 	mk_irq_mailbox_reset(&shared->irq_mailbox);
+	mk_pci_stats_reset(&shared->pci_stats);
 }
 
 /* Function pointer type for IPI callbacks */

@@ -101,6 +101,11 @@ static unsigned int mk_pci_control_active;
 static bool mk_pci_control_shutdown = true;
 static atomic64_t mk_pci_control_pool_exhausted = ATOMIC64_INIT(0);
 
+u64 mk_pci_control_pool_exhausted_read(void)
+{
+	return atomic64_read(&mk_pci_control_pool_exhausted);
+}
+
 struct mk_pci_control_work {
 	struct work_struct work;
 	mk_phys_cpu_t sender_cpu;

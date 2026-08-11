@@ -24,9 +24,6 @@ static bool mk_pci_roots_ready;
 #define MK_PCI_ENUM_RETRIES	3
 #define MK_PCI_ENUM_RETRY_MS	20
 static atomic64_t mk_pci_request_id = ATOMIC64_INIT(0);
-static atomic64_t mk_pci_cfg_count = ATOMIC64_INIT(0);
-static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
-static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
 #define MK_PCI_RESET_TIMEOUT_MS	70000
 #ifdef CONFIG_PCI_MSI
 static void mk_pci_forward_irq_set_mask(struct irq_data *data, bool masked);
@@ -748,13 +745,19 @@ int mk_pci_reset_flr(struct pci_dev *dev)
 
 static void mk_pci_record_latency(u64 start)
 {
+	struct mk_shared_data *shared = READ_ONCE(root_instance->ipi_data);
+	struct mk_pci_stats *stats;
 	u64 elapsed = ktime_get_mono_fast_ns() - start;
-	u64 old_max = atomic64_read(&mk_pci_cfg_max_ns);
+	u64 old_max;
 
-	atomic64_inc(&mk_pci_cfg_count);
-	atomic64_add(elapsed, &mk_pci_cfg_total_ns);
+	if (!shared)
+		return;
+	stats = &shared->pci_stats;
+	old_max = atomic64_read(&stats->config_max_ns);
+	atomic64_inc(&stats->config_requests);
+	atomic64_add(elapsed, &stats->config_total_ns);
 	while (elapsed > old_max) {
-		u64 previous = atomic64_cmpxchg(&mk_pci_cfg_max_ns, old_max,
+		u64 previous = atomic64_cmpxchg(&stats->config_max_ns, old_max,
 						 elapsed);
 
 		if (previous == old_max)
@@ -972,12 +975,13 @@ static int __init x86_multikernel_pci_init(void)
 			      device->func, MK_PCI_ENUM_RETRIES);
 		pci_bus_add_devices(bus);
 	}
-	if (atomic64_read(&mk_pci_cfg_count)) {
-		u64 count = atomic64_read(&mk_pci_cfg_count);
+	if (atomic64_read(&root_instance->ipi_data->pci_stats.config_requests)) {
+		struct mk_pci_stats *stats = &root_instance->ipi_data->pci_stats;
+		u64 count = atomic64_read(&stats->config_requests);
 
 		pr_notice("Multikernel PCI control plane: %llu config requests, average %llu ns, max %llu ns\n",
-			  count, atomic64_read(&mk_pci_cfg_total_ns) / count,
-			  atomic64_read(&mk_pci_cfg_max_ns));
+			  count, atomic64_read(&stats->config_total_ns) / count,
+			  atomic64_read(&stats->config_max_ns));
 	}
 
 	/* Suppress legacy bus 0 probing after every assigned root is present. */
