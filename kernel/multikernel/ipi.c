@@ -503,14 +503,14 @@ int mk_arm_force_halt(struct mk_instance *instance)
  *
  * Returns 0 on success, negative error code on failure
  */
-int mk_send_ipi_data(struct mk_instance *instance, void *data,
-		     size_t data_size, unsigned long type)
+static int __mk_send_ipi_data(struct mk_instance *instance,
+			      mk_phys_cpu_t target, void *data,
+			      size_t data_size, unsigned long type)
 {
-	mk_phys_cpu_t target;
 	int instance_id;
 	int ret;
 
-	if (!instance)
+	if (!instance || target == MK_PHYS_CPU_INVALID)
 		return -EINVAL;
 	instance_id = instance->id;
 	if (data_size > MK_MAX_DATA_SIZE || (data_size && !data))
@@ -557,6 +557,29 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 	mk_arch_send_ipi(target);
 
 	return 0;
+}
+
+int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
+			    mk_phys_cpu_t target, void *data,
+			    size_t data_size, unsigned long type)
+{
+	return __mk_send_ipi_data(instance, target, data, data_size, type);
+}
+
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type)
+{
+	mk_phys_cpu_t target;
+
+	if (!instance)
+		return -EINVAL;
+	target = mk_cpu_set_first(instance->cpus);
+	if (target == MK_PHYS_CPU_INVALID) {
+		pr_err("Instance %d has no CPUs to receive the IPI\n",
+		       instance->id);
+		return -ENODEV;
+	}
+	return __mk_send_ipi_data(instance, target, data, data_size, type);
 }
 
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,

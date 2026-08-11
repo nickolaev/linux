@@ -595,6 +595,7 @@ void kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
 	kimage_entry_t ind = 0;
+	struct mk_instance *route_instance = NULL;
 
 	if (!image)
 		return;
@@ -608,6 +609,10 @@ void kimage_free(struct kimage *image)
 
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
+
+		route_instance = image->mk_instance;
+		if (route_instance)
+			down_write(&route_instance->control_route_sem);
 
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
@@ -629,7 +634,6 @@ void kimage_free(struct kimage *image)
 			image->mk_instance->ipi_phys = 0;
 			image->mk_instance->kimage = NULL;
 			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
-			mk_instance_put(image->mk_instance);
 			image->mk_instance = NULL;
 		}
 
@@ -643,6 +647,10 @@ void kimage_free(struct kimage *image)
 			unsigned int order = get_order(ipi_buffer_size);
 			__free_pages(phys_to_page(image->mk_ipi), order);
 			image->mk_ipi = 0;
+		}
+		if (route_instance) {
+			up_write(&route_instance->control_route_sem);
+			mk_instance_put(route_instance);
 		}
 	}
 #ifdef CONFIG_CRASH_DUMP
@@ -1688,6 +1696,8 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	bool transaction_locked = false;
+	bool route_locked = false;
 	int cpu = -1;
 	int i, rc;
 
@@ -1708,9 +1718,16 @@ int multikernel_kexec_by_id(int mk_id)
 		rc = -EINVAL;
 		goto unlock;
 	}
+	mk_cpu_transaction_lock();
+	transaction_locked = true;
+	down_write(&instance->control_route_sem);
+	route_locked = true;
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
+		if (!mk_cpu_set_contains(instance->cpus,
+					 mk_instance_irq_route_load(instance)))
+			mk_instance_irq_route_store(instance, phys_cpu);
 		cpu = arch_cpu_from_physical_id(phys_cpu);
 		if (cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n", phys_cpu);
@@ -1815,6 +1832,13 @@ int multikernel_kexec_by_id(int mk_id)
 
 			pr_err("Instance %d did not acknowledge IPI ABI %u: %d\n",
 			       mk_id, MK_IPI_ABI_VERSION, rc);
+			mutex_lock(&instance->resource_mutex);
+			mk_instance_set_state(instance, MK_STATE_FAILED);
+			mutex_unlock(&instance->resource_mutex);
+			up_write(&instance->control_route_sem);
+			route_locked = false;
+			mk_cpu_transaction_unlock();
+			transaction_locked = false;
 			abort_ret = mk_instance_abort_spawn(instance);
 			if (abort_ret)
 				pr_crit("Instance %d IPI ABI timeout abort failed: %d\n",
@@ -1827,6 +1851,10 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 unlock:
+	if (route_locked)
+		up_write(&instance->control_route_sem);
+	if (transaction_locked)
+		mk_cpu_transaction_unlock();
 	kexec_unlock();
 	return rc;
 }

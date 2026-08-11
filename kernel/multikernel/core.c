@@ -15,7 +15,7 @@
 #include <linux/vmalloc.h>
 #include "internal.h"
 
-/* CPU moves hold the transaction lock before the ownership lock. */
+/* Lock order: transaction -> route write -> ownership -> resources. */
 static DEFINE_MUTEX(mk_cpu_transaction_mutex);
 static DEFINE_MUTEX(mk_cpu_ownership_mutex);
 
@@ -42,6 +42,55 @@ void mk_cpu_ownership_unlock(void)
 void mk_cpu_ownership_assert_held(void)
 {
 	lockdep_assert_held(&mk_cpu_ownership_mutex);
+}
+
+static int __mk_instance_migrate_irq_route(struct mk_instance *instance,
+					   const struct mk_cpu_set *removing)
+{
+	mk_phys_cpu_t replacement = MK_PHYS_CPU_INVALID;
+	mk_phys_cpu_t route_cpu;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+
+	lockdep_assert_held_write(&instance->control_route_sem);
+	route_cpu = mk_instance_irq_route_load(instance);
+	if (route_cpu == MK_PHYS_CPU_INVALID ||
+	    !mk_cpu_set_contains(removing, route_cpu))
+		return 0;
+
+	mk_cpu_ownership_lock();
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		if (!mk_cpu_set_contains(removing, phys_cpu)) {
+			replacement = phys_cpu;
+			break;
+		}
+	}
+	mk_cpu_ownership_unlock();
+	if (replacement == MK_PHYS_CPU_INVALID &&
+	    READ_ONCE(instance->state) == MK_STATE_ACTIVE)
+		return -EBUSY;
+
+	mutex_lock(&instance->resource_mutex);
+	if (replacement != MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, replacement);
+	mk_pci_sync_instance_irq_route(instance);
+	if (replacement == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
+	mutex_unlock(&instance->resource_mutex);
+	return 0;
+}
+
+int mk_instance_migrate_irq_route(struct mk_instance *instance,
+				  const struct mk_cpu_set *removing)
+{
+	int ret;
+
+	if (!instance || !removing)
+		return -EINVAL;
+	down_write(&instance->control_route_sem);
+	ret = __mk_instance_migrate_irq_route(instance, removing);
+	up_write(&instance->control_route_sem);
+	return ret;
 }
 
 static void mk_instance_return_all_cpus(struct mk_instance *instance)
@@ -224,6 +273,17 @@ void mk_instance_set_state(struct mk_instance *instance,
 	 */
 }
 
+void mk_instance_mark_failed(struct mk_instance *instance)
+{
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	mk_instance_set_state(instance, MK_STATE_FAILED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+}
+
 struct mk_instance *mk_instance_find_by_name(const char *name)
 {
 	struct mk_instance *instance;
@@ -377,8 +437,10 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *snapshot;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
+	int logical_cpu;
 	int unavailable = 0;
 	char buf[256];
 	int ret;
@@ -387,15 +449,25 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 		pr_err("Invalid CPU sets for transfer\n");
 		return -EINVAL;
 	}
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, cpus);
+	if (ret)
+		goto unlock;
 
-	requested_count = mk_cpu_set_count(cpus);
+	requested_count = mk_cpu_set_count(snapshot);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested for instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto unlock;
 	}
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		if (!mk_cpu_set_contains(mk_cpu_pool, phys_cpu)) {
 			pr_err("CPU %llu not available in the pool\n",
 			       phys_cpu);
@@ -403,8 +475,13 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			continue;
 		}
 
-		if (arch_cpu_from_physical_id(phys_cpu) < 0) {
+		logical_cpu = arch_cpu_from_physical_id(phys_cpu);
+		if (logical_cpu < 0) {
 			pr_err("Physical CPU %llu not found in logical CPU map\n",
+			       phys_cpu);
+			unavailable++;
+		} else if (logical_cpu == 0) {
+			pr_err("Physical CPU %llu is reserved for host control\n",
 			       phys_cpu);
 			unavailable++;
 		}
@@ -413,23 +490,33 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 	if (unavailable > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not available\n",
 		       instance->id, instance->name, unavailable);
-		return -EBUSY;
+		ret = -EBUSY;
+		goto unlock;
 	}
 
 	ret = mk_cpu_set_reserve(instance->cpus, requested_count);
 	if (ret)
-		return ret;
+		goto unlock;
 
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_cpu_set_del(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_add(instance->cpus, phys_cpu);
 	}
+	if (mk_instance_irq_route_load(instance) == MK_PHYS_CPU_INVALID)
+		mk_instance_irq_route_store(instance,
+					    mk_cpu_set_first(instance->cpus));
 
 	mk_cpu_set_format(buf, sizeof(buf), instance->cpus);
 	pr_info("Transferred %u CPUs from pool to instance %d (%s): %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+	ret = 0;
+unlock:
+	mk_cpu_ownership_unlock();
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(snapshot);
+	return ret;
 }
 
 /**
@@ -445,6 +532,7 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus)
 {
+	struct mk_cpu_set *snapshot;
 	unsigned int i, requested_count;
 	mk_phys_cpu_t phys_cpu;
 	int not_found = 0;
@@ -455,16 +543,26 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 		pr_err("Invalid CPU sets for return\n");
 		return -EINVAL;
 	}
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mk_cpu_ownership_lock();
+	ret = mk_cpu_set_copy(snapshot, cpus);
+	if (ret)
+		goto unlock;
 
-	requested_count = mk_cpu_set_count(cpus);
+	requested_count = mk_cpu_set_count(snapshot);
 	if (requested_count == 0) {
 		pr_info("No CPUs requested to return from instance %d (%s)\n",
 			instance->id, instance->name);
-		return 0;
+		ret = 0;
+		goto unlock;
 	}
 
 	/* Validate all CPUs are assigned to this instance */
-	mk_cpu_set_for_each(i, phys_cpu, cpus) {
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		if (!mk_cpu_set_contains(instance->cpus, phys_cpu)) {
 			pr_err("CPU %llu not assigned to instance %d (%s)\n",
 			       phys_cpu, instance->id, instance->name);
@@ -475,22 +573,21 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	if (not_found > 0) {
 		pr_err("Instance %d (%s): %d CPUs are not assigned to this instance\n",
 		       instance->id, instance->name, not_found);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto unlock;
 	}
 
 	ret = mk_cpu_set_reserve(mk_cpu_pool, requested_count);
 	if (ret)
-		return ret;
+		goto unlock;
 
-	mk_cpu_set_format(buf, sizeof(buf), cpus);
-
-	/*
-	 * @cpus may alias instance->cpus (returning everything on
-	 * teardown), so walk it back-to-front: a deletion then never
-	 * shifts entries the walk has yet to visit.
-	 */
-	for (i = requested_count; i-- > 0; ) {
-		phys_cpu = cpus->ids[i];
+	mk_cpu_set_format(buf, sizeof(buf), snapshot);
+	mk_cpu_ownership_unlock();
+	ret = __mk_instance_migrate_irq_route(instance, snapshot);
+	if (ret)
+		goto unlock_route;
+	mk_cpu_ownership_lock();
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		mk_cpu_set_add(mk_cpu_pool, phys_cpu);
 		mk_cpu_set_del(instance->cpus, phys_cpu);
 	}
@@ -498,7 +595,14 @@ int mk_instance_return_cpus(struct mk_instance *instance,
 	pr_info("Returned %u CPUs from instance %d (%s) to the pool: %s\n",
 		requested_count, instance->id, instance->name, buf);
 
-	return 0;
+	ret = 0;
+unlock:
+	mk_cpu_ownership_unlock();
+unlock_route:
+	up_write(&instance->control_route_sem);
+	mk_cpu_transaction_unlock();
+	mk_cpu_set_free(snapshot);
+	return ret;
 }
 
 static int mk_instance_reserve_cpus(struct mk_instance *instance,
@@ -1334,11 +1438,21 @@ static void mk_shutdown_work_fn(struct work_struct *work)
  * it corrupts the single-producer mailbox. The kexec path confirms the
  * CPUs are parked before it rewrites the image.
  */
-static void mk_instance_settle_halted(struct mk_instance *instance)
+static void mk_instance_settle_halted(struct mk_instance *instance,
+				      bool transaction_held)
 {
 	pr_info("Instance %d (%s) halted, CPUs parking in pool\n",
 		instance->id, instance->name);
+	if (!transaction_held)
+		mk_cpu_transaction_lock();
+	down_write(&instance->control_route_sem);
+	mutex_lock(&instance->resource_mutex);
+	mk_instance_irq_route_store(instance, MK_PHYS_CPU_INVALID);
 	mk_instance_set_state(instance, MK_STATE_LOADED);
+	mutex_unlock(&instance->resource_mutex);
+	up_write(&instance->control_route_sem);
+	if (!transaction_held)
+		mk_cpu_transaction_unlock();
 }
 
 struct mk_halted_work {
@@ -1354,7 +1468,7 @@ static void mk_halted_work_fn(struct work_struct *work)
 
 	instance = mk_instance_find(aw->instance_id);
 	if (instance) {
-		mk_instance_settle_halted(instance);
+		mk_instance_settle_halted(instance, false);
 		mk_instance_put(instance);
 	} else {
 		pr_warn("Shutdown ACK from unknown instance %d\n",
@@ -1482,7 +1596,7 @@ int multikernel_halt_by_id(int mk_id)
 			pr_warn("Multikernel instance %d halted with CPUs unaccounted for\n",
 				mk_id);
 
-		mk_instance_set_state(instance, MK_STATE_LOADED);
+		mk_instance_settle_halted(instance, false);
 		pr_info("Multikernel instance %d halted (graceful)\n", mk_id);
 	}
 
@@ -1508,7 +1622,9 @@ static int __mk_instance_force_halt(struct mk_instance *instance,
 	 * a rerun the instance is stuck for good.
 	 */
 	if (instance->state != MK_STATE_ACTIVE &&
-	    (!allow_loaded || instance->state != MK_STATE_LOADED)) {
+	    (!allow_loaded ||
+	     (instance->state != MK_STATE_LOADED &&
+	      instance->state != MK_STATE_FAILED))) {
 		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
 			instance->id, instance->state);
 		return -EINVAL;
@@ -1542,7 +1658,7 @@ static int __mk_instance_force_halt(struct mk_instance *instance,
 		return ret;
 	}
 
-	mk_instance_settle_halted(instance);
+	mk_instance_settle_halted(instance, false);
 	return 0;
 }
 
@@ -1552,7 +1668,7 @@ int mk_instance_abort_spawn(struct mk_instance *instance)
 
 	ret = __mk_instance_force_halt(instance, true);
 	if (ret && instance)
-		mk_instance_set_state(instance, MK_STATE_FAILED);
+		mk_instance_mark_failed(instance);
 	return ret;
 }
 

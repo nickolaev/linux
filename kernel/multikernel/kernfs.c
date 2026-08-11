@@ -269,6 +269,8 @@ int mk_create_instance_from_dtb(const char *name, int id, const void *fdt,
 
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
+	init_rwsem(&instance->control_route_sem);
+	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->pci_devices);
 	mk_pci_lease_instance_init(instance);
 	INIT_LIST_HEAD(&instance->platform_devices);
