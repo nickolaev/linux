@@ -581,7 +581,8 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 		fdt_for_each_subnode(item_node, fdt, op_node) {
 			const char *name = fdt_get_name(fdt, item_node, NULL);
 			const char *pci_id_str;
-			unsigned int domain, bus, slot, func;
+			u16 domain;
+			u8 bus, slot, func;
 
 			if (strncmp(name, "pci@", 4) != 0)
 				continue;
@@ -593,9 +594,12 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s'\n",
+				       len, pci_id_str);
+				return ret;
 			}
 
 			pr_info("Overlay tx%d: -device %04x:%02x:%02x.%x from %s\n",
@@ -624,7 +628,8 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 			const char *name = fdt_get_name(fdt, item_node, NULL);
 			const char *pci_id_str;
 			const char *driver_name = NULL;
-			unsigned int domain, bus, slot, func;
+			u16 domain;
+			u8 bus, slot, func;
 			u32 flags = 0;
 
 			if (strncmp(name, "pci@", 4) != 0)
@@ -637,9 +642,12 @@ static int mk_overlay_parse_and_apply(struct mk_overlay_tx *tx,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s'\n",
+				       len, pci_id_str);
+				return ret;
 			}
 
 			/* Get optional driver override */
@@ -799,7 +807,8 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 		fdt_for_each_subnode(item_node, fdt, op_node) {
 			const char *name = fdt_get_name(fdt, item_node, NULL);
 			const char *pci_id_str;
-			unsigned int domain, bus, slot, func;
+			u16 domain;
+			u8 bus, slot, func;
 
 			if (strncmp(name, "pci@", 4) != 0)
 				continue;
@@ -810,9 +819,12 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s'\n",
+				       len, pci_id_str);
+				return ret;
 			}
 
 			pr_info("Rollback tx%d: -device %04x:%02x:%02x.%x from %s\n",
@@ -845,7 +857,8 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 			const char *name = fdt_get_name(fdt, item_node, NULL);
 			const char *pci_id_str;
 			const char *driver_name = NULL;
-			unsigned int domain, bus, slot, func;
+			u16 domain;
+			u8 bus, slot, func;
 			u32 flags = 0;
 
 			if (strncmp(name, "pci@", 4) != 0)
@@ -857,9 +870,12 @@ static int mk_overlay_parse_and_rollback(struct mk_overlay_tx *tx,
 				return -EINVAL;
 			}
 
-			if (sscanf(pci_id_str, "%x:%x:%x.%x", &domain, &bus, &slot, &func) != 4) {
-				pr_err("Invalid pci-id format '%s'\n", pci_id_str);
-				return -EINVAL;
+			ret = mk_pci_parse_bdf(pci_id_str, len, &domain, &bus,
+					       &slot, &func);
+			if (ret) {
+				pr_err("Invalid or out-of-range pci-id '%.*s'\n",
+				       len, pci_id_str);
+				return ret;
 			}
 
 			/* Get optional driver override */

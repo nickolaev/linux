@@ -26,7 +26,8 @@ int mk_dt_parse_resources(const void *fdt, int resources_node,
 			  const char *instance_name, struct mk_dt_config *config);
 int mk_dt_generate_instance_dtb(struct mk_instance *instance,
 				 void **out_dtb, size_t *out_size);
-
+int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
+		     u8 *slot, u8 *func);
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 int mk_overlay_init(void);
