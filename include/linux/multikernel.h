@@ -585,6 +585,13 @@ struct mk_memory_region {
  * Format: vendor:device@domain:bus:slot.func
  */
 #define MK_PCI_ALIAS_LEN 32	/* Devicetree spec: alias names are at most 31 chars */
+#define MK_PCI_RESOURCE_COUNT 6
+
+struct mk_pci_resource {
+	u64 start;
+	u64 end;
+	u64 flags;
+};
 
 /*
  * A PCI host bridge as the instance device tree describes it: the
@@ -602,6 +609,8 @@ struct mk_pci_device {
 	u8 bus;            /* PCI bus number */
 	u8 slot;           /* PCI slot number */
 	u8 func;           /* PCI function number */
+	struct mk_pci_resource resources[MK_PCI_RESOURCE_COUNT];
+	bool resources_valid;
 	struct list_head list;  /* Link to device list */
 };
 

@@ -279,6 +279,17 @@ static int __init mk_copy_platform_devices(const struct mk_dt_config *config,
 	return 0;
 }
 
+static void __init mk_take_pci_devices(struct mk_dt_config *config,
+				       struct mk_instance *instance)
+{
+	list_splice_tail_init(&config->pci_devices, &instance->pci_devices);
+	instance->pci_device_count = config->pci_device_count;
+	instance->pci_devices_valid = config->pci_devices_valid;
+
+	config->pci_device_count = 0;
+	config->pci_devices_valid = false;
+}
+
 /* A message ring the host describes in /chosen: its address and size */
 static bool __init mk_chosen_ring(const char *what, phys_addr_t *phys,
 				  u32 *pages)
@@ -528,8 +539,8 @@ int __init mk_instance_restore_from_manifest(void)
 		goto cleanup_instance;
 	}
 
-	/* The tree is the record of this kernel's PCI devices; the list stays empty */
-	instance->pci_devices_valid = true;
+	/* Config entries become this kernel's assigned-device allowlist. */
+	mk_take_pci_devices(&config, instance);
 
 	ret = mk_copy_platform_devices(&config, instance);
 	if (ret) {
