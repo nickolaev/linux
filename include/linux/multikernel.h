@@ -84,10 +84,54 @@ void mk_cpu_transaction_unlock(void);
 /* IPI ring buffer size - must be power of 2 for efficient modulo */
 #define MK_IPI_RING_SIZE 64
 
+#define MK_REPLY_SLOTS		16
+#define MK_REPLY_STATE_BITS	3
+
+enum mk_reply_state {
+	MK_REPLY_FREE = 0,
+	MK_REPLY_RESERVED,
+	MK_REPLY_WRITING,
+	MK_REPLY_EXECUTING,
+	MK_REPLY_COMMITTED,
+	MK_REPLY_READY,
+	MK_REPLY_ABANDONED,
+};
+
+enum mk_reply_kind {
+	MK_REPLY_PCI_CFG = 1,
+	MK_REPLY_PCI_IRQ,
+};
+
+struct mk_reply_slot {
+	atomic64_t state_generation;
+	u64 request_id;
+	u32 kind;
+	s32 status;
+	u32 value;
+	u32 reserved;
+};
+
+struct mk_reply_table {
+	struct mk_reply_slot slots[MK_REPLY_SLOTS];
+	atomic_t late_replies;
+	atomic_t cancelled_slots;
+	atomic_t atomic_timeouts;
+	atomic_t indeterminate_timeouts;
+	atomic_t occupied_failures;
+};
+
+struct mk_reply_handle {
+	u32 slot;
+	u32 kind;
+	u64 request_id;
+	u64 generation;
+};
+
 /* Data structure for passing parameters via IPI */
 struct mk_ipi_data {
 	u32 ready;
 	u64 sender_cpu;          /* Physical ID of the CPU that sent this IPI */
+	s32 sender_instance_id;  /* Receiver-authenticated duplex peer */
 	unsigned int type;       /* User-defined type identifier */
 	size_t data_size;        /* Size of the data */
 	char buffer[MK_MAX_DATA_SIZE]; /* Actual data buffer */
@@ -134,7 +178,29 @@ struct mk_shared_data {
 	u32 reserved;
 	u64 parent_doorbell_cpu;
 	u64 child_doorbell_cpu;
+	/* Changes on every launch; zero means the link has not been launched. */
+	u64 spawn_epoch;
+	/* Generation-tagged synchronous replies, independent of ring progress. */
+	struct mk_reply_table replies;
 };
+
+static inline void mk_reply_table_reset(struct mk_reply_table *table)
+{
+	unsigned int i;
+
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		atomic64_set(&table->slots[i].state_generation, MK_REPLY_FREE);
+		WRITE_ONCE(table->slots[i].request_id, 0);
+		WRITE_ONCE(table->slots[i].kind, 0);
+		WRITE_ONCE(table->slots[i].status, 0);
+		WRITE_ONCE(table->slots[i].value, 0);
+	}
+	atomic_set(&table->late_replies, 0);
+	atomic_set(&table->cancelled_slots, 0);
+	atomic_set(&table->atomic_timeouts, 0);
+	atomic_set(&table->indeterminate_timeouts, 0);
+	atomic_set(&table->occupied_failures, 0);
+}
 
 static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
 {
@@ -146,12 +212,18 @@ static inline void mk_ipi_ring_reset(struct mk_ipi_ring *ring)
 
 static inline void mk_shared_data_reset(struct mk_shared_data *shared)
 {
+	unsigned int i;
+
 	mk_ipi_ring_reset(&shared->to_child);
 	mk_ipi_ring_reset(&shared->to_parent);
 	WRITE_ONCE(shared->force_halt, 0);
+	for (i = 0; i < MK_PARKED_MAX; i++)
+		WRITE_ONCE(shared->parked[i], 0);
+	mk_reply_table_reset(&shared->replies);
 }
 
 struct mk_ipi_endpoint {
+	struct mk_instance *peer;
 	struct mk_ipi_ring *tx;
 	struct mk_ipi_ring *rx;
 	raw_spinlock_t tx_lock;
@@ -216,6 +288,23 @@ void mk_ipi_link_reset(struct mk_instance *instance, int parent_id,
 		       int child_id, mk_phys_cpu_t parent_cpu,
 		       mk_phys_cpu_t child_cpu);
 void mk_ipi_handlers_enable(void);
+int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
+		     struct mk_reply_handle *reply);
+int mk_reply_claim(struct mk_instance *instance,
+		   const struct mk_reply_handle *reply);
+int mk_reply_begin_execute(struct mk_instance *instance,
+			   const struct mk_reply_handle *reply);
+int mk_reply_publish(struct mk_instance *instance,
+		     const struct mk_reply_handle *reply, s32 status, u32 value);
+int mk_reply_wait_atomic(struct mk_shared_data *shared,
+			 struct mk_reply_handle *reply, unsigned int timeout_us,
+			 s32 *status, u32 *value);
+int mk_reply_wait(struct mk_shared_data *shared,
+		  struct mk_reply_handle *reply, unsigned int timeout_ms,
+		  s32 *status, u32 *value);
+void mk_reply_release(struct mk_shared_data *shared,
+		      struct mk_reply_handle *reply);
+void mk_reply_scan(struct mk_shared_data *shared);
 
 /*
  * Multikernel Messaging System

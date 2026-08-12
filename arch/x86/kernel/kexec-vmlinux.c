@@ -65,6 +65,7 @@ struct elf_kernel_info {
  * The note type carries the generation; the descriptor remains one u64.
  */
 #define MK_VMLINUX_LEGACY_NOTE_TYPE	0x4d4b
+#define MK_VMLINUX_PREVIOUS_NOTE_TYPE	0x4d4b0002
 
 static int find_multikernel_entry_note(const void *buf, size_t len,
 				       const Elf64_Ehdr *ehdr,
@@ -108,7 +109,8 @@ static int find_multikernel_entry_note(const void *buf, size_t len,
 						*note_entry);
 					return 0;
 				}
-				if (nhdr->n_type == MK_VMLINUX_LEGACY_NOTE_TYPE)
+				if (nhdr->n_type == MK_VMLINUX_LEGACY_NOTE_TYPE ||
+				    nhdr->n_type == MK_VMLINUX_PREVIOUS_NOTE_TYPE)
 					legacy = true;
 			}
 			ptr += note_size;
