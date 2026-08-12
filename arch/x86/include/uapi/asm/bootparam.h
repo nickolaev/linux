@@ -25,6 +25,8 @@
 #define XLF_5LEVEL			(1<<5)
 #define XLF_5LEVEL_ENABLED		(1<<6)
 #define XLF_MEM_ENCRYPTION		(1<<7)
+#define XLF_MULTIKERNEL_IPI_V2		0x0100
+#define XLF_MULTIKERNEL_IPI_V3		0x0200
 
 #ifndef __ASSEMBLER__
 

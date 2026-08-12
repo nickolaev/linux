@@ -313,6 +313,7 @@ bool multikernel_allow_emergency_restart(void)
  */
 int mk_instance_confirm_parked(struct mk_instance *instance)
 {
+	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
 	int ret, failed = 0;
@@ -320,8 +321,19 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 	/* Never started, so nothing of it is running */
 	if (!instance->spawn_ctx)
 		return 0;
+	if (!instance->cpus_on_slot)
+		return 0;
 
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus_on_slot) {
+	snapshot = mk_cpu_set_alloc();
+	if (!snapshot)
+		return -ENOMEM;
+	ret = mk_cpu_set_copy(snapshot, instance->cpus_on_slot);
+	if (ret) {
+		mk_cpu_set_free(snapshot);
+		return ret;
+	}
+
+	mk_cpu_set_for_each(i, phys_cpu, snapshot) {
 		ret = mk_arch_confirm_parked(instance, phys_cpu);
 		if (ret) {
 			pr_err("Instance %d (%s): CPU %llu is not parked: %d\n",
@@ -329,6 +341,15 @@ int mk_instance_confirm_parked(struct mk_instance *instance)
 			failed++;
 		}
 	}
+	if (!failed) {
+		ret = mk_ipi_ring_recover_halted(snapshot);
+		if (ret) {
+			pr_err("Instance %d (%s): failed to recover halted IPI producer: %d\n",
+			       instance->id, instance->name, ret);
+			failed++;
+		}
+	}
+	mk_cpu_set_free(snapshot);
 
 	return failed ? -EBUSY : 0;
 }
@@ -1335,6 +1356,71 @@ int multikernel_halt_by_id(int mk_id)
 	return ret;
 }
 
+static int __mk_instance_force_halt(struct mk_instance *instance,
+				    bool allow_loaded)
+{
+	struct mk_shutdown_payload payload;
+	mk_phys_cpu_t phys_cpu;
+	unsigned int i;
+	int cpu_count = 0;
+	int ret;
+
+	if (!instance)
+		return -EINVAL;
+
+	if (instance->state != MK_STATE_ACTIVE &&
+	    (!allow_loaded || instance->state != MK_STATE_LOADED)) {
+		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
+			instance->id, instance->state);
+		return -EINVAL;
+	}
+
+	if (mk_cpu_set_empty(instance->cpus)) {
+		pr_err("Instance %d has no CPUs assigned\n", instance->id);
+		return -EINVAL;
+	}
+
+	pr_info("Force halting multikernel instance %d via NMI\n",
+		instance->id);
+
+	/* Queue shutdown message - NMI handler will check for this */
+	payload.flags = MK_SHUTDOWN_IMMEDIATE;
+	payload.sender_instance_id = root_instance->id;
+	ret = mk_send_message(instance->id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
+			      &payload, sizeof(payload));
+	if (ret < 0)
+		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n", ret);
+
+	/* Send NMI to each CPU in the instance */
+	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
+		mk_force_stop_cpu(phys_cpu);
+		cpu_count++;
+	}
+
+	pr_info("Sent NMI to %d CPUs in instance %d\n",
+		cpu_count, instance->id);
+
+	ret = mk_instance_confirm_parked(instance);
+	if (ret) {
+		pr_err("Instance %d CPUs did not park after force halt: %d\n",
+		       instance->id, ret);
+		return ret;
+	}
+
+	mk_instance_settle_halted(instance);
+	return 0;
+}
+
+int mk_instance_abort_spawn(struct mk_instance *instance)
+{
+	int ret;
+
+	ret = __mk_instance_force_halt(instance, true);
+	if (ret && instance)
+		mk_instance_set_state(instance, MK_STATE_FAILED);
+	return ret;
+}
+
 /**
  * mk_instance_force_halt - Forcibly stop an instance via NMI
  * @instance: Instance to stop
@@ -1350,43 +1436,7 @@ int multikernel_halt_by_id(int mk_id)
  */
 int mk_instance_force_halt(struct mk_instance *instance)
 {
-	struct mk_shutdown_payload payload;
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
-	int cpu_count = 0;
-	int ret;
-
-	if (instance->state != MK_STATE_ACTIVE) {
-		pr_err("Instance %d not active (state=%d), nothing to force halt\n",
-			instance->id, instance->state);
-		return -EINVAL;
-	}
-
-	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", instance->id);
-		return -EINVAL;
-	}
-
-	pr_info("Force halting multikernel instance %d via NMI\n",
-		instance->id);
-
-	payload.flags = MK_SHUTDOWN_IMMEDIATE;
-	payload.sender_instance_id = root_instance->id;
-	ret = mk_send_message(instance->id, MK_MSG_SYSTEM, MK_SYS_SHUTDOWN,
-			      &payload, sizeof(payload));
-	if (ret < 0)
-		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n",
-			ret);
-
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
-		mk_force_stop_cpu(phys_cpu);
-		cpu_count++;
-	}
-
-	pr_info("Sent NMI to %d CPUs in instance %d\n", cpu_count,
-		instance->id);
-	mk_instance_settle_halted(instance);
-	return 0;
+	return __mk_instance_force_halt(instance, false);
 }
 
 int multikernel_force_halt_by_id(int mk_id)
@@ -1397,7 +1447,6 @@ int multikernel_force_halt_by_id(int mk_id)
 	instance = mk_instance_find(mk_id);
 	if (!instance)
 		return -ENOENT;
-
 	ret = mk_instance_force_halt(instance);
 	mk_instance_put(instance);
 	return ret;
@@ -1450,6 +1499,17 @@ static int __init multikernel_init(void)
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
 		mk_messaging_cleanup();
 		mk_pci_lease_system_cleanup();
+		return ret;
+	}
+
+	ret = mk_ipi_shared_mark_ready(root_instance->ipi_data,
+				       root_instance->id);
+	if (ret < 0) {
+		pr_err("Failed to publish multikernel IPI readiness: %d\n", ret);
+		mk_kernfs_cleanup();
+		mk_hotplug_cleanup();
+		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		mk_messaging_cleanup();
 		return ret;
 	}
 
