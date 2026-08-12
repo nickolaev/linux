@@ -104,11 +104,14 @@ struct mk_spawn_context {
 	unsigned long boot_cpu_khz;	/* Host CPU frequency calibration */
 	unsigned long boot_tsc_khz;	/* Host TSC frequency calibration */
 	unsigned long boot_apic_hz;	/* Host local APIC timer frequency */
+	u64 abi_magic;			/* Validated context producer */
 } __aligned(PAGE_SIZE);
 
 static_assert(offsetof(struct mk_spawn_context, bp) == 144);
 static_assert(offsetof(struct mk_spawn_context, boot_lps) ==
 	      144 + sizeof(struct boot_params));
+static_assert(offsetof(struct mk_spawn_context, abi_magic) ==
+	      144 + sizeof(struct boot_params) + 4 * sizeof(unsigned long));
 static_assert(sizeof(struct mk_spawn_context) == 2 * PAGE_SIZE);
 
 /* Pool park loop code, copied by the host into per-instance park pages */
@@ -163,7 +166,8 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		 struct mk_spawn_context *ctx);
 
-/* Initialize boot context tracking in spawn kernel */
+/* Validate and initialize boot context tracking in spawn kernel */
+struct mk_spawn_context *mk_validate_boot_context(phys_addr_t ctx_phys);
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
 /* Identity page table and trampoline setup */
