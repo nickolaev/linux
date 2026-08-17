@@ -71,8 +71,11 @@ static unsigned int mk_ipi_gate_index(u64 token)
 }
 
 /*
- * Publish the complete message while local IRQs and preemption are disabled.
- * No NMI path sends general messages; force halt uses emergency_shutdown.
+ * Serialize producers with preemption disabled so the physical owner encoded
+ * in the gate remains stable. Keep local IRQs enabled while waiting for a
+ * producer in another kernel, then disable them only for the short publish
+ * critical section. No NMI path sends general messages; force halt uses
+ * emergency_shutdown.
  * Advancing head before READY lets recovery distinguish both interruption
  * windows without allowing another producer to pass the gate.
  */
@@ -93,7 +96,6 @@ static int mk_ipi_ring_publish(struct mk_shared_data *shared, int instance_id,
 	int ret;
 
 	preempt_disable();
-	local_irq_save(flags);
 	owner = arch_cpu_physical_id(smp_processor_id());
 
 	for (retry = 0; retry < MK_IPI_PRODUCER_RETRIES; retry++) {
@@ -102,7 +104,7 @@ static int mk_ipi_ring_publish(struct mk_shared_data *shared, int instance_id,
 		token = mk_ipi_gate_token(owner, idx);
 		if (!token) {
 			ret = -EOVERFLOW;
-			goto out_restore;
+			goto out_enable;
 		}
 
 		old = atomic64_cmpxchg_acquire(&ring->producer_gate, 0, token);
@@ -128,6 +130,8 @@ static int mk_ipi_ring_publish(struct mk_shared_data *shared, int instance_id,
 		ret = -EAGAIN;
 		goto out_count_contention;
 	}
+
+	local_irq_save(flags);
 	if (contended)
 		atomic_inc(&ring->producer_contention);
 	if (!atomic_read_acquire(&shared->ready) ||
@@ -164,14 +168,14 @@ static int mk_ipi_ring_publish(struct mk_shared_data *shared, int instance_id,
 
 out_release_gate:
 	atomic64_set_release(&ring->producer_gate, 0);
-out_restore:
 	local_irq_restore(flags);
+out_enable:
 	preempt_enable();
 	return ret;
 
 out_count_contention:
 	atomic_inc(&ring->producer_contention);
-	goto out_restore;
+	goto out_enable;
 }
 
 static bool mk_ipi_slot_is_pending(int state)
@@ -246,6 +250,7 @@ int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
 		WRITE_ONCE(slot->kind, kind);
 		WRITE_ONCE(slot->status, -ETIMEDOUT);
 		WRITE_ONCE(slot->value, ~0U);
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation,
 				     mk_reply_token(generation,
 						    MK_REPLY_RESERVED));
@@ -277,6 +282,7 @@ static int mk_reply_take_ready(struct mk_shared_data *shared,
 		*status = READ_ONCE(slot->status);
 	if (value)
 		*value = READ_ONCE(slot->value);
+	WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 	if (atomic64_cmpxchg_release(&slot->state_generation, ready, free) !=
 	    ready)
 		return -EAGAIN;
@@ -305,6 +311,8 @@ static int mk_reply_cancel(struct mk_shared_data *shared,
 		token = atomic64_read_acquire(&slot->state_generation);
 		if (token == ready)
 			return 1;
+		if (token == committed)
+			return -EINPROGRESS;
 		if (token == writing &&
 		    atomic64_cmpxchg_release(&slot->state_generation, writing,
 					     abandoned) == writing)
@@ -414,6 +422,7 @@ int mk_reply_claim(struct mk_instance *instance,
 	u64 abandoned;
 	u64 reserved;
 	u64 free;
+	u32 owner;
 	int ret;
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
@@ -431,8 +440,15 @@ int mk_reply_claim(struct mk_instance *instance,
 	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
 	abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
 	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+	owner = arch_cpu_physical_id(smp_processor_id());
+	if (cmpxchg(&slot->owner_cpu, MK_REPLY_OWNER_INVALID, owner) !=
+	    MK_REPLY_OWNER_INVALID) {
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
 	if (atomic64_cmpxchg_acquire(&slot->state_generation, reserved,
 				     writing) != reserved) {
+		cmpxchg(&slot->owner_cpu, owner, MK_REPLY_OWNER_INVALID);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
@@ -440,6 +456,7 @@ int mk_reply_claim(struct mk_instance *instance,
 	    READ_ONCE(slot->kind) != reply->kind) {
 		u64 old;
 
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
 					       free);
 		if (old == abandoned)
@@ -512,11 +529,13 @@ int mk_reply_publish(struct mk_instance *instance,
 		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
 					       ready);
 	if (old == abandoned) {
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
 	if (old == committed) {
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
@@ -592,7 +611,6 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared)
 	smp_mb();
 	ring = &shared->ring;
 	preempt_disable();
-	local_irq_save(flags);
 	owner = arch_cpu_physical_id(smp_processor_id());
 	for (retry = 0; retry < MK_IPI_PRODUCER_RETRIES; retry++) {
 		head = atomic_read(&ring->head);
@@ -600,22 +618,23 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared)
 		token = mk_ipi_gate_token(owner, idx);
 		if (!token) {
 			ret = -EOVERFLOW;
-			goto out_restore;
+			goto out_enable;
 		}
 		old = atomic64_cmpxchg_acquire(&ring->producer_gate, 0, token);
 		if (!old)
 			break;
 		if (mk_ipi_gate_owner(old) == owner) {
 			ret = -EDEADLK;
-			goto out_restore;
+			goto out_enable;
 		}
 		cpu_relax();
 	}
 	if (retry == MK_IPI_PRODUCER_RETRIES) {
 		ret = -EAGAIN;
-		goto out_restore;
+		goto out_enable;
 	}
 
+	local_irq_save(flags);
 	/* The old receiver is parked and every pre-existing publisher drained. */
 	atomic_set(&shared->emergency_shutdown, 0);
 	mk_ipi_ring_reset_contents(ring);
@@ -632,10 +651,44 @@ int mk_ipi_shared_reset_downlink(struct mk_shared_data *shared)
 	atomic_set(&shared->ready, 0);
 	atomic64_set_release(&ring->producer_gate, 0);
 
-out_restore:
 	local_irq_restore(flags);
+out_enable:
 	preempt_enable();
 	return ret;
+}
+
+static void mk_reply_recover_halted(struct mk_shared_data *shared,
+				    const struct mk_cpu_set *halted_cpus)
+{
+	struct mk_reply_table *table = &shared->replies;
+	unsigned int i;
+
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		struct mk_reply_slot *slot = &table->slots[i];
+		enum mk_reply_state state;
+		u64 token, free;
+		u32 owner;
+
+		token = atomic64_read_acquire(&slot->state_generation);
+		state = mk_reply_state(token);
+		if (state != MK_REPLY_RESERVED && state != MK_REPLY_WRITING &&
+		    state != MK_REPLY_EXECUTING && state != MK_REPLY_COMMITTED &&
+		    state != MK_REPLY_ABANDONED)
+			continue;
+
+		owner = READ_ONCE(slot->owner_cpu);
+		if (owner == MK_REPLY_OWNER_INVALID ||
+		    !mk_cpu_set_contains(halted_cpus, owner))
+			continue;
+
+		free = mk_reply_token(mk_reply_generation(token), MK_REPLY_FREE);
+		if (atomic64_cmpxchg_release(&slot->state_generation, token, free) !=
+		    token)
+			continue;
+
+		atomic_inc(&table->cancelled_slots);
+		wake_up_all(&mk_reply_waitq);
+	}
 }
 
 /**
@@ -664,6 +717,7 @@ int mk_ipi_ring_recover_halted(const struct mk_cpu_set *halted_cpus)
 		return -EINVAL;
 
 	ring = &root_instance->ipi_data->ring;
+	mk_reply_recover_halted(root_instance->ipi_data, halted_cpus);
 	token = atomic64_read_acquire(&ring->producer_gate);
 	if (!token)
 		goto kick;
