@@ -169,15 +169,23 @@ static int mk_do_cpu_add(mk_phys_cpu_t cpu_id, u32 numa_node, u32 flags)
 	}
 
 	mk_cpu_ownership_lock();
-	if (root_instance->cpus) {
+	if (!root_instance->cpus) {
+		ret = -ENODEV;
+	} else {
 		ret = mk_cpu_set_add(root_instance->cpus, cpu_id);
 		if (ret)
 			pr_warn("Multikernel hotplug: Failed to track CPU %llu in root pool\n",
 				cpu_id);
 	}
 	mk_cpu_ownership_unlock();
-	if (ret)
+	if (ret) {
+		int rollback_ret = remove_cpu(logical_cpu);
+
+		if (rollback_ret)
+			pr_crit("Multikernel hotplug: CPU %d is online but untracked; rollback failed: %d\n",
+				logical_cpu, rollback_ret);
 		goto unlock_transaction;
+	}
 
 	/* Track the operation for potential rollback */
 	op = kzalloc(sizeof(*op), GFP_KERNEL);

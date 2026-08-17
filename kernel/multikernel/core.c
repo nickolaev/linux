@@ -219,10 +219,16 @@ static void mk_instance_release(struct kref *kref)
 	ret = mk_instance_release_resources(instance);
 	if (WARN_ON_ONCE(ret)) {
 		/*
-		 * A failed PCI release can leave assignments linked to this
-		 * instance.  Retain the backing object rather than leave those
-		 * assignments with a dangling instance pointer.
+		 * The release callback runs after kref_put() reaches zero.  A
+		 * failed PCI release can leave assignments linked to this instance,
+		 * so restore an owning reference before retaining the object.  This
+		 * keeps a still-published instance findable and prevents a later
+		 * lookup from trying to resurrect a zero reference.
+		 *
+		 * Normal removal releases resources before unlinking the instance,
+		 * so this is only the last-resort fail-safe for an unsafe teardown.
 		 */
+		kref_init(&instance->refcount);
 		pr_crit("Retaining multikernel instance %d (%s) after resource release failed: %d\n",
 			instance->id, instance->name, ret);
 		return;
@@ -237,9 +243,9 @@ static void mk_instance_release(struct kref *kref)
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance)
 {
-	if (instance)
-		kref_get(&instance->refcount);
-	return instance;
+	if (instance && kref_get_unless_zero(&instance->refcount))
+		return instance;
+	return NULL;
 }
 
 void mk_instance_put(struct mk_instance *instance)
@@ -326,7 +332,7 @@ struct mk_instance *mk_instance_find(int mk_id)
 	mutex_lock(&mk_instance_mutex);
 	instance = idr_find(&mk_instance_idr, mk_id);
 	if (instance)
-		mk_instance_get(instance);
+		instance = mk_instance_get(instance);
 	mutex_unlock(&mk_instance_mutex);
 
 	return instance;
