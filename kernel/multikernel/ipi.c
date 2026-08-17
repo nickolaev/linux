@@ -66,6 +66,7 @@ int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
 		WRITE_ONCE(slot->kind, kind);
 		WRITE_ONCE(slot->status, -ETIMEDOUT);
 		WRITE_ONCE(slot->value, ~0U);
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation,
 				     mk_reply_token(generation,
 						    MK_REPLY_RESERVED));
@@ -97,6 +98,7 @@ static int mk_reply_take_ready(struct mk_shared_data *shared,
 		*status = READ_ONCE(slot->status);
 	if (value)
 		*value = READ_ONCE(slot->value);
+	WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 	if (atomic64_cmpxchg_release(&slot->state_generation, ready, free) !=
 	    ready)
 		return -EAGAIN;
@@ -125,6 +127,8 @@ static int mk_reply_cancel(struct mk_shared_data *shared,
 		token = atomic64_read_acquire(&slot->state_generation);
 		if (token == ready)
 			return 1;
+		if (token == committed)
+			return -EINPROGRESS;
 		if (token == writing &&
 		    atomic64_cmpxchg_release(&slot->state_generation, writing,
 					     abandoned) == writing)
@@ -234,6 +238,7 @@ int mk_reply_claim(struct mk_instance *instance,
 	u64 abandoned;
 	u64 reserved;
 	u64 free;
+	mk_phys_cpu_t owner;
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
 		return -EINVAL;
@@ -246,8 +251,15 @@ int mk_reply_claim(struct mk_instance *instance,
 	writing = mk_reply_token(reply->generation, MK_REPLY_WRITING);
 	abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
 	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
+	owner = arch_cpu_physical_id(smp_processor_id());
+	if (cmpxchg(&slot->owner_cpu, MK_REPLY_OWNER_INVALID, owner) !=
+	    MK_REPLY_OWNER_INVALID) {
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
+	}
 	if (atomic64_cmpxchg_acquire(&slot->state_generation, reserved,
 				     writing) != reserved) {
+		cmpxchg(&slot->owner_cpu, owner, MK_REPLY_OWNER_INVALID);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
@@ -255,6 +267,7 @@ int mk_reply_claim(struct mk_instance *instance,
 	    READ_ONCE(slot->kind) != reply->kind) {
 		u64 old;
 
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
 					       free);
 		if (old == abandoned)
@@ -325,11 +338,13 @@ int mk_reply_publish(struct mk_instance *instance,
 		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
 					       ready);
 	if (old == abandoned) {
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
 	if (old == committed) {
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation, free);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
@@ -360,6 +375,44 @@ void mk_reply_scan(struct mk_shared_data *shared)
 			wake_up_all(&mk_reply_waitq);
 			return;
 		}
+	}
+}
+
+void mk_reply_recover_halted(struct mk_shared_data *shared,
+			     const struct mk_cpu_set *halted_cpus)
+{
+	struct mk_reply_table *table;
+	unsigned int i;
+
+	if (!shared || !halted_cpus)
+		return;
+	table = &shared->replies;
+	for (i = 0; i < MK_REPLY_SLOTS; i++) {
+		struct mk_reply_slot *slot = &table->slots[i];
+		enum mk_reply_state state;
+		mk_phys_cpu_t owner;
+		u64 token, free;
+
+		token = atomic64_read_acquire(&slot->state_generation);
+		state = mk_reply_state(token);
+		if (state != MK_REPLY_RESERVED && state != MK_REPLY_WRITING &&
+		    state != MK_REPLY_EXECUTING && state != MK_REPLY_COMMITTED &&
+		    state != MK_REPLY_ABANDONED)
+			continue;
+
+		owner = READ_ONCE(slot->owner_cpu);
+		if (owner == MK_REPLY_OWNER_INVALID ||
+		    !mk_cpu_set_contains(halted_cpus, owner))
+			continue;
+
+		free = mk_reply_token(mk_reply_generation(token), MK_REPLY_FREE);
+		if (atomic64_cmpxchg_release(&slot->state_generation, token, free) !=
+		    token)
+			continue;
+
+		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
+		atomic_inc(&table->cancelled_slots);
+		wake_up_all(&mk_reply_waitq);
 	}
 }
 
