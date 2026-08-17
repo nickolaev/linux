@@ -82,6 +82,7 @@ bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 
 #define MK_REPLY_SLOTS		16
 #define MK_REPLY_STATE_BITS	3
+#define MK_REPLY_OWNER_INVALID	U32_MAX
 #define MK_IRQ_MAILBOX_SLOTS	256
 #define MK_IRQ_MAILBOX_WORDS	(MK_IRQ_MAILBOX_SLOTS / 64)
 #define MK_IRQ_MAILBOX_SLOT_INVALID	((u32)~0U)
@@ -112,7 +113,7 @@ struct mk_reply_slot {
 	u32 kind;
 	s32 status;
 	u32 value;
-	u32 reserved;
+	u32 owner_cpu;
 };
 
 struct mk_reply_table {
@@ -244,6 +245,7 @@ static inline void mk_reply_table_reset(struct mk_reply_table *table)
 		WRITE_ONCE(table->slots[i].kind, 0);
 		WRITE_ONCE(table->slots[i].status, 0);
 		WRITE_ONCE(table->slots[i].value, 0);
+		WRITE_ONCE(table->slots[i].owner_cpu, MK_REPLY_OWNER_INVALID);
 	}
 	atomic_set(&table->late_replies, 0);
 	atomic_set(&table->cancelled_slots, 0);
