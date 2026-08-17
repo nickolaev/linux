@@ -66,7 +66,7 @@ int mk_reply_reserve(struct mk_shared_data *shared, u32 kind, u64 request_id,
 		WRITE_ONCE(slot->kind, kind);
 		WRITE_ONCE(slot->status, -ETIMEDOUT);
 		WRITE_ONCE(slot->value, ~0U);
-		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
+		atomic64_set(&slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic64_set_release(&slot->state_generation,
 				     mk_reply_token(generation,
 						    MK_REPLY_RESERVED));
@@ -98,7 +98,7 @@ static int mk_reply_take_ready(struct mk_shared_data *shared,
 		*status = READ_ONCE(slot->status);
 	if (value)
 		*value = READ_ONCE(slot->value);
-	WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
+	atomic64_set(&slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 	if (atomic64_cmpxchg_release(&slot->state_generation, ready, free) !=
 	    ready)
 		return -EAGAIN;
@@ -238,7 +238,7 @@ int mk_reply_claim(struct mk_instance *instance,
 	u64 abandoned;
 	u64 reserved;
 	u64 free;
-	mk_phys_cpu_t owner;
+	u64 owner;
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
 		return -EINVAL;
@@ -252,14 +252,15 @@ int mk_reply_claim(struct mk_instance *instance,
 	abandoned = mk_reply_token(reply->generation, MK_REPLY_ABANDONED);
 	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
 	owner = arch_cpu_physical_id(smp_processor_id());
-	if (cmpxchg(&slot->owner_cpu, MK_REPLY_OWNER_INVALID, owner) !=
+	if (atomic64_cmpxchg_acquire(&slot->owner_cpu,
+				     MK_REPLY_OWNER_INVALID, owner) !=
 	    MK_REPLY_OWNER_INVALID) {
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
 	if (atomic64_cmpxchg_acquire(&slot->state_generation, reserved,
 				     writing) != reserved) {
-		cmpxchg(&slot->owner_cpu, owner, MK_REPLY_OWNER_INVALID);
+		/* Reservation resets stale ownership before it can be reused. */
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
@@ -267,7 +268,6 @@ int mk_reply_claim(struct mk_instance *instance,
 	    READ_ONCE(slot->kind) != reply->kind) {
 		u64 old;
 
-		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
 					       free);
 		if (old == abandoned)
@@ -331,27 +331,31 @@ int mk_reply_publish(struct mk_instance *instance,
 	ready = mk_reply_token(reply->generation, MK_REPLY_READY);
 	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
 
-	WRITE_ONCE(slot->status, status);
-	WRITE_ONCE(slot->value, value);
-	old = atomic64_cmpxchg_release(&slot->state_generation, executing, ready);
+	/*
+	 * Claim this exact generation before touching its payload. A timed-out
+	 * publisher may resume after the slot has been reused; writing first would
+	 * corrupt the new request even though the state transition later failed.
+	 */
+	old = atomic64_cmpxchg_acquire(&slot->state_generation, executing,
+				       committed);
 	if (old == writing)
-		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
-					       ready);
+		old = atomic64_cmpxchg_acquire(&slot->state_generation, writing,
+					       committed);
 	if (old == abandoned) {
-		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
-		atomic64_set_release(&slot->state_generation, free);
-		atomic_inc(&shared->replies.late_replies);
-		return -ESTALE;
-	}
-	if (old == committed) {
-		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
-		atomic64_set_release(&slot->state_generation, free);
+		atomic64_cmpxchg_release(&slot->state_generation, abandoned, free);
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
 	if (old != executing && old != writing) {
 		atomic_inc(&shared->replies.late_replies);
 		return -EIO;
+	}
+	WRITE_ONCE(slot->status, status);
+	WRITE_ONCE(slot->value, value);
+	if (atomic64_cmpxchg_release(&slot->state_generation, committed, ready) !=
+	    committed) {
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
 	}
 
 	target = mk_instance_irq_route_load(instance);
@@ -390,7 +394,7 @@ void mk_reply_recover_halted(struct mk_shared_data *shared,
 	for (i = 0; i < MK_REPLY_SLOTS; i++) {
 		struct mk_reply_slot *slot = &table->slots[i];
 		enum mk_reply_state state;
-		mk_phys_cpu_t owner;
+		u64 owner;
 		u64 token, free;
 
 		token = atomic64_read_acquire(&slot->state_generation);
@@ -400,7 +404,7 @@ void mk_reply_recover_halted(struct mk_shared_data *shared,
 		    state != MK_REPLY_ABANDONED)
 			continue;
 
-		owner = READ_ONCE(slot->owner_cpu);
+		owner = atomic64_read(&slot->owner_cpu);
 		if (owner == MK_REPLY_OWNER_INVALID ||
 		    !mk_cpu_set_contains(halted_cpus, owner))
 			continue;
@@ -410,7 +414,6 @@ void mk_reply_recover_halted(struct mk_shared_data *shared,
 		    token)
 			continue;
 
-		WRITE_ONCE(slot->owner_cpu, MK_REPLY_OWNER_INVALID);
 		atomic_inc(&table->cancelled_slots);
 		wake_up_all(&mk_reply_waitq);
 	}

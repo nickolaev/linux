@@ -111,7 +111,7 @@ struct mk_reply_slot {
 	u32 kind;
 	s32 status;
 	u32 value;
-	u64 owner_cpu;
+	atomic64_t owner_cpu;
 };
 
 struct mk_reply_table {
@@ -234,7 +234,7 @@ static inline void mk_reply_table_reset(struct mk_reply_table *table)
 		WRITE_ONCE(table->slots[i].kind, 0);
 		WRITE_ONCE(table->slots[i].status, 0);
 		WRITE_ONCE(table->slots[i].value, 0);
-		WRITE_ONCE(table->slots[i].owner_cpu, MK_REPLY_OWNER_INVALID);
+		atomic64_set(&table->slots[i].owner_cpu, MK_REPLY_OWNER_INVALID);
 	}
 	atomic_set(&table->late_replies, 0);
 	atomic_set(&table->cancelled_slots, 0);
