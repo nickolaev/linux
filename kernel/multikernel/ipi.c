@@ -221,6 +221,8 @@ static bool mk_reply_cancel(struct mk_shared_data *shared,
 		token = atomic64_read_acquire(&slot->state_generation);
 		if (token == ready)
 			return true;
+		if (token == committed)
+			goto timed_out;
 		if (token == writing &&
 		    atomic64_cmpxchg_release(&slot->state_generation, writing,
 					     abandoned) == writing)
@@ -410,28 +412,40 @@ int mk_reply_publish_route_locked(struct mk_instance *instance,
 	ready = mk_reply_token(reply->generation, MK_REPLY_READY);
 	free = mk_reply_token(reply->generation, MK_REPLY_FREE);
 
-	WRITE_ONCE(slot->status, status);
-	WRITE_ONCE(slot->value, value);
-	old = atomic64_cmpxchg_release(&slot->state_generation, executing, ready);
-	if (old == writing)
-		old = atomic64_cmpxchg_release(&slot->state_generation, writing,
-					       ready);
-	if (old == abandoned) {
-		atomic64_set_release(&slot->state_generation, free);
+	old = atomic64_read_acquire(&slot->state_generation);
+	if (READ_ONCE(slot->request_id) != reply->request_id ||
+	    READ_ONCE(slot->kind) != reply->kind) {
 		atomic_inc(&shared->replies.late_replies);
-		ret = -ESTALE;
-		return ret;
+		return -ESTALE;
+	}
+	if (old == abandoned) {
+		atomic64_cmpxchg_release(&slot->state_generation, abandoned, free);
+		atomic_inc(&shared->replies.late_replies);
+		return -ESTALE;
 	}
 	if (old == committed) {
-		atomic64_set_release(&slot->state_generation, free);
+		atomic64_cmpxchg_release(&slot->state_generation, committed, free);
 		atomic_inc(&shared->replies.late_replies);
-		ret = -ESTALE;
-		return ret;
+		return -ESTALE;
 	}
 	if (old != executing && old != writing) {
 		atomic_inc(&shared->replies.late_replies);
-		ret = -EIO;
-		return ret;
+		return -EIO;
+	}
+
+	WRITE_ONCE(slot->status, status);
+	WRITE_ONCE(slot->value, value);
+	if (atomic64_cmpxchg_release(&slot->state_generation, old, ready) != old) {
+		/* A racing timeout may abandon only this exact generation. */
+		old = atomic64_read_acquire(&slot->state_generation);
+		if (old == abandoned)
+			atomic64_cmpxchg_release(&slot->state_generation,
+						 abandoned, free);
+		else if (old == committed)
+			atomic64_cmpxchg_release(&slot->state_generation,
+						 committed, free);
+		atomic_inc(&shared->replies.late_replies);
+		return old == abandoned || old == committed ? -ESTALE : -EIO;
 	}
 
 	target = mk_instance_irq_route_load(instance);
