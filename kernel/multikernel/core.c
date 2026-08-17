@@ -237,9 +237,9 @@ static void mk_instance_release(struct kref *kref)
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance)
 {
-	if (instance)
-		kref_get(&instance->refcount);
-	return instance;
+	if (instance && kref_get_unless_zero(&instance->refcount))
+		return instance;
+	return NULL;
 }
 
 void mk_instance_put(struct mk_instance *instance)
@@ -326,7 +326,7 @@ struct mk_instance *mk_instance_find(int mk_id)
 	mutex_lock(&mk_instance_mutex);
 	instance = idr_find(&mk_instance_idr, mk_id);
 	if (instance)
-		mk_instance_get(instance);
+		instance = mk_instance_get(instance);
 	mutex_unlock(&mk_instance_mutex);
 
 	return instance;
@@ -1512,73 +1512,6 @@ int multikernel_halt_by_id(int mk_id)
 	return ret;
 }
 
-static int __mk_instance_force_halt(struct mk_instance *instance,
-				    bool allow_loaded)
-{
-	mk_phys_cpu_t phys_cpu;
-	unsigned int i;
-	int cpu_count = 0;
-	int ret;
-
-	if (!instance)
-		return -EINVAL;
-
-	/*
-	 * LOADED is allowed for the retry case: a previous halt already
-	 * settled the state, but a CPU that missed its NMI is still
-	 * running the old image and kexec refuses to reload it. Without
-	 * a rerun the instance is stuck for good.
-	 */
-	if (instance->state != MK_STATE_ACTIVE &&
-	    (!allow_loaded ||
-	     (instance->state != MK_STATE_LOADED &&
-	      instance->state != MK_STATE_FAILED))) {
-		pr_err("Instance %d not running (state=%d), nothing to force halt\n",
-			instance->id, instance->state);
-		return -EINVAL;
-	}
-
-	if (mk_cpu_set_empty(instance->cpus)) {
-		pr_err("Instance %d has no CPUs assigned\n", instance->id);
-		return -EINVAL;
-	}
-
-	pr_info("Force halting multikernel instance %d via NMI\n",
-		instance->id);
-
-	ret = mk_arm_force_halt(instance);
-	if (ret)
-		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n", ret);
-
-	/* Send NMI to each CPU in the instance */
-	mk_cpu_set_for_each(i, phys_cpu, instance->cpus) {
-		mk_force_stop_cpu(phys_cpu);
-		cpu_count++;
-	}
-
-	pr_info("Sent NMI to %d CPUs in instance %d\n",
-		cpu_count, instance->id);
-
-	ret = mk_instance_confirm_parked(instance);
-	if (ret) {
-		pr_err("Instance %d CPUs did not park after force halt: %d\n",
-		       instance->id, ret);
-		return ret;
-	}
-
-	mk_instance_settle_halted(instance, false);
-	return 0;
-}
-
-int mk_instance_abort_spawn(struct mk_instance *instance)
-{
-	int ret;
-
-	ret = __mk_instance_force_halt(instance, true);
-	if (ret && instance)
-		mk_instance_mark_failed(instance);
-	return ret;
-}
 /**
  * mk_instance_force_halt - Forcibly stop an instance via NMI
  * @instance: Instance to stop
@@ -1595,7 +1528,6 @@ int mk_instance_abort_spawn(struct mk_instance *instance)
 static int __mk_instance_force_halt(struct mk_instance *instance,
 				    bool allow_loaded)
 {
-	struct mk_shutdown_payload payload;
 	struct mk_cpu_set *snapshot;
 	mk_phys_cpu_t phys_cpu;
 	unsigned int i;
@@ -1634,19 +1566,9 @@ static int __mk_instance_force_halt(struct mk_instance *instance,
 	}
 
 	pr_info("Force halting multikernel instance %d via NMI\n", instance->id);
-	if (!instance->ipi_data) {
-		mk_cpu_transaction_unlock();
-		mk_cpu_set_free(snapshot);
-		return -ENODEV;
-	}
-	atomic_set_release(&instance->ipi_data->emergency_shutdown, 1);
-	payload.flags = MK_SHUTDOWN_IMMEDIATE;
-	payload.sender_instance_id = root_instance ? root_instance->id : 0;
-	ret = mk_send_message_to_instance(instance, MK_MSG_SYSTEM,
-					  MK_SYS_SHUTDOWN, &payload,
-					  sizeof(payload));
-	if (ret < 0)
-		pr_err("Failed to queue shutdown message: %d (sending NMI anyway)\n",
+	ret = mk_arm_force_halt(instance);
+	if (ret)
+		pr_err("Failed to arm force-halt marker: %d (sending NMI anyway)\n",
 		       ret);
 
 	/* Send NMI to each CPU in the instance */
