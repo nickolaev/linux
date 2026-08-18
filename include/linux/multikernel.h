@@ -77,7 +77,7 @@ bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
 #define MK_IPI_SLOT_READY	2
 #define MK_IPI_SLOT_CONSUMING	3
 #define MK_IPI_SLOT_CANCELLED	4
-#define MK_IPI_ABI_MAGIC		0x4d4b495049303037ULL /* "MKIPI007" */
+#define MK_IPI_ABI_MAGIC		0x4d4b495049303038ULL /* "MKIPI008" */
 #define MK_IPI_READY_TIMEOUT_MS	120000
 
 #define MK_REPLY_SLOTS		16
