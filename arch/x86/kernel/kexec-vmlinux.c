@@ -62,7 +62,7 @@ struct elf_kernel_info {
 
 /*
  * Find multikernel entry point from PT_NOTE section.
- * Looks for note with name "Linux" and type 0x4d4b ('MK').
+ * The note type carries the generation; the descriptor remains one u64.
  */
 static unsigned long find_multikernel_entry_note(const void *buf, size_t len,
 						 const Elf64_Ehdr *ehdr)
@@ -91,14 +91,16 @@ static unsigned long find_multikernel_entry_note(const void *buf, size_t len,
 			if (ptr + note_size > end)
 				break;
 
-			if (nhdr->n_type == 0x4d4b &&
+			if (nhdr->n_type == MK_VMLINUX_NOTE_TYPE &&
 			    nhdr->n_namesz == 6 &&
 			    nhdr->n_descsz == sizeof(u64) &&
 			    !memcmp(ptr + sizeof(*nhdr), "Linux", 6)) {
-				u64 entry = *(u64 *)(ptr + sizeof(*nhdr) +
-						     ALIGN(nhdr->n_namesz, 4));
-				pr_info("multikernel: entry=0x%llx\n", entry);
-				return entry;
+				const u64 *entry;
+
+				entry = ptr + sizeof(*nhdr) +
+				       ALIGN(nhdr->n_namesz, 4);
+				pr_info("multikernel: entry=0x%llx\n", *entry);
+				return *entry;
 			}
 			ptr += note_size;
 		}

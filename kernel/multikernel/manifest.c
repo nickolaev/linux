@@ -23,10 +23,16 @@
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static bool mk_manifest_fdt_rejected;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_manifest_rejected(void)
+{
+	return READ_ONCE(mk_manifest_fdt_rejected);
 }
 
 /**
@@ -50,6 +56,7 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	if (!fdt) {
 		pr_warn("multikernel: failed to memremap manifest (0x%llx)\n",
 			fdt_phys);
+		err = -ENOMEM;
 		goto out;
 	}
 
@@ -68,14 +75,17 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
+	mk_manifest_fdt_rejected = false;
 
 	pr_info("multikernel: manifest accepted\n");
 
 out:
 	if (fdt)
 		early_memunmap(fdt, fdt_len);
-	if (err)
-		pr_warn("multikernel: ignoring invalid manifest\n");
+	if (err) {
+		mk_manifest_fdt_rejected = true;
+		pr_warn("multikernel: supplied manifest rejected: %d\n", err);
+	}
 }
 
 /**
@@ -123,16 +133,9 @@ int mk_manifest_finalize(struct kimage *image)
 		return ret;
 	}
 
-	ret = mk_manifest_add_host_ipi(image, fdt);
-	if (ret) {
-		pr_err("Failed to preserve host IPI buffer: %d\n", ret);
-		fdt_end_node(fdt);
-		fdt_finish(fdt);
-		return ret;
-	}
-
 	/* Add IPI buffer information if allocated */
 	if (image->mk_ipi) {
+		struct mk_instance *child = mk_instance_find(image->mk_id);
 		u64 ipi_phys = (u64)image->mk_ipi;
 		size_t ipi_buffer_size = sizeof(struct mk_shared_data);
 		u32 ipi_pages = (u32)(PAGE_ALIGN(ipi_buffer_size) >> PAGE_SHIFT);
@@ -140,7 +143,15 @@ int mk_manifest_finalize(struct kimage *image)
 		ret = fdt_begin_node(fdt, "ipi-buffer");
 		ret |= fdt_property_u64(fdt, "phys-addr", ipi_phys);
 		ret |= fdt_property_u32(fdt, "pages", ipi_pages);
+		ret |= fdt_property_u32(fdt, "parent-id", root_instance->id);
+		ret |= fdt_property_u32(fdt, "child-id", image->mk_id);
+		ret |= fdt_property_u64(fdt, "parent-doorbell-cpu",
+					mk_cpu_set_first(root_instance->cpus));
+		ret |= fdt_property_u64(fdt, "child-doorbell-cpu",
+					child ? mk_cpu_set_first(child->cpus) :
+					MK_PHYS_CPU_INVALID);
 		ret |= fdt_end_node(fdt);
+		mk_instance_put(child);
 
 		if (ret) {
 			pr_err("Failed to add IPI buffer to manifest: %d\n", ret);

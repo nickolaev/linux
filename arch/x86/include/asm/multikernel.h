@@ -107,7 +107,7 @@ struct mk_spawn_context {
 	u32 target_apic_id;		/* Target CPU's APIC ID */
 	u32 flags;			/* MK_SPAWN_F_* flags */
 	u32 ready;			/* Signal flag */
-	u32 reserved;			/* Padding for alignment */
+	u32 abi_magic;			/* Host/spawn generation marker */
 	/* Keep all existing context offsets unchanged. */
 	struct boot_params bp;		/* Standard x86 boot params */
 	/* Optional boot data belongs after boot_params, in the zeroed tail. */
@@ -175,7 +175,8 @@ void mk_set_spawn_context(struct mk_spawn_context *ctx,
 int mk_spawn_cpu(struct mk_instance *instance, int cpu,
 		 struct mk_spawn_context *ctx);
 
-/* Initialize boot context tracking in spawn kernel */
+/* Validate and initialize boot context tracking in spawn kernel */
+struct mk_spawn_context *mk_validate_boot_context(phys_addr_t ctx_phys);
 void mk_init_boot_context(phys_addr_t ctx_phys);
 
 /* Identity page table and trampoline setup */

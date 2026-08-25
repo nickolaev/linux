@@ -17,6 +17,7 @@
 #include <linux/pci.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
+#include <linux/smp.h>
 #include "internal.h"
 
 #define PROP_SUB_FDT "fdt"
@@ -33,6 +34,23 @@
  */
 struct mk_instance *root_instance = NULL;
 EXPORT_SYMBOL_GPL(root_instance);
+
+static void __init __noreturn mk_manifest_reject_and_park(int error)
+{
+	int ret;
+
+	ret = mk_arch_prepare_park();
+	if (ret || !mk_arch_park_ready())
+		panic("multikernel: rejected manifest before park path became ready");
+	ret = mk_arch_register_force_stop();
+	if (ret)
+		pr_emerg("multikernel: force-stop registration failed while rejecting manifest: %d\n",
+			 ret);
+	pr_emerg("multikernel: parking CPUs after rejecting supplied manifest: %d\n",
+		 error);
+	smp_call_function(mk_enter_pool_state, NULL, 0);
+	mk_enter_pool_state(NULL);
+}
 
 /*
  * Collect every CPU the instance might receive through hotplug later:
@@ -155,43 +173,6 @@ int mk_manifest_add_instance_dtb(struct kimage *image, void *fdt, int mk_id)
 	mk_instance_put(instance);
 	return 0;
 }
-
-/**
- * mk_manifest_add_host_ipi() - Add the host's IPI buffer address to the manifest
- * @image: Target kimage
- * @fdt: The manifest FDT being built
- *
- * Called during kexec preparation to pass the host's IPI receive buffer
- * address to the spawn kernel so it can send messages back to the host.
- *
- * Returns: 0 on success, negative error code on failure
- */
-int mk_manifest_add_host_ipi(struct kimage *image, void *fdt)
-{
-	int ret = 0;
-
-	if (!root_instance->ipi_data) {
-		pr_debug("No host IPI buffer to preserve\n");
-		return 0;
-	}
-
-	pr_info("Preserving host IPI buffer: phys=0x%llx, pages=%u\n",
-		(unsigned long long)root_instance->ipi_phys, root_instance->ipi_pages);
-
-	ret |= fdt_begin_node(fdt, "host-ipi-buffer");
-	ret |= fdt_property_u64(fdt, "phys-addr", root_instance->ipi_phys);
-	ret |= fdt_property_u32(fdt, "pages", root_instance->ipi_pages);
-	ret |= fdt_end_node(fdt);
-
-	if (ret) {
-		pr_err("Failed to add host IPI buffer to manifest: %d\n", ret);
-		return ret;
-	}
-
-	pr_info("Added host IPI buffer to manifest\n");
-	return 0;
-}
-
 
 /**
  * mk_dt_extract_instance_info() - Extract instance ID and name from DTB
@@ -386,6 +367,7 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 			pr_err("Failed to allocate IPI buffer for instance %d\n", instance_id);
 			goto err_free_name;
 		}
+		mk_shared_data_reset(instance->ipi_data);
 		instance->ipi_phys = virt_to_phys(instance->ipi_data);
 		instance->ipi_pages = (sizeof(struct mk_shared_data) + PAGE_SIZE - 1) / PAGE_SIZE;
 
@@ -543,6 +525,11 @@ static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instan
 			 (unsigned long long)ipi_phys, ipi_pages);
 		return 0;
 	}
+	if (ipi_size < sizeof(struct mk_shared_data)) {
+		pr_err("IPI buffer is too small: %zu < %zu\n", ipi_size,
+		       sizeof(struct mk_shared_data));
+		return -EPROTO;
+	}
 
 	instance->ipi_data = memremap(ipi_phys, ipi_size, MEMREMAP_WB);
 	if (!instance->ipi_data) {
@@ -562,64 +549,44 @@ static int __init mk_restore_instance_ipi(const void *manifest, struct mk_instan
 static struct mk_instance * __init mk_restore_host_instance(const void *manifest)
 {
 	struct mk_instance *host_instance;
-	int host_ipi_node;
-	const fdt64_t *phys_prop;
-	const fdt32_t *pages_prop;
-	phys_addr_t host_ipi_phys = 0;
-	u32 host_ipi_pages = 0;
-	size_t host_ipi_size = 0;
+	const fdt32_t *id_prop;
+	const fdt64_t *cpu_prop;
+	mk_phys_cpu_t parent_cpu;
+	u32 parent_id;
+	int ipi_node;
 	int len;
 
-	host_ipi_node = fdt_subnode_offset(manifest, 0, "host-ipi-buffer");
-	if (host_ipi_node < 0) {
-		pr_warn("No host-ipi-buffer node in manifest (spawn won't be able to send to host)\n");
+	ipi_node = fdt_subnode_offset(manifest, 0, "ipi-buffer");
+	if (ipi_node < 0 || !root_instance->ipi_data)
 		return NULL;
-	}
-
-	phys_prop = fdt_getprop(manifest, host_ipi_node, "phys-addr", &len);
-	if (phys_prop && len == sizeof(*phys_prop))
-		host_ipi_phys = (phys_addr_t)fdt64_to_cpu(*phys_prop);
-
-	pages_prop = fdt_getprop(manifest, host_ipi_node, "pages", &len);
-	if (pages_prop && len == sizeof(*pages_prop)) {
-		host_ipi_pages = fdt32_to_cpu(*pages_prop);
-		host_ipi_size = (size_t)host_ipi_pages << PAGE_SHIFT;
-	}
-
-	if (!host_ipi_phys || !host_ipi_pages) {
-		pr_warn("Incomplete host IPI buffer info (phys=0x%llx, pages=%u)\n",
-			(unsigned long long)host_ipi_phys, host_ipi_pages);
+	id_prop = fdt_getprop(manifest, ipi_node, "parent-id", &len);
+	if (!id_prop || len != sizeof(*id_prop))
 		return NULL;
-	}
+	parent_id = fdt32_to_cpu(*id_prop);
+	cpu_prop = fdt_getprop(manifest, ipi_node, "parent-doorbell-cpu", &len);
+	if (!cpu_prop || len != sizeof(*cpu_prop))
+		return NULL;
+	parent_cpu = fdt64_to_cpu(*cpu_prop);
 
-	host_instance = alloc_mk_instance(0, "", false);
+	host_instance = alloc_mk_instance(parent_id, "", false);
 	if (!host_instance)
 		return NULL;
-
-	/* Set physical CPU 0 as default target for host IPIs */
-	if (mk_cpu_set_add(host_instance->cpus, 0)) {
+	if (mk_cpu_set_add(host_instance->cpus, parent_cpu)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
 		return NULL;
 	}
-
-	host_instance->ipi_data = memremap(host_ipi_phys, host_ipi_size, MEMREMAP_WB);
-	if (!host_instance->ipi_data) {
-		pr_err("Failed to map host IPI buffer at 0x%llx\n",
-		       (unsigned long long)host_ipi_phys);
+	host_instance->ipi_data = root_instance->ipi_data;
+	host_instance->ipi_phys = root_instance->ipi_phys;
+	host_instance->ipi_pages = root_instance->ipi_pages;
+	if (mk_ipi_endpoint_init(host_instance, false)) {
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
 		return NULL;
 	}
-	host_instance->ipi_phys = host_ipi_phys;
-	host_instance->ipi_pages = host_ipi_pages;
-	pr_info("Restored host IPI buffer: phys=0x%llx, virt=%px, pages=%u\n",
-		(unsigned long long)host_ipi_phys, host_instance->ipi_data,
-		host_ipi_pages);
-	pr_info("Registered host instance (ID 0) for spawn→host communication\n");
-
+	pr_info("Registered parent instance %u on duplex IPI link\n", parent_id);
 	return host_instance;
 }
 
@@ -645,11 +612,14 @@ int __init mk_instance_restore_from_manifest(void)
 	const void *manifest = NULL;
 	phys_addr_t fdt_phys;
 
+	if (mk_manifest_rejected())
+		mk_manifest_reject_and_park(-EPROTO);
+
 	fdt_phys = mk_manifest_phys();
 	if (!fdt_phys) {
 		pr_info("No manifest available for multikernel DTB restoration\n");
 
-		instance = alloc_mk_instance(0, "", true);
+		instance = alloc_mk_instance(0, "", false);
 		if (!instance) {
 			pr_err("Failed to allocate root instance\n");
 			return -ENOMEM;
@@ -682,15 +652,15 @@ int __init mk_instance_restore_from_manifest(void)
 
 	int mk_node = fdt_subnode_offset(manifest, 0, "multikernel");
 	if (mk_node < 0) {
-		pr_info("No multikernel node found in manifest\n");
-		ret = 0;
+		pr_err("No multikernel node found in supplied manifest\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
 	const void *dtb_data = fdt_getprop(manifest, mk_node, "dtb-data", &dtb_len);
 	if (!dtb_data || dtb_len <= 0) {
-		pr_info("No dtb-data property found in multikernel node\n");
-		ret = 0;
+		pr_err("No dtb-data property found in multikernel node\n");
+		ret = -EINVAL;
 		goto cleanup_fdt;
 	}
 
@@ -787,8 +757,16 @@ int __init mk_instance_restore_from_manifest(void)
 
 	host_instance = mk_restore_host_instance(manifest);
 	if (!host_instance)
-		pr_warn("Failed to restore host instance (spawn→host communication unavailable)\n");
+		mk_manifest_reject_and_park(-ENODEV);
 
+	ret = mk_arch_prepare_park();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
+	if (!mk_arch_park_ready())
+		mk_manifest_reject_and_park(-EIO);
+	ret = mk_arch_register_force_stop();
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	pr_info("Successfully restored multikernel root instance %d ('%s') from manifest (%d bytes)\n",
 		instance_id, instance_name, dtb_len);
 	mk_dt_config_free(&config);
@@ -822,6 +800,8 @@ cleanup_dtb:
 	kfree(dtb_virt);
 cleanup_fdt:
 	early_memunmap((void *)manifest, PAGE_SIZE);
+	if (ret)
+		mk_manifest_reject_and_park(ret);
 	return ret;
 }
 
