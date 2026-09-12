@@ -1383,7 +1383,7 @@ static void __noreturn mk_notify_down_and_park(int target_id, u32 subtype)
  */
 void __noreturn mk_halt_to_pool(void)
 {
-	mk_notify_down_and_park(0, MK_SYS_HALTED);
+	mk_notify_down_and_park(READ_ONCE(root_instance->ipi_data->parent_id), MK_SYS_HALTED);
 }
 
 static void mk_shutdown_work_fn(struct work_struct *work)

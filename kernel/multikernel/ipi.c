@@ -170,13 +170,13 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
 	if (target == MK_PHYS_CPU_INVALID)
 		return -ENODEV;
-	if (endpoint->parent_side)
-		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
 	raw_spin_lock_irqsave(&endpoint->tx_lock, flags);
 	if (!READ_ONCE(endpoint->registered) || !endpoint->tx_enabled) {
 		ret = -ESHUTDOWN;
 		goto unlock;
 	}
+	if (endpoint->parent_side)
+		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
 	idx = endpoint->tx_head & (MK_IPI_RING_SIZE - 1);
 	slot = &endpoint->tx->entries[idx];
 	/* Pair with the receiver's release when it makes the slot reusable. */
