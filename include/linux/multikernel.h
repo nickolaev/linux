@@ -1207,6 +1207,7 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size);
 /* Device filtering against the instance metadata */
 #ifdef CONFIG_PCI
 bool mk_pci_get_assigned_identity_bdf(unsigned int domain, unsigned int bus,
+bool mk_pci_should_probe(struct pci_bus *bus, int devfn);
 				      unsigned int devfn, u16 *vendor,
 				      u16 *device);
 #if defined(CONFIG_X86)
