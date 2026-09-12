@@ -614,7 +614,9 @@ void kimage_free(struct kimage *image)
 		if (route_instance)
 			down_write(&route_instance->control_route_sem);
 		if (image->mk_instance)
+#ifdef CONFIG_MULTIKERNEL
 			mk_ipi_endpoint_unregister(image->mk_instance);
+#endif
 
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
