@@ -694,11 +694,13 @@ void kimage_free(struct kimage *image)
 	 * Free up any temporary buffers allocated. This might hit if
 	 * error occurred much later after buffer allocation.
 	 */
+#ifdef CONFIG_KEXEC_FILE
 	if (image->file_mode) {
 		kfree(image->cmdline_buf);
 		image->cmdline_buf = NULL;
 		kimage_file_post_load_cleanup(image);
 	}
+#endif
 
 	kfree(image);
 }
@@ -1289,6 +1291,7 @@ static int kimage_proc_show(struct seq_file *m, void *v)
 				image->mk_id, type_name, image->start, image->nr_segments,
 				image->file_mode ? "file" : "sys");
 
+#ifdef CONFIG_KEXEC_FILE
 			if (image->file_mode && image->cmdline_buf && image->cmdline_buf_len > 0) {
 				unsigned long len = image->cmdline_buf_len;
 
