@@ -163,7 +163,8 @@ static int kexec_parse_elf_kernel(const void *kernel_buf, unsigned long kernel_l
 	 */
 	info->multikernel_entry = find_multikernel_entry_note(kernel_buf, kernel_len, ehdr);
 	if (!info->multikernel_entry) {
-		pr_err("multikernel_startup_64 entry offset not found in PT_NOTE\n");
+		pr_err("legacy or incompatible vmlinux: ABI note type 0x%x not found\n",
+		       MK_VMLINUX_NOTE_TYPE);
 		return -ENOEXEC;
 	}
 

@@ -447,7 +447,6 @@ static struct page *kimage_alloc_crash_control_pages(struct kimage *image,
 		unsigned long i;
 
 		cond_resched();
-
 		if (hole_end > KEXEC_CRASH_CONTROL_MEMORY_LIMIT)
 			break;
 		/* See if I overlap any of the segments */
@@ -608,6 +607,10 @@ void kimage_free(struct kimage *image)
 
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
+
+		/* Stop delivery before image-owned shared pages are returned. */
+		if (image->mk_instance)
+			mk_ipi_endpoint_unregister(image->mk_instance);
 
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);

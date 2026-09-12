@@ -167,11 +167,8 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 	if (!instance || data_size > MK_MAX_DATA_SIZE || (data_size && !data))
 		return -EINVAL;
 	endpoint = &instance->ipi_endpoint;
-	if (!endpoint->registered) {
-		ret = mk_ipi_endpoint_init(instance, true);
-		if (ret)
-			return ret;
-	}
+	if (!READ_ONCE(endpoint->registered))
+		return -ESHUTDOWN;
 	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
 		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
 	if (target == MK_PHYS_CPU_INVALID)
