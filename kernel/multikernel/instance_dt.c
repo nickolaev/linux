@@ -381,6 +381,9 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 		goto err_free_ipi;
 
 	instance->state = MK_STATE_READY;
+	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
+	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
+	INIT_LIST_HEAD(&instance->ipi_endpoint.rx_node);
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	kref_init(&instance->refcount);

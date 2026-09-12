@@ -36,8 +36,6 @@ int mk_ipi_endpoint_init(struct mk_instance *instance, bool parent_side)
 		return -ENODEV;
 	if (endpoint->registered)
 		return 0;
-	raw_spin_lock_init(&endpoint->tx_lock);
-	raw_spin_lock_init(&endpoint->rx_lock);
 	endpoint->tx = parent_side ? &instance->ipi_data->to_child :
 				     &instance->ipi_data->to_parent;
 	endpoint->rx = parent_side ? &instance->ipi_data->to_parent :
@@ -47,7 +45,6 @@ int mk_ipi_endpoint_init(struct mk_instance *instance, bool parent_side)
 	endpoint->tx_enabled = true;
 	endpoint->rx_dispatching = false;
 	endpoint->parent_side = parent_side;
-	INIT_LIST_HEAD(&endpoint->rx_node);
 	raw_spin_lock_irqsave(&mk_ipi_endpoints_lock, flags);
 	list_add_tail_rcu(&endpoint->rx_node, &mk_ipi_endpoints);
 	endpoint->registered = true;
@@ -176,7 +173,7 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 	if (endpoint->parent_side)
 		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
 	raw_spin_lock_irqsave(&endpoint->tx_lock, flags);
-	if (!endpoint->tx_enabled) {
+	if (!READ_ONCE(endpoint->registered) || !endpoint->tx_enabled) {
 		ret = -ESHUTDOWN;
 		goto unlock;
 	}
