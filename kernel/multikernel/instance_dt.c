@@ -575,6 +575,10 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	if (!host_instance)
 		return NULL;
 	if (mk_cpu_set_add(host_instance->cpus, parent_cpu)) {
+		mutex_lock(&mk_instance_mutex);
+		idr_remove(&mk_instance_idr, host_instance->id);
+		list_del(&host_instance->list);
+		mutex_unlock(&mk_instance_mutex);
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
