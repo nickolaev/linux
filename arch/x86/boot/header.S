@@ -380,7 +380,7 @@ xloadflags:
 #endif
 
 #ifdef CONFIG_MULTIKERNEL
-# define XLF_MK XLF_MULTIKERNEL_IPI
+# define XLF_MK XLF_MULTIKERNEL_IPI_EXT
 #else
 # define XLF_MK 0
 #endif
