@@ -25,6 +25,7 @@ struct mk_spawn_context;
 struct mk_ident_pgtable;
 
 /* Per-instance spawn state, carved from the control block on first spawn */
+#ifdef CONFIG_MULTIKERNEL
 struct mk_instance_arch {
 	struct mk_spawn_context *spawn_ctx;
 	phys_addr_t spawn_ctx_phys;
@@ -32,6 +33,7 @@ struct mk_instance_arch {
 	void *trampoline_va;
 	void *park_va;			/* Pool park page, written once by the host */
 };
+#endif
 
 /*
  * Physical CPU IDs are APIC IDs, widened to the generic u64 type. The
