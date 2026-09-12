@@ -563,15 +563,18 @@ int mk_arm_force_halt(struct mk_instance *instance)
 
 static int __mk_send_ipi_data(struct mk_instance *instance,
 			      mk_phys_cpu_t target, void *data,
-			      size_t data_size, unsigned long type)
+			      size_t data_size, unsigned long type,
+			      bool select_target)
 {
 	struct mk_ipi_endpoint *endpoint;
+	struct mk_shared_data *shared;
 	struct mk_ipi_data *slot;
 	unsigned long flags;
 	u32 idx;
 	int ret = 0;
+	bool no_target = false;
 
-	if (!instance || target == MK_PHYS_CPU_INVALID ||
+	if (!instance || (!select_target && target == MK_PHYS_CPU_INVALID) ||
 	    data_size > MK_MAX_DATA_SIZE || (data_size && !data))
 		return -EINVAL;
 	endpoint = &instance->ipi_endpoint;
@@ -580,8 +583,21 @@ static int __mk_send_ipi_data(struct mk_instance *instance,
 		ret = -ESHUTDOWN;
 		goto unlock;
 	}
+	shared = READ_ONCE(instance->ipi_data);
+	if (!shared) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	if (select_target)
+		target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
+			READ_ONCE(shared->parent_doorbell_cpu);
+	if (target == MK_PHYS_CPU_INVALID) {
+		no_target = true;
+		ret = -ENODEV;
+		goto unlock;
+	}
 	if (endpoint->parent_side)
-		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
+		WRITE_ONCE(shared->child_doorbell_cpu, target);
 	idx = endpoint->tx_head & (MK_IPI_RING_SIZE - 1);
 	slot = &endpoint->tx->entries[idx];
 	/* Pair with the receiver's release when it makes the slot reusable. */
@@ -601,6 +617,8 @@ unlock:
 	raw_spin_unlock_irqrestore(&endpoint->tx_lock, flags);
 	if (!ret)
 		mk_arch_send_ipi(target);
+	else if (no_target)
+		pr_err("Instance %d has no CPUs to receive the IPI\n", instance->id);
 	return ret;
 }
 
@@ -608,27 +626,16 @@ int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
 			    mk_phys_cpu_t target, void *data,
 			    size_t data_size, unsigned long type)
 {
-	return __mk_send_ipi_data(instance, target, data, data_size, type);
+	return __mk_send_ipi_data(instance, target, data, data_size, type, false);
 }
 
 int mk_send_ipi_data(struct mk_instance *instance, void *data,
 		     size_t data_size, unsigned long type)
 {
-	struct mk_ipi_endpoint *endpoint;
-	mk_phys_cpu_t target;
 	if (!instance)
 		return -EINVAL;
-	endpoint = &instance->ipi_endpoint;
-	if (!READ_ONCE(endpoint->registered))
-		return -ESHUTDOWN;
-	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
-		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
-	if (target == MK_PHYS_CPU_INVALID) {
-		pr_err("Instance %d has no CPUs to receive the IPI\n",
-		       instance->id);
-		return -ENODEV;
-	}
-	return __mk_send_ipi_data(instance, target, data, data_size, type);
+	return __mk_send_ipi_data(instance, MK_PHYS_CPU_INVALID, data,
+				  data_size, type, true);
 }
 
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,
