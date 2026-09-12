@@ -28,10 +28,16 @@
 
 /* Physical address of the manifest this kernel booted with, 0 if none */
 static phys_addr_t mk_manifest_fdt_phys;
+static bool mk_manifest_fdt_rejected;
 
 phys_addr_t mk_manifest_phys(void)
 {
 	return mk_manifest_fdt_phys;
+}
+
+bool mk_manifest_rejected(void)
+{
+	return READ_ONCE(mk_manifest_fdt_rejected);
 }
 
 /**
@@ -55,6 +61,7 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	if (!fdt) {
 		pr_warn("multikernel: failed to memremap manifest (0x%llx)\n",
 			fdt_phys);
+		err = -ENOMEM;
 		goto out;
 	}
 
@@ -73,14 +80,17 @@ void __init mk_manifest_populate(phys_addr_t fdt_phys, u64 fdt_len)
 	}
 
 	mk_manifest_fdt_phys = fdt_phys;
+	mk_manifest_fdt_rejected = false;
 
 	pr_info("multikernel: manifest accepted\n");
 
 out:
 	if (fdt)
 		early_memunmap(fdt, fdt_len);
-	if (err)
-		pr_warn("multikernel: ignoring invalid manifest\n");
+	if (err) {
+		mk_manifest_fdt_rejected = true;
+		pr_warn("multikernel: supplied manifest rejected: %d\n", err);
+	}
 }
 
 /*
@@ -267,6 +277,7 @@ out:
 struct mk_manifest_ctx {
 	struct kimage *image;
 	struct mk_instance *instance;
+	mk_phys_cpu_t parent_doorbell_cpu;
 };
 
 static int mk_manifest_chosen(void *fdt, void *data)
@@ -289,7 +300,7 @@ static int mk_manifest_chosen(void *fdt, void *data)
 		/* The boot CPU can never join the pool, so it stays ours */
 		if (!ret)
 			ret = fdt_property_u64(fdt, "multikernel,host-ipi-cpu",
-					       arch_cpu_physical_id(0));
+					       ctx->parent_doorbell_cpu);
 		if (ret)
 			return ret;
 	}
@@ -323,15 +334,20 @@ static int mk_manifest_chosen(void *fdt, void *data)
 /**
  * mk_manifest_finalize - Write the boot tree for a spawn
  * @image: The multikernel kimage being executed
+ * @parent_doorbell_cpu: Physical CPU that receives child-to-parent IPIs
  *
  * Generates the instance's device tree into the manifest page allocated
  * at load time, with /chosen carrying the boot handoff.
  *
  * Returns: 0 on success, negative error code on failure
  */
-int mk_manifest_finalize(struct kimage *image)
+int mk_manifest_finalize(struct kimage *image,
+			 mk_phys_cpu_t parent_doorbell_cpu)
 {
-	struct mk_manifest_ctx ctx = { .image = image };
+	struct mk_manifest_ctx ctx = {
+		.image = image,
+		.parent_doorbell_cpu = parent_doorbell_cpu,
+	};
 	struct mk_instance *instance;
 	void *fdt;
 	int ret;
@@ -340,6 +356,9 @@ int mk_manifest_finalize(struct kimage *image)
 		pr_warn("%s: called without valid multikernel target\n", __func__);
 		return -EINVAL;
 	}
+
+	if (parent_doorbell_cpu == MK_PHYS_CPU_INVALID)
+		return -EINVAL;
 
 	if (!image->mk_manifest) {
 		pr_err("No manifest page allocated for multikernel kimage\n");

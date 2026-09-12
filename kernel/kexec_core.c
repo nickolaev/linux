@@ -609,6 +609,12 @@ void kimage_free(struct kimage *image)
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
 		unsigned long i;
 
+		/* Stop delivery before image-owned shared pages are returned. */
+#ifdef CONFIG_MULTIKERNEL
+		if (image->mk_instance)
+			mk_ipi_endpoint_unregister(image->mk_instance);
+#endif
+
 		for (i = 0; i < image->nr_segments; i++) {
 			void *virt_addr = phys_to_virt(image->segment[i].mem);
 
@@ -1683,12 +1689,42 @@ struct kimage *kimage_find_by_id(int mk_id)
 	return image;
 }
 
+int kimage_prepare_multikernel_unload(struct kimage *image)
+{
+	struct mk_instance *instance;
+	int state;
+	int ret;
+
+	if (!image || image->type != KEXEC_TYPE_MULTIKERNEL)
+		return -EINVAL;
+	instance = image->mk_instance;
+	if (!instance)
+		return -EINVAL;
+
+	/* ACTIVE always means CPUs may still execute from image memory. */
+	state = READ_ONCE(instance->state);
+	if (state == MK_STATE_ACTIVE)
+		return -EBUSY;
+
+	/*
+	 * FAILED can describe a partially aborted launch, while LOADED may
+	 * precede the final park acknowledgment. In either case the parked
+	 * proof, rather than state alone, permits the image to be released.
+	 */
+	ret = mk_instance_confirm_parked(instance);
+	if (ret)
+		return ret == -ENOMEM ? ret : -EBUSY;
+
+	return 0;
+}
+
 int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
 	int cpu = -1;
 	int i, rc;
+	mk_phys_cpu_t parent_cpu;
 
 	if (!kexec_trylock())
 		return -EBUSY;
@@ -1701,6 +1737,12 @@ int multikernel_kexec_by_id(int mk_id)
 	}
 
 	instance = mk_image->mk_instance;
+	if (instance->state != MK_STATE_LOADED) {
+		pr_err("Multikernel instance %d is not loadable (state=%d)\n",
+		       mk_id, instance->state);
+		rc = -EINVAL;
+		goto unlock;
+	}
 	if (!mk_cpu_set_empty(instance->cpus)) {
 		mk_phys_cpu_t phys_cpu = mk_cpu_set_first(instance->cpus);
 
@@ -1754,11 +1796,18 @@ int multikernel_kexec_by_id(int mk_id)
 		}
 	}
 
-	rc = mk_manifest_finalize(mk_image);
-	if (rc)
-		pr_warn("Manifest finalization failed: %d\n", rc);
-	else
-		pr_info("Manifest finalized for multikernel instance\n");
+	/* Logical CPU 0 stays with this parent and receives child doorbells. */
+	parent_cpu = arch_cpu_physical_id(0);
+	if (parent_cpu == MK_PHYS_CPU_INVALID) {
+		rc = -ENODEV;
+		goto unlock;
+	}
+	rc = mk_manifest_finalize(mk_image, parent_cpu);
+	if (rc) {
+		pr_err("Manifest finalization failed: %d\n", rc);
+		goto unlock;
+	}
+	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
 	 * Point at the ring this image actually carries. Every load
@@ -1775,31 +1824,34 @@ int multikernel_kexec_by_id(int mk_id)
 			PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
 	}
 
-	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
-	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
-
-	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+	/* Reset only this parent/child link, after the old child is parked. */
+	if (instance->ipi_data) {
+		mk_ipi_link_reset(instance, mk_self->id, mk_id,
+				  parent_cpu, mk_cpu_set_first(instance->cpus));
 	}
+	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
+	if (rc) {
+		mk_ipi_endpoint_close(instance);
+		goto unlock;
+	}
+
+	/*
+	 * Publish the running state before dropping the global kexec lock so a
+	 * second exec cannot race this boot while its CPUs are leaving the park
+	 * loop.
+	 */
+	rc = mk_instance_set_kexec_active(mk_image->mk_id);
+	if (rc) {
+		int abort_ret = mk_instance_abort_spawn(instance);
+
+		if (abort_ret)
+			pr_crit("Instance %d activation abort failed: %d\n",
+				mk_id, abort_ret);
+		goto unlock;
+	}
+
+	kexec_unlock();
+	return 0;
 
 unlock:
 	kexec_unlock();
