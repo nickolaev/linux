@@ -156,6 +156,7 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 {
 	struct mk_ipi_endpoint *endpoint;
 	struct mk_ipi_data *slot;
+	struct mk_shared_data *shared;
 	mk_phys_cpu_t target;
 	unsigned long flags;
 	u32 idx;
@@ -166,17 +167,24 @@ int mk_send_ipi_data(struct mk_instance *instance, void *data,
 	endpoint = &instance->ipi_endpoint;
 	if (!READ_ONCE(endpoint->registered))
 		return -ESHUTDOWN;
-	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
-		 READ_ONCE(instance->ipi_data->parent_doorbell_cpu);
-	if (target == MK_PHYS_CPU_INVALID)
-		return -ENODEV;
 	raw_spin_lock_irqsave(&endpoint->tx_lock, flags);
 	if (!READ_ONCE(endpoint->registered) || !endpoint->tx_enabled) {
 		ret = -ESHUTDOWN;
 		goto unlock;
 	}
+	shared = READ_ONCE(instance->ipi_data);
+	if (!shared) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	target = endpoint->parent_side ? mk_cpu_set_first(instance->cpus) :
+		 READ_ONCE(shared->parent_doorbell_cpu);
+	if (target == MK_PHYS_CPU_INVALID) {
+		ret = -ENODEV;
+		goto unlock;
+	}
 	if (endpoint->parent_side)
-		WRITE_ONCE(instance->ipi_data->child_doorbell_cpu, target);
+		WRITE_ONCE(shared->child_doorbell_cpu, target);
 	idx = endpoint->tx_head & (MK_IPI_RING_SIZE - 1);
 	slot = &endpoint->tx->entries[idx];
 	/* Pair with the receiver's release when it makes the slot reusable. */
