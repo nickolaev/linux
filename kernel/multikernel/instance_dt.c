@@ -819,6 +819,7 @@ early_initcall(mk_instance_restore_from_manifest);
  *
  * Returns: true if probing should proceed, false to skip entirely
  */
+#if IS_ENABLED(CONFIG_PCI)
 bool mk_pci_should_probe(struct pci_bus *bus, int devfn)
 {
 	struct mk_pci_device *pci_dev;
@@ -890,6 +891,7 @@ check_bridge:
 	return false;
 }
 EXPORT_SYMBOL_GPL(mk_pci_should_probe);
+#endif /* CONFIG_PCI */
 
 bool mk_platform_device_allowed(const char *name, const char *hid)
 {
