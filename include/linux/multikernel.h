@@ -354,6 +354,7 @@ void generic_multikernel_interrupt(void);
 int mk_ipi_endpoint_init(struct mk_instance *instance, bool parent_side);
 void mk_ipi_endpoint_unregister(struct mk_instance *instance);
 void mk_ipi_endpoint_close(struct mk_instance *instance);
+void mk_poll_ipi_messages(void);
 void mk_ipi_link_reset(struct mk_instance *instance, int parent_id,
 		       int child_id, mk_phys_cpu_t parent_cpu,
 		       mk_phys_cpu_t child_cpu);
