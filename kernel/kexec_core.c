@@ -1825,8 +1825,10 @@ int multikernel_kexec_by_id(int mk_id)
 				  mk_cpu_set_first(instance->cpus));
 	}
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc)
+	if (rc) {
+		mk_ipi_endpoint_close(instance);
 		goto unlock;
+	}
 
 	/*
 	 * The instance is running once its CPUs leave the park loop. Publish that

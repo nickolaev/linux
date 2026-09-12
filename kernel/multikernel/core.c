@@ -1758,6 +1758,7 @@ int mk_instance_abort_spawn(struct mk_instance *instance)
 {
 	int ret;
 
+	mk_ipi_endpoint_close(instance);
 	ret = __mk_instance_force_halt(instance, true);
 	if (ret && instance)
 		mk_instance_mark_failed(instance);

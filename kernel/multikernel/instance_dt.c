@@ -382,6 +382,9 @@ static struct mk_instance * __init alloc_mk_instance(int instance_id, const char
 
 	instance->state = MK_STATE_READY;
 	init_rwsem(&instance->control_route_sem);
+	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
+	raw_spin_lock_init(&instance->ipi_endpoint.rx_lock);
+	INIT_LIST_HEAD(&instance->ipi_endpoint.rx_node);
 	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
