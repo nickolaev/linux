@@ -584,6 +584,10 @@ static struct mk_instance * __init mk_restore_host_instance(const void *manifest
 	host_instance->ipi_phys = root_instance->ipi_phys;
 	host_instance->ipi_pages = root_instance->ipi_pages;
 	if (mk_ipi_endpoint_init(host_instance, false)) {
+		mutex_lock(&mk_instance_mutex);
+		idr_remove(&mk_instance_idr, host_instance->id);
+		list_del(&host_instance->list);
+		mutex_unlock(&mk_instance_mutex);
 		kfree(host_instance->name);
 		mk_cpu_set_free(host_instance->cpus);
 		kfree(host_instance);
