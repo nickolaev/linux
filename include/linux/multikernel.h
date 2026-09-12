@@ -57,7 +57,7 @@ bool mk_cpu_set_contains(const struct mk_cpu_set *set, mk_phys_cpu_t id);
 int mk_cpu_set_copy(struct mk_cpu_set *dst, const struct mk_cpu_set *src);
 int mk_cpu_set_format(char *buf, size_t size, const struct mk_cpu_set *set);
 
-int mk_cpu_set_count(const struct mk_cpu_set *set);
+unsigned int mk_cpu_set_count(const struct mk_cpu_set *set);
 bool mk_cpu_set_empty(const struct mk_cpu_set *set);
 mk_phys_cpu_t mk_cpu_set_first(const struct mk_cpu_set *set);
 bool mk_cpu_set_get(const struct mk_cpu_set *set, unsigned int index,
