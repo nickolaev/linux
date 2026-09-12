@@ -1300,6 +1300,7 @@ static int kimage_proc_show(struct seq_file *m, void *v)
 				if (len > 0)
 					seq_printf(m, "\"%.*s\"", (int)len, image->cmdline_buf);
 			}
+#endif
 			seq_printf(m, "\n");
 		}
 	}
