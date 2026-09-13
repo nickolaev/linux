@@ -1915,14 +1915,15 @@ static void mk_pci_iommu_system_cleanup(void)
 }
 #else
 static int
+mk_pci_reset_assignment_for_start(struct mk_pci_assignment *assignment)
+{
+	return -EOPNOTSUPP;
+}
+
+static int
 mk_pci_quiesce_assignment(struct mk_pci_assignment *assignment)
 {
 	return 0;
-}
-
-static void
-mk_pci_iommu_deactivate_assignment(struct mk_pci_assignment *assignment)
-{
 }
 
 static int mk_pci_iommu_prepare_assignment(struct mk_pci_assignment *assignment)
