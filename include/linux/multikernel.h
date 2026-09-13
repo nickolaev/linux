@@ -1324,7 +1324,14 @@ bool mk_manifest_rejected(void);
 /* Build the manifest for a spawn (host, kexec path) */
 int mk_manifest_finalize(struct kimage *image,
 			 mk_phys_cpu_t parent_doorbell_cpu);
+#ifdef CONFIG_PCI
 int mk_pci_prepare_instance_start(struct mk_instance *instance);
+#else
+static inline int mk_pci_prepare_instance_start(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 #else
 static inline bool multikernel_allow_emergency_restart(void)
 {

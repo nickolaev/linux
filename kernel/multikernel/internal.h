@@ -67,6 +67,7 @@ int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
 
 /* pci.c */
+#ifdef CONFIG_PCI
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
@@ -82,6 +83,54 @@ int mk_pci_release_assignments(struct mk_instance *instance);
 int mk_pci_quiesce_instance_irqs(struct mk_instance *instance,
 				 bool parked_force);
 unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance);
+#else
+static inline int mk_pci_lease_system_init(void) { return 0; }
+static inline void mk_pci_lease_system_cleanup(void) { }
+static inline void mk_pci_lease_instance_init(struct mk_instance *instance) { }
+static inline bool
+mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
+{
+	return false;
+}
+
+static inline int
+mk_pci_assign_devices(struct mk_instance *instance,
+		      const struct list_head *requested_devices,
+		      int requested_count)
+{
+	return requested_count ? -EOPNOTSUPP : 0;
+}
+
+static inline int
+mk_pci_assign_device(struct mk_instance *instance, u16 domain, u8 bus, u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int
+mk_pci_unassign_device(struct mk_instance *instance, u16 domain, u8 bus,
+		       u8 devfn)
+{
+	return -EOPNOTSUPP;
+}
+
+static inline int mk_pci_release_assignments(struct mk_instance *instance)
+{
+	return 0;
+}
+
+static inline int
+mk_pci_quiesce_instance_irqs(struct mk_instance *instance, bool parked_force)
+{
+	return 0;
+}
+
+static inline unsigned int
+mk_pci_sync_instance_irq_route(struct mk_instance *instance)
+{
+	return 0;
+}
+#endif
 /* overlay.c */
 extern struct kernfs_node *mk_overlay_root_kn;
 extern struct mutex mk_overlay_mutex;
