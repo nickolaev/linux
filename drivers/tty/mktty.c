@@ -54,14 +54,14 @@ struct mktty_host_conn {
 	int instance_id;		/* -1 = not connected */
 	struct list_head list;
 	wait_queue_head_t wait;
-	spinlock_t rx_lock;
+	raw_spinlock_t rx_lock;
 	char *rx_buf;
 	int rx_head;
 	int rx_tail;
 };
 
 static LIST_HEAD(mktty_host_conns);
-static DEFINE_SPINLOCK(mktty_host_conns_lock);
+static DEFINE_RAW_SPINLOCK(mktty_host_conns_lock);
 static struct mk_ipi_handler *mktty_host_handler;
 
 static struct mktty_host_conn *mktty_find_conn(int instance_id)
@@ -78,6 +78,7 @@ static struct mktty_host_conn *mktty_find_conn(int instance_id)
 static int mktty_host_open(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn;
+	unsigned long flags;
 
 	conn = kzalloc(sizeof(*conn), GFP_KERNEL);
 	if (!conn)
@@ -91,13 +92,13 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 
 	conn->instance_id = -1;
 	init_waitqueue_head(&conn->wait);
-	spin_lock_init(&conn->rx_lock);
+	raw_spin_lock_init(&conn->rx_lock);
 	conn->rx_head = 0;
 	conn->rx_tail = 0;
 
-	spin_lock(&mktty_host_conns_lock);
+	raw_spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_add(&conn->list, &mktty_host_conns);
-	spin_unlock(&mktty_host_conns_lock);
+	raw_spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	filp->private_data = conn;
 	return 0;
@@ -106,10 +107,11 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 static int mktty_host_release(struct inode *inode, struct file *filp)
 {
 	struct mktty_host_conn *conn = filp->private_data;
+	unsigned long flags;
 
-	spin_lock(&mktty_host_conns_lock);
+	raw_spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	list_del(&conn->list);
-	spin_unlock(&mktty_host_conns_lock);
+	raw_spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
 	kfree(conn->rx_buf);
 	kfree(conn);
@@ -128,22 +130,22 @@ static ssize_t mktty_host_read(struct file *filp, char __user *buf,
 		return -ENOTCONN;
 
 	while (copied == 0) {
-		spin_lock_irqsave(&conn->rx_lock, flags);
+		raw_spin_lock_irqsave(&conn->rx_lock, flags);
 
 		while (copied < count && conn->rx_head != conn->rx_tail) {
 			char c = conn->rx_buf[conn->rx_tail];
 			conn->rx_tail = (conn->rx_tail + 1) % MKTTY_RX_BUF_SIZE;
-			spin_unlock_irqrestore(&conn->rx_lock, flags);
+			raw_spin_unlock_irqrestore(&conn->rx_lock, flags);
 
 			if (put_user(c, buf + copied)) {
 				return copied > 0 ? copied : -EFAULT;
 			}
 			copied++;
 
-			spin_lock_irqsave(&conn->rx_lock, flags);
+			raw_spin_lock_irqsave(&conn->rx_lock, flags);
 		}
 
-		spin_unlock_irqrestore(&conn->rx_lock, flags);
+		raw_spin_unlock_irqrestore(&conn->rx_lock, flags);
 
 		if (copied > 0)
 			break;
@@ -240,10 +242,10 @@ static __poll_t mktty_host_poll(struct file *filp, poll_table *wait)
 
 	poll_wait(filp, &conn->wait, wait);
 
-	spin_lock_irqsave(&conn->rx_lock, flags);
+	raw_spin_lock_irqsave(&conn->rx_lock, flags);
 	if (conn->rx_head != conn->rx_tail)
 		mask |= EPOLLIN | EPOLLRDNORM;
-	spin_unlock_irqrestore(&conn->rx_lock, flags);
+	raw_spin_unlock_irqrestore(&conn->rx_lock, flags);
 
 	mask |= EPOLLOUT | EPOLLWRNORM;
 	return mask;
@@ -278,10 +280,10 @@ static void mktty_host_ipi_handler(struct mk_ipi_data *data, void *ctx)
 	if (msg->len > MKTTY_MAX_DATA)
 		return;
 
-	spin_lock_irqsave(&mktty_host_conns_lock, flags);
+	raw_spin_lock_irqsave(&mktty_host_conns_lock, flags);
 	conn = mktty_find_conn(msg->console_id);
 	if (conn) {
-		spin_lock(&conn->rx_lock);
+		raw_spin_lock(&conn->rx_lock);
 		for (i = 0; i < msg->len; i++) {
 			space = (conn->rx_tail - conn->rx_head - 1 + MKTTY_RX_BUF_SIZE) % MKTTY_RX_BUF_SIZE;
 			if (space == 0)
@@ -289,10 +291,10 @@ static void mktty_host_ipi_handler(struct mk_ipi_data *data, void *ctx)
 			conn->rx_buf[conn->rx_head] = msg->data[i];
 			conn->rx_head = (conn->rx_head + 1) % MKTTY_RX_BUF_SIZE;
 		}
-		spin_unlock(&conn->rx_lock);
+		raw_spin_unlock(&conn->rx_lock);
 		wake_up_interruptible(&conn->wait);
 	}
-	spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
+	raw_spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 }
 
 static int mktty_host_init(void)
