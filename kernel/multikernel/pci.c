@@ -19,11 +19,11 @@
 #include <linux/dma-mapping.h>
 #include <linux/iommu.h>
 #include <linux/interrupt.h>
-#include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/multikernel.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
+#include <linux/ratelimit.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
@@ -91,16 +91,24 @@ static DEFINE_SPINLOCK(mk_pci_active_lock);
 static LIST_HEAD(mk_pci_active_assignments);
 static bool mk_pci_notifier_registered;
 static bool mk_pci_control_registered;
-static mempool_t *mk_pci_control_pool;
+static struct mk_pci_control_work *mk_pci_control_pool;
+static unsigned long *mk_pci_control_pool_busy;
+static unsigned int mk_pci_control_pool_size;
+static atomic_t mk_pci_control_pool_cursor = ATOMIC_INIT(0);
 static struct workqueue_struct *mk_pci_control_wq;
-static DEFINE_SPINLOCK(mk_pci_control_lock);
 static DECLARE_WAIT_QUEUE_HEAD(mk_pci_control_waitq);
-static unsigned int mk_pci_control_active;
-static bool mk_pci_control_shutdown = true;
+#define MK_PCI_CONTROL_SHUTDOWN	BIT(30)
+#define MK_PCI_CONTROL_ACTIVE_MASK	(MK_PCI_CONTROL_SHUTDOWN - 1)
+static atomic_t mk_pci_control_state = ATOMIC_INIT(MK_PCI_CONTROL_SHUTDOWN);
 static atomic64_t mk_pci_control_pool_exhausted = ATOMIC64_INIT(0);
+static DEFINE_RATELIMIT_STATE(mk_pci_control_pool_rs,
+			     DEFAULT_RATELIMIT_INTERVAL,
+			     DEFAULT_RATELIMIT_BURST);
 
 struct mk_pci_control_work {
 	struct work_struct work;
+	work_func_t dispatch;
+	unsigned int pool_slot;
 	s32 sender_instance_id;
 	union {
 		struct mk_pci_cfg_request cfg;
@@ -111,52 +119,76 @@ struct mk_pci_control_work {
 
 static void mk_pci_schedule_failure(struct mk_pci_assignment *assignment);
 
+static void mk_pci_control_wake_workfn(struct work_struct *work)
+{
+	wake_up_all(&mk_pci_control_waitq);
+}
+
+static DECLARE_WORK(mk_pci_control_wake_work,
+			    mk_pci_control_wake_workfn);
+
 static bool mk_pci_control_handler_get(void)
 {
-	unsigned long flags;
-	bool acquired = false;
+	int state = atomic_read(&mk_pci_control_state);
 
-	spin_lock_irqsave(&mk_pci_control_lock, flags);
-	if (!mk_pci_control_shutdown) {
-		mk_pci_control_active++;
-		acquired = true;
+	for (;;) {
+		if (state & MK_PCI_CONTROL_SHUTDOWN)
+			return false;
+		if ((state & MK_PCI_CONTROL_ACTIVE_MASK) ==
+		    MK_PCI_CONTROL_ACTIVE_MASK)
+			return false;
+		if (atomic_try_cmpxchg(&mk_pci_control_state, &state, state + 1))
+			return true;
 	}
-	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
-	return acquired;
 }
 
 static void mk_pci_control_handler_put(void)
 {
-	unsigned long flags;
-	bool drained;
+	int state = atomic_read(&mk_pci_control_state);
+	int new_state;
 
-	spin_lock_irqsave(&mk_pci_control_lock, flags);
-	WARN_ON_ONCE(!mk_pci_control_active);
-	if (mk_pci_control_active)
-		mk_pci_control_active--;
-	drained = !mk_pci_control_active;
-	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
-	if (drained)
-		wake_up_all(&mk_pci_control_waitq);
+	for (;;) {
+		if (!(state & MK_PCI_CONTROL_ACTIVE_MASK))
+			return;
+		new_state = state - 1;
+		if (atomic_try_cmpxchg(&mk_pci_control_state, &state, new_state))
+			break;
+	}
+	if (new_state == MK_PCI_CONTROL_SHUTDOWN)
+		schedule_work(&mk_pci_control_wake_work);
 }
 
 static void mk_pci_control_shutdown_begin(void)
 {
-	unsigned long flags;
-
-	spin_lock_irqsave(&mk_pci_control_lock, flags);
-	mk_pci_control_shutdown = true;
-	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+	atomic_or(MK_PCI_CONTROL_SHUTDOWN, &mk_pci_control_state);
 }
 
 static void mk_pci_control_shutdown_end(void)
 {
-	unsigned long flags;
+	WARN_ON_ONCE(atomic_read(&mk_pci_control_state) !=
+		     MK_PCI_CONTROL_SHUTDOWN);
+	atomic_set(&mk_pci_control_state, 0);
+}
 
-	spin_lock_irqsave(&mk_pci_control_lock, flags);
-	mk_pci_control_active = 0;
-	mk_pci_control_shutdown = false;
-	spin_unlock_irqrestore(&mk_pci_control_lock, flags);
+static struct mk_pci_control_work *mk_pci_control_work_get(void)
+{
+	unsigned int start;
+	unsigned int slot;
+	unsigned int i;
+
+	start = (unsigned int)atomic_inc_return(&mk_pci_control_pool_cursor);
+	for (i = 0; i < mk_pci_control_pool_size; i++) {
+		slot = (start + i) % mk_pci_control_pool_size;
+		if (!test_and_set_bit_lock(slot, mk_pci_control_pool_busy))
+			return &mk_pci_control_pool[slot];
+	}
+	return NULL;
+}
+
+static void
+mk_pci_control_work_put(struct mk_pci_control_work *control_work)
+{
+	clear_bit_unlock(control_work->pool_slot, mk_pci_control_pool_busy);
 }
 
 static bool mk_pci_device_live(struct pci_dev *pdev)
@@ -380,14 +412,17 @@ static void mk_pci_irq_retry_workfn(struct work_struct *work)
 	struct mk_instance *instance = container_of(to_delayed_work(work),
 						   struct mk_instance,
 						   irq_retry_work);
-	struct mk_shared_data *shared = READ_ONCE(instance->ipi_data);
+	struct mk_shared_data *shared;
 	bool any_pending = false;
 	bool unmasked_pending = false;
 	mk_phys_cpu_t target;
+	unsigned long flags;
 	unsigned int slot;
 
+	raw_spin_lock_irqsave(&instance->control_route_lock, flags);
+	shared = READ_ONCE(instance->ipi_data);
 	if (!shared)
-		return;
+		goto unlock;
 	for (slot = 0; slot < MK_IRQ_MAILBOX_SLOTS; slot++) {
 		struct mk_irq_mailbox_entry *entry;
 		u64 token;
@@ -412,6 +447,8 @@ static void mk_pci_irq_retry_workfn(struct work_struct *work)
 		if (target != MK_PHYS_CPU_INVALID)
 			mk_arch_send_ipi(target);
 	}
+unlock:
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
 	if (any_pending)
 		mod_delayed_work(system_wq, &instance->irq_retry_work,
 				 msecs_to_jiffies(unmasked_pending ? 10 : 100));
@@ -421,23 +458,29 @@ static irqreturn_t mk_pci_forward_irq(int irq, void *data)
 {
 	struct mk_pci_irq_vector *vector = data;
 	struct mk_pci_assignment *assignment = vector->assignment;
-	struct mk_shared_data *shared = assignment->instance->ipi_data;
+	struct mk_instance *instance = assignment->instance;
+	struct mk_shared_data *shared;
 	struct mk_irq_mailbox *mailbox;
 	struct mk_irq_mailbox_entry *entry;
+	bool first_forward = false;
+	bool schedule_retry = false;
 	mk_phys_cpu_t target;
 	u64 old, new;
 	u32 pending;
 	u32 local_irq;
+	unsigned long flags;
 
 	/* Pair with BIND's publication of the shared mailbox identity. */
 	local_irq = smp_load_acquire(&vector->local_irq);
 
-	if (READ_ONCE(assignment->instance->state) != MK_STATE_ACTIVE ||
+	raw_spin_lock_irqsave(&instance->control_route_lock, flags);
+	shared = READ_ONCE(instance->ipi_data);
+	if (READ_ONCE(instance->state) != MK_STATE_ACTIVE ||
 	    READ_ONCE(assignment->irq_state) != MK_PCI_MSI_ACTIVE ||
 	    !local_irq || !shared ||
 	    vector->mailbox_slot == MK_IRQ_MAILBOX_SLOT_INVALID ||
 	    !vector->mailbox_generation)
-		return IRQ_HANDLED;
+		goto unlock;
 	mailbox = &shared->irq_mailbox;
 	entry = &mailbox->entries[vector->mailbox_slot];
 	for (;;) {
@@ -445,7 +488,7 @@ static irqreturn_t mk_pci_forward_irq(int irq, void *data)
 		if (mk_irq_mailbox_generation(old) !=
 		    vector->mailbox_generation) {
 			atomic_inc(&mailbox->stale);
-			return IRQ_HANDLED;
+			goto unlock;
 		}
 		pending = mk_irq_mailbox_pending(old);
 		if (pending == MK_IRQ_MAILBOX_PENDING_MASK) {
@@ -464,15 +507,21 @@ static irqreturn_t mk_pci_forward_irq(int irq, void *data)
 		    &mailbox->pending_bitmap[vector->mailbox_slot / 64]);
 	atomic_inc(&mailbox->recorded);
 	if (!pending)
-		mod_delayed_work(system_wq, &assignment->instance->irq_retry_work,
-				 msecs_to_jiffies(10));
-	if (atomic64_inc_return(&vector->forwarded) == 1)
-		pr_info("Forwarding host IRQ %u as instance IRQ %u for %s vector %u\n",
-			irq, local_irq, pci_name(assignment->vf),
-			(unsigned int)(vector - assignment->irq_vectors));
-	target = mk_instance_irq_route_load(assignment->instance);
+		schedule_retry = true;
+	first_forward = atomic64_inc_return(&vector->forwarded) == 1;
+	target = mk_instance_irq_route_load(instance);
 	if (target != MK_PHYS_CPU_INVALID)
 		mk_arch_send_ipi(target);
+unlock:
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
+	if (schedule_retry)
+		mod_delayed_work(system_wq, &instance->irq_retry_work,
+				 msecs_to_jiffies(10));
+	if (first_forward)
+		printk_deferred(KERN_INFO
+				"Forwarding host IRQ %u as instance IRQ %u for %s vector %u\n",
+				irq, local_irq, pci_name(assignment->vf),
+				(unsigned int)(vector - assignment->irq_vectors));
 	return IRQ_HANDLED;
 }
 
@@ -595,10 +644,14 @@ unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance)
 	pci_unlock_rescan_remove();
 	mutex_unlock(&mk_pci_lease_mutex);
 	if (requested) {
-		mk_phys_cpu_t target = mk_instance_irq_route_load(instance);
+		mk_phys_cpu_t target;
+		unsigned long flags;
 
+		raw_spin_lock_irqsave(&instance->control_route_lock, flags);
+		target = mk_instance_irq_route_load(instance);
 		if (target != MK_PHYS_CPU_INVALID)
 			mk_arch_send_ipi(target);
+		raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
 	}
 	return requested;
 }
@@ -1038,7 +1091,7 @@ unlock_route:
 	up_read(&instance->control_route_sem);
 	mk_instance_put(instance);
 out:
-	mempool_free(control_work, mk_pci_control_pool);
+	return;
 }
 
 static int mk_pci_irq_access(struct mk_instance *instance,
@@ -1142,7 +1195,7 @@ unlock_route:
 	up_read(&instance->control_route_sem);
 	mk_instance_put(instance);
 out:
-	mempool_free(control_work, mk_pci_control_pool);
+	return;
 }
 
 static int mk_pci_reset_access(struct mk_instance *instance,
@@ -1242,7 +1295,16 @@ unlock_route:
 	up_read(&instance->control_route_sem);
 	mk_instance_put(instance);
 out:
-	mempool_free(control_work, mk_pci_control_pool);
+	return;
+}
+
+static void mk_pci_control_work_fn(struct work_struct *work)
+{
+	struct mk_pci_control_work *control_work =
+		container_of(work, struct mk_pci_control_work, work);
+
+	control_work->dispatch(work);
+	mk_pci_control_work_put(control_work);
 }
 
 static void mk_pci_control_msg_handler(u32 msg_type, u32 subtype,
@@ -1283,13 +1345,15 @@ static void mk_pci_control_msg_handler(u32 msg_type, u32 subtype,
 	 * keeps the hardirq receive path allocation-safe without changing reply
 	 * or route validation. Duplicate traffic is outside the cooperative ABI.
 	 */
-	control_work = mempool_alloc(mk_pci_control_pool, GFP_ATOMIC);
+	control_work = mk_pci_control_work_get();
 	if (!control_work) {
 		atomic64_inc(&mk_pci_control_pool_exhausted);
-		pr_warn_ratelimited("Multikernel PCI control work pool exhausted\n");
+		if (__ratelimit(&mk_pci_control_pool_rs))
+			printk_deferred(KERN_WARNING
+					"Multikernel PCI control work pool exhausted\n");
 		goto out;
 	}
-	INIT_WORK(&control_work->work, work_fn);
+	control_work->dispatch = work_fn;
 	memcpy(&control_work->request, payload, request_size);
 	control_work->sender_instance_id = sender_instance_id;
 	switch (subtype) {
@@ -1304,7 +1368,7 @@ static void mk_pci_control_msg_handler(u32 msg_type, u32 subtype,
 		break;
 	}
 	if (!queue_work(mk_pci_control_wq, &control_work->work))
-		mempool_free(control_work, mk_pci_control_pool);
+		mk_pci_control_work_put(control_work);
 out:
 	mk_pci_control_handler_put();
 }
@@ -2239,6 +2303,16 @@ void mk_pci_lease_instance_init(struct mk_instance *instance)
 	INIT_DELAYED_WORK(&instance->irq_retry_work, mk_pci_irq_retry_workfn);
 }
 
+void mk_pci_irq_retry_disable_sync(struct mk_instance *instance)
+{
+	disable_delayed_work_sync(&instance->irq_retry_work);
+}
+
+void mk_pci_irq_retry_enable(struct mk_instance *instance)
+{
+	enable_delayed_work(&instance->irq_retry_work);
+}
+
 bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
 {
 	if (!instance)
@@ -2450,8 +2524,8 @@ int mk_pci_prepare_instance_start(struct mk_instance *instance)
 
 int mk_pci_lease_system_init(void)
 {
+	unsigned int i;
 	unsigned int pool_size;
-	size_t work_size = sizeof(struct mk_pci_control_work);
 	int ret;
 
 	ret = mk_pci_iommu_system_init();
@@ -2466,17 +2540,31 @@ int mk_pci_lease_system_init(void)
 	if (mk_self && mk_self->id == 0) {
 		pool_size = max_t(unsigned int, num_possible_cpus(), 1) *
 			MK_REPLY_SLOTS;
-		mk_pci_control_pool = mempool_create_kmalloc_pool(pool_size, work_size);
+		mk_pci_control_pool = kcalloc(pool_size,
+					      sizeof(*mk_pci_control_pool),
+					      GFP_KERNEL);
 		if (!mk_pci_control_pool) {
 			ret = -ENOMEM;
 			goto unregister_notifier;
+		}
+		mk_pci_control_pool_busy = bitmap_zalloc(pool_size, GFP_KERNEL);
+		if (!mk_pci_control_pool_busy) {
+			ret = -ENOMEM;
+			goto free_pool;
+		}
+		mk_pci_control_pool_size = pool_size;
+		atomic_set(&mk_pci_control_pool_cursor, 0);
+		for (i = 0; i < pool_size; i++) {
+			INIT_WORK(&mk_pci_control_pool[i].work,
+				  mk_pci_control_work_fn);
+			mk_pci_control_pool[i].pool_slot = i;
 		}
 		mk_pci_control_wq =
 			alloc_workqueue("mk-pci-control",
 					WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
 		if (!mk_pci_control_wq) {
 			ret = -ENOMEM;
-			goto destroy_pool;
+			goto free_pool_bitmap;
 		}
 		mk_pci_control_shutdown_end();
 		ret = mk_register_msg_handler(MK_MSG_PCI,
@@ -2491,8 +2579,12 @@ destroy_workqueue:
 	mk_pci_control_shutdown_begin();
 	destroy_workqueue(mk_pci_control_wq);
 	mk_pci_control_wq = NULL;
-destroy_pool:
-	mempool_destroy(mk_pci_control_pool);
+free_pool_bitmap:
+	bitmap_free(mk_pci_control_pool_busy);
+	mk_pci_control_pool_busy = NULL;
+	mk_pci_control_pool_size = 0;
+free_pool:
+	kfree(mk_pci_control_pool);
 	mk_pci_control_pool = NULL;
 unregister_notifier:
 	bus_unregister_notifier(&pci_bus_type, &mk_pci_bus_notifier);
@@ -2508,13 +2600,18 @@ void mk_pci_lease_system_cleanup(void)
 		mk_unregister_msg_handler(MK_MSG_PCI,
 					  mk_pci_control_msg_handler);
 		mk_pci_control_registered = false;
-		wait_event(mk_pci_control_waitq, !READ_ONCE(mk_pci_control_active));
+		wait_event(mk_pci_control_waitq,
+			   !(atomic_read(&mk_pci_control_state) &
+			     MK_PCI_CONTROL_ACTIVE_MASK));
 	}
 	if (mk_pci_control_wq) {
 		destroy_workqueue(mk_pci_control_wq);
 		mk_pci_control_wq = NULL;
 	}
-	mempool_destroy(mk_pci_control_pool);
+	bitmap_free(mk_pci_control_pool_busy);
+	mk_pci_control_pool_busy = NULL;
+	mk_pci_control_pool_size = 0;
+	kfree(mk_pci_control_pool);
 	mk_pci_control_pool = NULL;
 	if (mk_pci_notifier_registered) {
 		bus_unregister_notifier(&pci_bus_type, &mk_pci_bus_notifier);

@@ -57,6 +57,7 @@
 
 #include <crypto/hash.h>
 #include "kexec_internal.h"
+#include "multikernel/internal.h"
 
 atomic_t __kexec_lock = ATOMIC_INIT(0);
 
@@ -608,11 +609,19 @@ void kimage_free(struct kimage *image)
 		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
 
 	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
+		unsigned long route_flags;
 		unsigned long i;
 
 		route_instance = image->mk_instance;
-		if (route_instance)
+		if (route_instance) {
+			/*
+			 * The retry worker takes the raw route lock. Drain it before
+			 * taking the sleepable route lock to keep this ordering acyclic,
+			 * and keep it disabled until the shared pages are gone.
+			 */
+			mk_pci_irq_retry_disable_sync(route_instance);
 			down_write(&route_instance->control_route_sem);
+		}
 
 		/* Stop delivery before image-owned shared pages are returned. */
 #ifdef CONFIG_MULTIKERNEL
@@ -636,8 +645,12 @@ void kimage_free(struct kimage *image)
 			 * instance lands in pages the allocator has already
 			 * handed to someone else.
 			 */
-			image->mk_instance->ipi_data = NULL;
-			image->mk_instance->ipi_phys = 0;
+			raw_spin_lock_irqsave(&route_instance->control_route_lock,
+					      route_flags);
+			route_instance->ipi_data = NULL;
+			route_instance->ipi_phys = 0;
+			raw_spin_unlock_irqrestore(&route_instance->control_route_lock,
+						   route_flags);
 			image->mk_instance->kimage = NULL;
 			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
 			image->mk_instance = NULL;
@@ -657,6 +670,7 @@ void kimage_free(struct kimage *image)
 		}
 		if (route_instance) {
 			up_write(&route_instance->control_route_sem);
+			mk_pci_irq_retry_enable(route_instance);
 			mk_instance_put(route_instance);
 		}
 	}
@@ -1701,6 +1715,8 @@ int multikernel_kexec_by_id(int mk_id)
 {
 	struct kimage *mk_image;
 	struct mk_instance *instance;
+	unsigned long route_flags;
+	bool instance_locked = false;
 	bool transaction_locked = false;
 	bool route_locked = false;
 	int cpu = -1;
@@ -1723,6 +1739,8 @@ int multikernel_kexec_by_id(int mk_id)
 		rc = -EINVAL;
 		goto unlock;
 	}
+	mutex_lock(&mk_instance_mutex);
+	instance_locked = true;
 	mk_cpu_transaction_lock();
 	transaction_locked = true;
 	down_write(&instance->control_route_sem);
@@ -1800,6 +1818,8 @@ int multikernel_kexec_by_id(int mk_id)
 		pr_err("Manifest finalization failed: %d\n", rc);
 		goto unlock;
 	}
+	mutex_unlock(&mk_instance_mutex);
+	instance_locked = false;
 	pr_info("Manifest finalized for multikernel instance\n");
 
 	/*
@@ -1811,10 +1831,14 @@ int multikernel_kexec_by_id(int mk_id)
 	 * each other's messages.
 	 */
 	if (mk_image->mk_ipi) {
+		raw_spin_lock_irqsave(&instance->control_route_lock,
+				      route_flags);
 		instance->ipi_phys = mk_image->mk_ipi;
 		instance->ipi_data = phys_to_virt(mk_image->mk_ipi);
 		instance->ipi_pages =
 			PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
+		raw_spin_unlock_irqrestore(&instance->control_route_lock,
+					   route_flags);
 	}
 
 	/* Reset only this parent/child link, after the old child is parked. */
@@ -1834,21 +1858,7 @@ int multikernel_kexec_by_id(int mk_id)
 	 * state before dropping the global kexec lock so another exec cannot race
 	 * this boot while the readiness handshake is pending.
 	 */
-	rc = mk_instance_set_kexec_active(mk_image->mk_id);
-	if (rc) {
-		int abort_ret;
-
-		up_write(&instance->control_route_sem);
-		route_locked = false;
-		mk_cpu_transaction_unlock();
-		transaction_locked = false;
-		abort_ret = mk_instance_abort_spawn(instance);
-
-		if (abort_ret)
-			pr_crit("Instance %d activation abort failed: %d\n",
-				mk_id, abort_ret);
-		goto unlock;
-	}
+	mk_instance_set_state(instance, MK_STATE_ACTIVE);
 
 	up_write(&instance->control_route_sem);
 	mk_cpu_transaction_unlock();
@@ -1860,6 +1870,8 @@ unlock:
 		up_write(&instance->control_route_sem);
 	if (transaction_locked)
 		mk_cpu_transaction_unlock();
+	if (instance_locked)
+		mutex_unlock(&mk_instance_mutex);
 	kexec_unlock();
 	return rc;
 }

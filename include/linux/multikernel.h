@@ -356,8 +356,9 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler);
  * @data_size: Size of data
  * @type: User-defined type identifier
  *
- * This function copies the data to per-CPU storage and sends an IPI
- * to the target CPU.
+ * This process-context API looks up the instance by ID, copies the data to
+ * its endpoint, and sends an IPI to the target CPU. Atomic callers with a
+ * lifetime-stable instance must use multikernel_send_ipi_data_to_host().
  *
  * Returns 0 on success, negative error code on failure
  */
@@ -622,17 +623,23 @@ struct mk_pending_msg;
  */
 
 /**
- * mk_send_message - Send a message to another CPU
+ * mk_send_message - Send a message to another CPU from process context
  * @instance_id: Target multikernel instance ID
  * @msg_type: Message type identifier
  * @subtype: Message subtype
  * @payload: Pointer to payload data (can be NULL)
  * @payload_len: Length of payload data
  *
+ * This ID-based API may sleep while looking up the target instance. Atomic
+ * callers with a lifetime-stable instance must use
+ * mk_send_message_to_instance().
+ *
  * Returns 0 on success, negative error code on failure
  */
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len);
+int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
+				u32 subtype, void *payload, u32 payload_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
@@ -748,7 +755,7 @@ size_t mk_pool_total_bytes(void);
 size_t mk_pool_avail_bytes(void);
 bool mk_pool_empty(void);
 int mk_pool_for_each_chunk(int (*fn)(struct mk_pool_chunk *, void *), void *data);
-bool mk_pool_cpus_returned(void);
+int mk_pool_park_teardown(void);
 
 /**
  * struct mk_pool_chunk_range - a pool chunk copied out of the chunk list
@@ -774,7 +781,7 @@ int mk_pool_snapshot_chunks(struct mk_pool_chunk_range *out, int max);
 int mk_pool_park_setup(void);
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size);
 bool mk_pool_park_uses(phys_addr_t start, size_t size);
-int mk_pool_park_teardown(void);
+int mk_arch_pool_park_teardown(void);
 #else
 static inline int mk_pool_park_setup(void)
 {
@@ -791,7 +798,7 @@ static inline bool mk_pool_park_uses(phys_addr_t start, size_t size)
 	return false;
 }
 
-static inline int mk_pool_park_teardown(void)
+static inline int mk_arch_pool_park_teardown(void)
 {
 	return 0;
 }
@@ -956,6 +963,7 @@ struct mk_instance {
 	struct mk_cpu_set *cpus;         /* Set of assigned physical CPU IDs */
 	/* Pins the CPU selected for control messages and forwarded IRQs. */
 	struct rw_semaphore control_route_sem;
+	raw_spinlock_t control_route_lock;
 	mk_phys_cpu_t irq_route_cpu;
 	struct delayed_work irq_retry_work;
 
@@ -1055,8 +1063,12 @@ mk_instance_irq_route_load(const struct mk_instance *instance)
 static inline void mk_instance_irq_route_store(struct mk_instance *instance,
 					       mk_phys_cpu_t target)
 {
+	unsigned long flags;
+
 	/* Publish the route after its associated control state. */
+	raw_spin_lock_irqsave(&instance->control_route_lock, flags);
 	smp_store_release(&instance->irq_route_cpu, target);
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
 }
 
 /**
@@ -1225,21 +1237,6 @@ void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t 
  */
 const char *mk_state_to_string(enum mk_instance_state state);
 enum mk_instance_state mk_string_to_state(const char *str);
-
-/**
- * Kexec Integration Functions
- *
- * These functions bridge the gap between the sysfs instance management
- * and the kexec multikernel system.
- */
-
-/**
- * mk_instance_set_kexec_active() - Mark instance as active for kexec
- * @mk_id: Multikernel ID from kexec system
- *
- * Returns 0 on success, negative error code on failure.
- */
-int mk_instance_set_kexec_active(int mk_id);
 
 /*
  * The declarations below are referenced from always-built code (kexec,

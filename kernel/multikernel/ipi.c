@@ -9,6 +9,7 @@
 #include <linux/smp.h>
 #include <linux/ktime.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 static struct mk_ipi_handler *mk_handlers;
@@ -19,6 +20,23 @@ static bool mk_handlers_ready;
 static DEFINE_RATELIMIT_STATE(mk_ipi_full_rs, DEFAULT_RATELIMIT_INTERVAL,
 			      DEFAULT_RATELIMIT_BURST);
 static DECLARE_WAIT_QUEUE_HEAD(mk_reply_waitq);
+static void mk_reply_wake_workfn(struct work_struct *work);
+static DECLARE_WORK(mk_reply_wake_work, mk_reply_wake_workfn);
+
+static void mk_reply_wake_workfn(struct work_struct *work)
+{
+	wake_up_all(&mk_reply_waitq);
+}
+
+static void mk_reply_wake_all(void)
+{
+	/*
+	 * Workqueue clears PENDING before running the callback.  A false return
+	 * therefore means a future callback is already queued; a notification
+	 * racing with the running callback queues another execution.
+	 */
+	schedule_work(&mk_reply_wake_work);
+}
 
 #define MK_REPLY_STATE_MASK	(BIT(MK_REPLY_STATE_BITS) - 1)
 #define MK_REPLY_GENERATION_MAX	(U64_MAX >> MK_REPLY_STATE_BITS)
@@ -351,7 +369,7 @@ int mk_reply_claim(struct mk_instance *instance,
 			old = atomic64_cmpxchg_release(&slot->state_generation,
 						       abandoned, free);
 		if (old == writing || old == abandoned)
-			wake_up_all(&mk_reply_waitq);
+			mk_reply_wake_all();
 		atomic_inc(&shared->replies.late_replies);
 		return -ESTALE;
 	}
@@ -395,6 +413,7 @@ int mk_reply_publish_route_locked(struct mk_instance *instance,
 	u64 ready;
 	u64 free;
 	u64 old;
+	unsigned long flags;
 	int ret;
 
 	if (!instance || !reply || reply->slot >= MK_REPLY_SLOTS)
@@ -448,13 +467,17 @@ int mk_reply_publish_route_locked(struct mk_instance *instance,
 		return old == abandoned || old == committed ? -ESTALE : -EIO;
 	}
 
+	raw_spin_lock_irqsave(&instance->control_route_lock, flags);
 	target = mk_instance_irq_route_load(instance);
 	if (target == MK_PHYS_CPU_INVALID) {
 		ret = -ENODEV;
-		return ret;
+		goto unlock_route;
 	}
 	ret = 0;
 	mk_arch_send_ipi(target);
+
+unlock_route:
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, flags);
 	return ret;
 }
 
@@ -482,7 +505,7 @@ void mk_reply_scan(struct mk_shared_data *shared)
 		u64 token = atomic64_read_acquire(&slot->state_generation);
 
 		if (mk_reply_state(token) == MK_REPLY_READY) {
-			wake_up_all(&mk_reply_waitq);
+			mk_reply_wake_all();
 			return;
 		}
 	}
@@ -541,32 +564,39 @@ int mk_arm_force_halt(struct mk_instance *instance)
 	return 0;
 }
 
-static int __mk_send_ipi_data(struct mk_instance *instance,
-			      mk_phys_cpu_t target, void *data,
-			      size_t data_size, unsigned long type)
+int mk_send_ipi_data(struct mk_instance *instance, void *data,
+		     size_t data_size, unsigned long type)
 {
 	struct mk_ipi_endpoint *endpoint;
 	struct mk_ipi_data *slot;
 	struct mk_shared_data *shared;
-	unsigned long flags;
+	mk_phys_cpu_t target;
+	unsigned long route_flags;
+	unsigned long tx_flags;
 	u32 idx;
 	int ret = 0;
 
-	if (!instance || target == MK_PHYS_CPU_INVALID ||
-	    data_size > MK_MAX_DATA_SIZE || (data_size && !data))
+	if (!instance || data_size > MK_MAX_DATA_SIZE ||
+	    (data_size && !data))
 		return -EINVAL;
 	endpoint = &instance->ipi_endpoint;
 	if (!READ_ONCE(endpoint->registered))
 		return -ESHUTDOWN;
-	raw_spin_lock_irqsave(&endpoint->tx_lock, flags);
+	raw_spin_lock_irqsave(&instance->control_route_lock, route_flags);
+	target = mk_instance_irq_route_load(instance);
+	if (target == MK_PHYS_CPU_INVALID) {
+		ret = -ENODEV;
+		goto unlock_route;
+	}
+	raw_spin_lock_irqsave(&endpoint->tx_lock, tx_flags);
 	if (!READ_ONCE(endpoint->registered) || !endpoint->tx_enabled) {
 		ret = -ESHUTDOWN;
-		goto unlock;
+		goto unlock_endpoint;
 	}
 	shared = READ_ONCE(instance->ipi_data);
 	if (!shared) {
 		ret = -ENODEV;
-		goto unlock;
+		goto unlock_endpoint;
 	}
 	if (endpoint->parent_side)
 		WRITE_ONCE(shared->child_doorbell_cpu, target);
@@ -576,7 +606,7 @@ static int __mk_send_ipi_data(struct mk_instance *instance,
 	if (smp_load_acquire(&slot->ready)) {
 		atomic_inc(&endpoint->tx->full_failures);
 		ret = -ENOSPC;
-		goto unlock;
+		goto unlock_endpoint;
 	}
 	WRITE_ONCE(slot->sender_cpu, arch_cpu_physical_id(smp_processor_id()));
 	WRITE_ONCE(slot->type, type);
@@ -586,45 +616,29 @@ static int __mk_send_ipi_data(struct mk_instance *instance,
 	/* Publish all message fields before the receiver observes readiness. */
 	smp_store_release(&slot->ready, 1);
 	endpoint->tx_head++;
-unlock:
-	raw_spin_unlock_irqrestore(&endpoint->tx_lock, flags);
-	if (!ret)
+
+unlock_endpoint:
+	raw_spin_unlock_irqrestore(&endpoint->tx_lock, tx_flags);
+	if (!ret || ret == -ENOSPC)
 		mk_arch_send_ipi(target);
-	else if (ret == -ENOSPC && __ratelimit(&mk_ipi_full_rs))
+
+unlock_route:
+	raw_spin_unlock_irqrestore(&instance->control_route_lock, route_flags);
+	if (ret == -ENOSPC && __ratelimit(&mk_ipi_full_rs))
 		printk_deferred(KERN_WARNING
 				"multikernel: IPI ring full for instance %d\n",
 				instance->id);
 	return ret;
 }
 
-int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
-			    mk_phys_cpu_t target, void *data,
-			    size_t data_size, unsigned long type)
-{
-	return __mk_send_ipi_data(instance, target, data, data_size, type);
-}
-
-int mk_send_ipi_data(struct mk_instance *instance, void *data,
-		     size_t data_size, unsigned long type)
-{
-	mk_phys_cpu_t target;
-	int ret;
-
-	if (!instance)
-		return -EINVAL;
-	down_read(&instance->control_route_sem);
-	target = mk_instance_irq_route_load(instance);
-	ret = __mk_send_ipi_data(instance, target, data, data_size, type);
-	up_read(&instance->control_route_sem);
-	return ret;
-}
-
 int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size,
 			      unsigned long type)
 {
-	struct mk_instance *instance = mk_instance_find(instance_id);
+	struct mk_instance *instance;
 	int ret;
 
+	might_sleep();
+	instance = mk_instance_find(instance_id);
 	if (!instance)
 		return -EINVAL;
 	ret = mk_send_ipi_data(instance, data, data_size, type);

@@ -1695,7 +1695,7 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
 }
 
 /**
- * mk_pool_park_teardown() - Return the pool park area to the pool
+ * mk_arch_pool_park_teardown() - Return the pool park area to the pool
  *
  * The area is pool memory, so the chunk holding it cannot be removed
  * while it exists. Every parked CPU executes the park page and runs on
@@ -1703,10 +1703,12 @@ bool mk_pool_park_uses(phys_addr_t start, size_t size)
  * context, so the area may only go back while no CPU is in the pool at
  * all. The next baseline builds it again, possibly elsewhere.
  *
- * Returns 0 if there was nothing to tear down, -EBUSY if the pool still
- * has CPUs.
+ * The generic caller holds the instance and CPU transaction locks and has
+ * verified that every pool CPU is back before entering this function.
+ *
+ * Returns 0 after releasing the park area or if none exists.
  */
-int mk_pool_park_teardown(void)
+int mk_arch_pool_park_teardown(void)
 {
 	if (!mk_pool)
 		return 0;
@@ -1715,9 +1717,6 @@ int mk_pool_park_teardown(void)
 
 	if (!mk_pool->arch.slot)
 		return 0;
-
-	if (!mk_pool_cpus_returned())
-		return -EBUSY;
 
 	multikernel_free(mk_pool->arch.slot_phys,
 			 ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
