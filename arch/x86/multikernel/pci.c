@@ -16,6 +16,7 @@
 #include <linux/multikernel.h>
 #include <linux/panic.h>
 #include <linux/pci.h>
+#include <linux/ratelimit.h>
 #include <linux/topology.h>
 
 #include <asm/pci_x86.h>
@@ -26,6 +27,9 @@ static atomic64_t mk_pci_request_id = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_count = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_total_ns = ATOMIC64_INIT(0);
 static atomic64_t mk_pci_cfg_max_ns = ATOMIC64_INIT(0);
+static DEFINE_RATELIMIT_STATE(mk_pci_cfg_error_rs,
+			      DEFAULT_RATELIMIT_INTERVAL,
+			      DEFAULT_RATELIMIT_BURST);
 #define MK_PCI_RESET_TIMEOUT_MS	70000
 #ifdef CONFIG_PCI_MSI
 static void mk_pci_forward_irq_set_mask(struct irq_data *data, bool masked);
@@ -338,7 +342,7 @@ static int mk_pci_send_irq_request(struct mk_pci_irq_request *request)
 		return -EWOULDBLOCK;
 	might_sleep();
 	if (!request->lifecycle_generation || !mk_self ||
-	    !mk_self->ipi_data)
+	    !mk_self->ipi_data || !host_instance)
 		return -EINVAL;
 	request->lifecycle_epoch =
 		READ_ONCE(mk_self->ipi_data->spawn_epoch);
@@ -354,8 +358,9 @@ static int mk_pci_send_irq_request(struct mk_pci_irq_request *request)
 	request->reply_slot = reply.slot;
 	request->reply_generation = reply.generation;
 
-	ret = mk_send_message(host_instance->id, MK_MSG_PCI, MK_PCI_IRQ_REQUEST,
-			      request, sizeof(*request));
+	ret = mk_send_message_to_instance(host_instance, MK_MSG_PCI,
+					  MK_PCI_IRQ_REQUEST, request,
+					  sizeof(*request));
 	if (ret) {
 		mk_reply_release(mk_self->ipi_data, &reply);
 		return ret;
@@ -702,7 +707,7 @@ int mk_pci_reset_flr(struct pci_dev *dev)
 	if (WARN_ON_ONCE(irqs_disabled() || !in_task()))
 		return -EWOULDBLOCK;
 	might_sleep();
-	if (!mk_self || !mk_self->ipi_data)
+	if (!mk_self || !mk_self->ipi_data || !host_instance)
 		return -ENODEV;
 	request.lifecycle_epoch =
 		READ_ONCE(mk_self->ipi_data->spawn_epoch);
@@ -723,8 +728,9 @@ int mk_pci_reset_flr(struct pci_dev *dev)
 	request.reply_slot = reply.slot;
 	request.reply_generation = reply.generation;
 
-	ret = mk_send_message(host_instance->id, MK_MSG_PCI, MK_PCI_RESET_REQUEST,
-			      &request, sizeof(request));
+	ret = mk_send_message_to_instance(host_instance, MK_MSG_PCI,
+					  MK_PCI_RESET_REQUEST, &request,
+					  sizeof(request));
 	if (ret) {
 		mk_reply_release(mk_self->ipi_data, &reply);
 		return ret;
@@ -787,8 +793,9 @@ static int mk_pci_remote_config(unsigned int domain, unsigned int bus,
 	request.reply_slot = reply.slot;
 	request.reply_generation = reply.generation;
 
-	ret = mk_send_message(host_instance->id, MK_MSG_PCI, MK_PCI_CFG_REQUEST,
-			      &request, sizeof(request));
+	ret = mk_send_message_to_instance(host_instance, MK_MSG_PCI,
+					  MK_PCI_CFG_REQUEST, &request,
+					  sizeof(request));
 	if (ret) {
 		mk_reply_release(mk_self->ipi_data, &reply);
 		goto out_error;
@@ -807,10 +814,10 @@ static int mk_pci_remote_config(unsigned int domain, unsigned int bus,
 	return status;
 
 out_error:
-	if (ret < 0) {
-		pr_err_ratelimited("Multikernel PCI config request timed out or failed to send: %d\n",
-				   ret);
-	}
+	if (ret < 0 && __ratelimit(&mk_pci_cfg_error_rs))
+		printk_deferred(KERN_ERR
+				"Multikernel PCI config request timed out or failed to send: %d\n",
+				ret);
 	return PCIBIOS_SET_FAILED;
 }
 

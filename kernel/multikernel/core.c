@@ -320,6 +320,7 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 
 	instance->state = MK_STATE_READY;
 	init_rwsem(&instance->control_route_sem);
+	raw_spin_lock_init(&instance->control_route_lock);
 	instance->irq_route_cpu = MK_PHYS_CPU_INVALID;
 	instance->ipi_target = MK_PHYS_CPU_INVALID;
 	raw_spin_lock_init(&instance->ipi_endpoint.tx_lock);
@@ -465,23 +466,6 @@ struct mk_instance *mk_instance_find(int mk_id)
 	mutex_unlock(&mk_instance_mutex);
 
 	return instance;
-}
-
-int mk_instance_set_kexec_active(int mk_id)
-{
-	struct mk_instance *instance;
-
-	instance = mk_instance_find(mk_id);
-	if (!instance) {
-		pr_err("No sysfs instance found for multikernel ID %d\n", mk_id);
-		return -ENOENT;
-	}
-
-	mk_instance_set_state(instance, MK_STATE_ACTIVE);
-	mk_instance_put(instance);
-	pr_info("Multikernel instance %d is now active\n", mk_id);
-
-	return 0;
 }
 
 bool multikernel_allow_emergency_restart(void)
@@ -745,7 +729,7 @@ out_route:
 }
 
 /**
- * mk_pool_cpus_returned() - Is every pool CPU back in this kernel?
+ * mk_pool_cpus_returned_locked() - Is every pool CPU back in this kernel?
  *
  * True when the pool holds no free CPU and no instance owns one, so
  * nothing can be sitting in a park loop. Pool memory that parked CPUs
@@ -754,15 +738,17 @@ out_route:
  * instance's set before it parks, which is why the move paths reserve
  * room in the destination set up front.
  */
-bool mk_pool_cpus_returned(void)
+static bool mk_pool_cpus_returned_locked(void)
 {
 	struct mk_instance *instance;
 	bool returned = true;
 
+	lockdep_assert_held(&mk_instance_mutex);
+	lockdep_assert_held(&mk_cpu_transaction_mutex);
+
 	if (mk_pool && !mk_cpu_set_empty(mk_pool->cpus))
 		return false;
 
-	mutex_lock(&mk_instance_mutex);
 	list_for_each_entry(instance, &mk_instance_list, list) {
 		if (instance == mk_self)
 			continue;
@@ -773,9 +759,33 @@ bool mk_pool_cpus_returned(void)
 			break;
 		}
 	}
-	mutex_unlock(&mk_instance_mutex);
 
 	return returned;
+}
+
+/**
+ * mk_pool_park_teardown() - Safely return the architecture park area
+ *
+ * Freeze instance membership and CPU ownership while checking that every
+ * CPU is home, and keep both frozen until the architecture has returned the
+ * executable park area to ordinary pool memory.
+ *
+ * Returns 0 on success, or -EBUSY while a pool CPU remains assigned or parked.
+ */
+int mk_pool_park_teardown(void)
+{
+	int ret;
+
+	mutex_lock(&mk_instance_mutex);
+	mk_cpu_transaction_lock();
+	if (!mk_pool_cpus_returned_locked())
+		ret = -EBUSY;
+	else
+		ret = mk_arch_pool_park_teardown();
+	mk_cpu_transaction_unlock();
+	mutex_unlock(&mk_instance_mutex);
+
+	return ret;
 }
 
 static int mk_instance_reserve_cpus(struct mk_instance *instance,

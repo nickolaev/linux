@@ -1261,7 +1261,6 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
-	mk_phys_cpu_t route_cpu;
 	int ret;
 
 	raw_spin_lock_init(&removing.lock);
@@ -1336,11 +1335,9 @@ int mk_send_cpu_remove(int instance_id, mk_phys_cpu_t cpu_id)
 		mk_msg_pending_wait(pending, 0);
 		goto unlock_transaction;
 	}
-	route_cpu = mk_instance_irq_route_load(target_instance);
-
-	ret = mk_send_message_to_cpu(target_instance, route_cpu,
-				     MK_MSG_RESOURCE, MK_RES_CPU_REMOVE,
-				     &payload, sizeof(payload));
+	ret = mk_send_message_to_instance(target_instance, MK_MSG_RESOURCE,
+					  MK_RES_CPU_REMOVE, &payload,
+					  sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
 		goto unlock_transaction;

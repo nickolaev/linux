@@ -184,7 +184,8 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 }
 
 /**
- * mk_send_message - Send a message to another multikernel instance
+ * __mk_send_message - Send a message to another multikernel instance
+ * @instance: Lifetime-stable target instance, or NULL for ID lookup
  * @instance_id: Target multikernel instance ID
  * @msg_type: Message type identifier
  * @subtype: Message subtype
@@ -194,7 +195,6 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
  * Returns 0 on success, negative error code on failure
  */
 static int __mk_send_message(struct mk_instance *instance, int instance_id,
-			     mk_phys_cpu_t target,
 			     u32 msg_type, u32 subtype, void *payload,
 			     u32 payload_len)
 {
@@ -207,8 +207,9 @@ static int __mk_send_message(struct mk_instance *instance, int instance_id,
 
 	/* Check if message fits in IPI buffer */
 	if (total_size > MK_MAX_DATA_SIZE) {
-		pr_err("Multikernel message too large: %zu > %d bytes\n",
-		       total_size, MK_MAX_DATA_SIZE);
+		printk_deferred(KERN_ERR
+				"Multikernel message too large: %zu > %d bytes\n",
+				total_size, MK_MAX_DATA_SIZE);
 		return -EMSGSIZE;
 	}
 
@@ -228,10 +229,7 @@ static int __mk_send_message(struct mk_instance *instance, int instance_id,
 		memcpy(msg->payload, payload, payload_len);
 
 	/* Send via IPI using the message type as IPI type */
-	if (instance && target != MK_PHYS_CPU_INVALID)
-		ret = mk_send_ipi_data_to_cpu(instance, target, msg, total_size,
-					      msg_type);
-	else if (instance)
+	if (instance)
 		ret = mk_send_ipi_data(instance, msg, total_size, msg_type);
 	else
 		ret = multikernel_send_ipi_data(instance_id, msg, total_size,
@@ -241,12 +239,10 @@ static int __mk_send_message(struct mk_instance *instance, int instance_id,
 	kfree(msg);
 
 	if (ret < 0) {
-		pr_err("Failed to send multikernel message: %d\n", ret);
+		printk_deferred(KERN_ERR
+				"Failed to send multikernel message: %d\n", ret);
 		return ret;
 	}
-
-	pr_debug("Multikernel message sent: type=0x%x, subtype=0x%x, len=%u to instance %d\n",
-		 msg_type, subtype, payload_len, instance_id);
 
 	return 0;
 }
@@ -256,24 +252,15 @@ int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
 {
 	if (!instance)
 		return -EINVAL;
-	return __mk_send_message(instance, instance->id, MK_PHYS_CPU_INVALID,
+	return __mk_send_message(instance, instance->id,
 				 msg_type, subtype, payload, payload_len);
-}
-
-int mk_send_message_to_cpu(struct mk_instance *instance,
-			   mk_phys_cpu_t target, u32 msg_type, u32 subtype,
-			   void *payload, u32 payload_len)
-{
-	if (!instance || target == MK_PHYS_CPU_INVALID)
-		return -EINVAL;
-	return __mk_send_message(instance, instance->id, target, msg_type,
-				 subtype, payload, payload_len);
 }
 
 int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 		    void *payload, u32 payload_len)
 {
-	return __mk_send_message(NULL, instance_id, MK_PHYS_CPU_INVALID,
+	might_sleep();
+	return __mk_send_message(NULL, instance_id,
 				 msg_type, subtype, payload, payload_len);
 }
 EXPORT_SYMBOL(mk_send_message);

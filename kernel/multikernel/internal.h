@@ -23,20 +23,10 @@ int mk_instance_force_halt(struct mk_instance *instance);
 int mk_send_ipi_data(struct mk_instance *instance, void *data,
 		     size_t data_size, unsigned long type);
 struct mk_shared_data *mk_instance_halt_data(struct mk_instance *instance);
-int mk_send_ipi_data_to_cpu(struct mk_instance *instance,
-			    mk_phys_cpu_t target, void *data,
-			    size_t data_size, unsigned long type);
 void mk_poll_ipi_messages(void);
 int mk_reply_publish_route_locked(struct mk_instance *instance,
 				  const struct mk_reply_handle *reply,
 				  s32 status, u32 value);
-
-/* messaging.c */
-int mk_send_message_to_instance(struct mk_instance *instance, u32 msg_type,
-				u32 subtype, void *payload, u32 payload_len);
-int mk_send_message_to_cpu(struct mk_instance *instance,
-			   mk_phys_cpu_t target, u32 msg_type, u32 subtype,
-			   void *payload, u32 payload_len);
 
 /* kernfs.c */
 extern struct kernfs_node *mk_root_kn;
@@ -67,10 +57,12 @@ int mk_pci_parse_bdf(const char *pci_id, int len, u16 *domain, u8 *bus,
 		     u8 *slot, u8 *func);
 
 /* pci.c */
-#ifdef CONFIG_PCI
+#if defined(CONFIG_MULTIKERNEL) && defined(CONFIG_PCI)
 int mk_pci_lease_system_init(void);
 void mk_pci_lease_system_cleanup(void);
 void mk_pci_lease_instance_init(struct mk_instance *instance);
+void mk_pci_irq_retry_disable_sync(struct mk_instance *instance);
+void mk_pci_irq_retry_enable(struct mk_instance *instance);
 bool mk_pci_iommu_lease_active_locked(struct mk_instance *instance);
 int mk_pci_assign_devices(struct mk_instance *instance,
 			  const struct list_head *requested_devices,
@@ -87,6 +79,15 @@ unsigned int mk_pci_sync_instance_irq_route(struct mk_instance *instance);
 static inline int mk_pci_lease_system_init(void) { return 0; }
 static inline void mk_pci_lease_system_cleanup(void) { }
 static inline void mk_pci_lease_instance_init(struct mk_instance *instance) { }
+static inline void
+mk_pci_irq_retry_disable_sync(struct mk_instance *instance)
+{
+}
+
+static inline void mk_pci_irq_retry_enable(struct mk_instance *instance)
+{
+}
+
 static inline bool
 mk_pci_iommu_lease_active_locked(struct mk_instance *instance)
 {
