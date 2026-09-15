@@ -11,6 +11,7 @@
 #include <linux/spinlock.h>
 #include <linux/completion.h>
 #include <linux/multikernel.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 /* Pending message tracking for request-response pattern */
@@ -20,11 +21,12 @@ struct mk_pending_msg {
 	u64 resource_id;            /* Resource identifier (physical CPU ID, PFN, etc.) */
 	int result;                 /* Operation result */
 	struct completion done;     /* Completion for waiting */
+	struct work_struct complete_work;
 	struct list_head list;      /* List linkage */
 };
 
 static LIST_HEAD(mk_pending_msgs);
-static DEFINE_SPINLOCK(mk_pending_msgs_lock);
+static DEFINE_RAW_SPINLOCK(mk_pending_msgs_lock);
 
 /* Per-type message handler registry */
 struct mk_msg_type_handler {
@@ -96,6 +98,14 @@ static void mk_message_type_ipi_callback(struct mk_ipi_data *data, void *ctx)
  * Pending message tracking for request-response pattern
  */
 
+static void mk_msg_pending_complete_workfn(struct work_struct *work)
+{
+	struct mk_pending_msg *pending =
+		container_of(work, struct mk_pending_msg, complete_work);
+
+	complete(&pending->done);
+}
+
 /**
  * mk_msg_pending_add - Register a pending operation awaiting response
  * @msg_type: Message type
@@ -118,10 +128,11 @@ struct mk_pending_msg *mk_msg_pending_add(u32 msg_type, u32 operation, u64 resou
 	pending->resource_id = resource_id;
 	pending->result = -ETIMEDOUT;  /* Default to timeout */
 	init_completion(&pending->done);
+	INIT_WORK(&pending->complete_work, mk_msg_pending_complete_workfn);
 
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_add(&pending->list, &mk_pending_msgs);
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 
 	return pending;
 }
@@ -140,17 +151,17 @@ void mk_msg_pending_complete(u32 msg_type, u32 operation, u64 resource_id, int r
 	struct mk_pending_msg *pending;
 	unsigned long flags;
 
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_for_each_entry(pending, &mk_pending_msgs, list) {
 		if (pending->msg_type == msg_type &&
 		    pending->operation == operation &&
 		    pending->resource_id == resource_id) {
 			pending->result = result;
-			complete(&pending->done);
+			schedule_work(&pending->complete_work);
 			break;
 		}
 	}
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
 }
 
 /**
@@ -164,20 +175,21 @@ int mk_msg_pending_wait(struct mk_pending_msg *pending, unsigned long timeout_ms
 {
 	unsigned long timeout = msecs_to_jiffies(timeout_ms);
 	unsigned long flags;
+	bool timed_out;
 	int result;
 
-	if (!wait_for_completion_timeout(&pending->done, timeout)) {
+	timed_out = !wait_for_completion_timeout(&pending->done, timeout);
+	if (timed_out) {
 		pr_err("Timeout waiting for operation 0x%x on resource %llu\n",
 		       pending->operation, pending->resource_id);
-		result = -ETIMEDOUT;
-	} else {
-		result = pending->result;
 	}
 
 	/* Remove from list and free */
-	spin_lock_irqsave(&mk_pending_msgs_lock, flags);
+	raw_spin_lock_irqsave(&mk_pending_msgs_lock, flags);
 	list_del(&pending->list);
-	spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	result = timed_out ? -ETIMEDOUT : pending->result;
+	raw_spin_unlock_irqrestore(&mk_pending_msgs_lock, flags);
+	cancel_work_sync(&pending->complete_work);
 	kfree(pending);
 
 	return result;
