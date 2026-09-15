@@ -329,6 +329,8 @@ struct mk_instance *mk_instance_alloc(int id, const char *name)
 	INIT_LIST_HEAD(&instance->memory_regions);
 	INIT_LIST_HEAD(&instance->list);
 	INIT_LIST_HEAD(&instance->pci_devices);
+	mutex_init(&instance->resource_mutex);
+	INIT_LIST_HEAD(&instance->pci_assignments);
 	INIT_LIST_HEAD(&instance->platform_devices);
 	mk_pci_lease_instance_init(instance);
 	kref_init(&instance->refcount);

@@ -2298,8 +2298,6 @@ static int mk_pci_commit_transaction(struct list_head *transaction)
 
 void mk_pci_lease_instance_init(struct mk_instance *instance)
 {
-	mutex_init(&instance->resource_mutex);
-	INIT_LIST_HEAD(&instance->pci_assignments);
 	INIT_DELAYED_WORK(&instance->irq_retry_work, mk_pci_irq_retry_workfn);
 }
 
