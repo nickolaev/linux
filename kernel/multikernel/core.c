@@ -5,6 +5,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/bitmap.h>
 #include <linux/cpumask.h>
 #include <linux/cpu.h>
 #include <linux/delay.h>
@@ -13,7 +14,9 @@
 #include <linux/kexec.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
+#include <linux/ratelimit.h>
 #include <linux/vmalloc.h>
+#include <linux/workqueue.h>
 #include "internal.h"
 
 /* Lock order: transaction -> route write -> ownership -> resources. */
@@ -1538,9 +1541,11 @@ void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 
 struct mk_shutdown_work {
 	struct work_struct work;
-	u32 flags;
 	int sender_instance_id;
 };
+
+static struct mk_shutdown_work mk_shutdown_work;
+static atomic_t mk_shutdown_work_pending = ATOMIC_INIT(0);
 
 
 /*
@@ -1591,10 +1596,10 @@ void __noreturn mk_halt_to_pool(void)
 
 static void mk_shutdown_work_fn(struct work_struct *work)
 {
-	struct mk_shutdown_work *sw = container_of(work, struct mk_shutdown_work, work);
+	struct mk_shutdown_work *sw =
+		container_of(work, struct mk_shutdown_work, work);
 	int sender_instance_id = sw->sender_instance_id;
 
-	kfree(sw);
 	mk_notify_down_and_park(sender_instance_id, MK_SYS_SHUTDOWN_ACK);
 }
 
@@ -1628,8 +1633,48 @@ static int mk_instance_settle_halted(struct mk_instance *instance)
 
 struct mk_halted_work {
 	struct work_struct work;
+	unsigned int pool_slot;
 	int instance_id;
 };
+
+static struct mk_halted_work *mk_halted_work_pool;
+static unsigned long *mk_halted_work_pool_busy;
+static unsigned int mk_halted_work_pool_size;
+static atomic_t mk_halted_work_pool_cursor = ATOMIC_INIT(0);
+static struct workqueue_struct *mk_system_workqueue;
+static atomic64_t mk_system_work_dropped = ATOMIC64_INIT(0);
+static DEFINE_RATELIMIT_STATE(mk_system_work_rs,
+			     DEFAULT_RATELIMIT_INTERVAL,
+			     DEFAULT_RATELIMIT_BURST);
+
+static void mk_system_work_drop(void)
+{
+	atomic64_inc(&mk_system_work_dropped);
+	if (__ratelimit(&mk_system_work_rs))
+		printk_deferred("WARNING: Multikernel system work request dropped\n");
+}
+
+static struct mk_halted_work *mk_halted_work_get(void)
+{
+	unsigned int start;
+	unsigned int slot;
+	unsigned int i;
+
+	start = (unsigned int)atomic_inc_return(&mk_halted_work_pool_cursor);
+	for (i = 0; i < mk_halted_work_pool_size; i++) {
+		slot = (start + i) % mk_halted_work_pool_size;
+		if (!test_and_set_bit_lock(slot, mk_halted_work_pool_busy))
+			return &mk_halted_work_pool[slot];
+	}
+
+	mk_system_work_drop();
+	return NULL;
+}
+
+static void mk_halted_work_put(struct mk_halted_work *aw)
+{
+	clear_bit_unlock(aw->pool_slot, mk_halted_work_pool_busy);
+}
 
 static void mk_halted_work_fn(struct work_struct *work)
 {
@@ -1648,7 +1693,7 @@ static void mk_halted_work_fn(struct work_struct *work)
 			aw->instance_id);
 	}
 
-	kfree(aw);
+	mk_halted_work_put(aw);
 }
 
 static void mk_system_msg_handler(u32 msg_type, u32 subtype,
@@ -1660,22 +1705,19 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 
 	switch (subtype) {
 	case MK_SYS_SHUTDOWN: {
-		struct mk_shutdown_payload *req = payload;
-		struct mk_shutdown_work *sw;
-
-		if (payload_len < sizeof(*req))
+		if (payload_len < sizeof(struct mk_shutdown_payload))
 			return;
 
 		pr_info("Shutdown requested by instance %d\n", sender_instance_id);
 
-		sw = kmalloc(sizeof(*sw), GFP_ATOMIC);
-		if (!sw)
+		if (atomic_cmpxchg(&mk_shutdown_work_pending, 0, 1)) {
+			mk_system_work_drop();
 			return;
+		}
 
-		INIT_WORK(&sw->work, mk_shutdown_work_fn);
-		sw->flags = req->flags;
-		sw->sender_instance_id = sender_instance_id;
-		schedule_work(&sw->work);
+		mk_shutdown_work.sender_instance_id = sender_instance_id;
+		if (!queue_work(mk_system_workqueue, &mk_shutdown_work.work))
+			mk_system_work_drop();
 		break;
 	}
 	case MK_SYS_SHUTDOWN_ACK: {
@@ -1710,13 +1752,15 @@ static void mk_system_msg_handler(u32 msg_type, u32 subtype,
 		 * need time to reach the park loop, while this runs in IPI
 		 * context.
 		 */
-		aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+		aw = mk_halted_work_get();
 		if (!aw)
 			break;
 
-		INIT_WORK(&aw->work, mk_halted_work_fn);
-		aw->instance_id = ack->resource_id;
-		schedule_work(&aw->work);
+		aw->instance_id = sender_instance_id;
+		if (!queue_work(mk_system_workqueue, &aw->work)) {
+			mk_halted_work_put(aw);
+			mk_system_work_drop();
+		}
 		break;
 	}
 	default:
@@ -2034,6 +2078,65 @@ int multikernel_force_halt_by_id(int mk_id)
 	return ret;
 }
 
+static int __init mk_system_work_init(void)
+{
+	unsigned int pool_size;
+	unsigned int i;
+
+	INIT_WORK(&mk_shutdown_work.work, mk_shutdown_work_fn);
+	atomic_set(&mk_shutdown_work_pending, 0);
+
+	/* Allow every possible CPU to have all reply slots in flight. */
+	pool_size = max_t(unsigned int, num_possible_cpus(), 1) *
+			MK_REPLY_SLOTS;
+	mk_halted_work_pool = kcalloc(pool_size, sizeof(*mk_halted_work_pool),
+				      GFP_KERNEL);
+	if (!mk_halted_work_pool)
+		return -ENOMEM;
+
+	mk_halted_work_pool_busy = bitmap_zalloc(pool_size, GFP_KERNEL);
+	if (!mk_halted_work_pool_busy)
+		goto free_pool;
+	mk_halted_work_pool_size = pool_size;
+	atomic_set(&mk_halted_work_pool_cursor, 0);
+	for (i = 0; i < pool_size; i++) {
+		INIT_WORK(&mk_halted_work_pool[i].work, mk_halted_work_fn);
+		mk_halted_work_pool[i].pool_slot = i;
+	}
+
+	mk_system_workqueue =
+		alloc_workqueue("mk-system", WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	if (!mk_system_workqueue)
+		goto free_pool_bitmap;
+
+	return 0;
+
+free_pool_bitmap:
+	bitmap_free(mk_halted_work_pool_busy);
+	mk_halted_work_pool_busy = NULL;
+	mk_halted_work_pool_size = 0;
+free_pool:
+	kfree(mk_halted_work_pool);
+	mk_halted_work_pool = NULL;
+	return -ENOMEM;
+}
+
+static void mk_system_work_cleanup(void)
+{
+	if (mk_system_workqueue) {
+		destroy_workqueue(mk_system_workqueue);
+		mk_system_workqueue = NULL;
+	}
+	WARN_ON_ONCE(mk_halted_work_pool_busy &&
+		     !bitmap_empty(mk_halted_work_pool_busy,
+				   mk_halted_work_pool_size));
+	bitmap_free(mk_halted_work_pool_busy);
+	mk_halted_work_pool_busy = NULL;
+	mk_halted_work_pool_size = 0;
+	kfree(mk_halted_work_pool);
+	mk_halted_work_pool = NULL;
+}
+
 static int __init multikernel_init(void)
 {
 	int ret;
@@ -2049,9 +2152,18 @@ static int __init multikernel_init(void)
 		return ret;
 	}
 
+	ret = mk_system_work_init();
+	if (ret < 0) {
+		pr_err("Failed to initialize multikernel system work: %d\n", ret);
+		mk_messaging_cleanup();
+		mk_pci_lease_system_cleanup();
+		return ret;
+	}
+
 	ret = mk_register_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler, NULL);
 	if (ret < 0) {
 		pr_err("Failed to register system message handler: %d\n", ret);
+		mk_system_work_cleanup();
 		mk_messaging_cleanup();
 		mk_pci_lease_system_cleanup();
 		return ret;
@@ -2061,6 +2173,7 @@ static int __init multikernel_init(void)
 	if (ret < 0) {
 		pr_err("Failed to initialize multikernel hotplug: %d\n", ret);
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		mk_system_work_cleanup();
 		mk_messaging_cleanup();
 		mk_pci_lease_system_cleanup();
 		return ret;
@@ -2071,6 +2184,7 @@ static int __init multikernel_init(void)
 		pr_err("Failed to initialize multikernel sysfs interface: %d\n", ret);
 		mk_hotplug_cleanup();
 		mk_unregister_msg_handler(MK_MSG_SYSTEM, mk_system_msg_handler);
+		mk_system_work_cleanup();
 		mk_messaging_cleanup();
 		mk_pci_lease_system_cleanup();
 		return ret;
