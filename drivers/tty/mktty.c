@@ -27,6 +27,7 @@
 #include <linux/tty.h>
 #include <linux/tty_flip.h>
 #include <linux/multikernel.h>
+#include <linux/workqueue.h>
 
 #define MKTTY_IPI_TYPE		0x4D4B5459U	/* "MKTY" */
 #define MKTTY_MAX_DATA		(MK_MAX_DATA_SIZE - 16)
@@ -54,6 +55,7 @@ struct mktty_host_conn {
 	int instance_id;		/* -1 = not connected */
 	struct list_head list;
 	wait_queue_head_t wait;
+	struct work_struct wake_work;
 	raw_spinlock_t rx_lock;
 	char *rx_buf;
 	int rx_head;
@@ -63,6 +65,14 @@ struct mktty_host_conn {
 static LIST_HEAD(mktty_host_conns);
 static DEFINE_RAW_SPINLOCK(mktty_host_conns_lock);
 static struct mk_ipi_handler *mktty_host_handler;
+
+static void mktty_host_wake_workfn(struct work_struct *work)
+{
+	struct mktty_host_conn *conn =
+		container_of(work, struct mktty_host_conn, wake_work);
+
+	wake_up_interruptible(&conn->wait);
+}
 
 static struct mktty_host_conn *mktty_find_conn(int instance_id)
 {
@@ -92,6 +102,7 @@ static int mktty_host_open(struct inode *inode, struct file *filp)
 
 	conn->instance_id = -1;
 	init_waitqueue_head(&conn->wait);
+	INIT_WORK(&conn->wake_work, mktty_host_wake_workfn);
 	raw_spin_lock_init(&conn->rx_lock);
 	conn->rx_head = 0;
 	conn->rx_tail = 0;
@@ -113,6 +124,7 @@ static int mktty_host_release(struct inode *inode, struct file *filp)
 	list_del(&conn->list);
 	raw_spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 
+	cancel_work_sync(&conn->wake_work);
 	kfree(conn->rx_buf);
 	kfree(conn);
 	return 0;
@@ -292,7 +304,7 @@ static void mktty_host_ipi_handler(struct mk_ipi_data *data, void *ctx)
 			conn->rx_head = (conn->rx_head + 1) % MKTTY_RX_BUF_SIZE;
 		}
 		raw_spin_unlock(&conn->rx_lock);
-		wake_up_interruptible(&conn->wait);
+		schedule_work(&conn->wake_work);
 	}
 	raw_spin_unlock_irqrestore(&mktty_host_conns_lock, flags);
 }
