@@ -395,6 +395,12 @@ static void mk_transport_release(struct vsock_sock *vsk)
 			kfree_skb(skb);
 		}
 	}
+
+	/*
+	 * With a transport assigned, af_vsock leaves unhashing to us; a
+	 * socket left in the tables pins its port and itself forever.
+	 */
+	vsock_remove_sock(vsk);
 }
 
 static int mk_transport_connect(struct vsock_sock *vsk)
