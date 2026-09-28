@@ -314,6 +314,7 @@ void mk_pci_irq_mailbox_drain(struct mk_shared_data *shared)
 {
 	unsigned int word;
 
+	lockdep_assert_in_irq();
 	if (!shared)
 		return;
 	for (word = 0; word < MK_IRQ_MAILBOX_WORDS; word++) {

@@ -764,9 +764,6 @@ static void mk_ipi_drain_all(void)
 
 	if (!READ_ONCE(mk_handlers_ready))
 		return;
-	/* A kernel consumes only its own parent-link IRQ mailbox. */
-	if (mk_self && mk_self->ipi_data)
-		mk_pci_irq_mailbox_drain(mk_self->ipi_data);
 	idx = srcu_read_lock(&mk_ipi_srcu);
 	list_for_each_entry_srcu(endpoint, &mk_ipi_endpoints, rx_node,
 				 srcu_read_lock_held(&mk_ipi_srcu))
@@ -789,8 +786,12 @@ static void mk_ipi_drain_workfn(struct work_struct *work)
 
 void generic_multikernel_interrupt(void)
 {
-	if (READ_ONCE(mk_handlers_ready))
-		schedule_work(&mk_ipi_drain_work);
+	if (!READ_ONCE(mk_handlers_ready))
+		return;
+	/* x86 vector IRQs must be injected from actual hardirq context. */
+	if (mk_self && mk_self->ipi_data)
+		mk_pci_irq_mailbox_drain(mk_self->ipi_data);
+	schedule_work(&mk_ipi_drain_work);
 }
 
 /**
