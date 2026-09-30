@@ -608,16 +608,14 @@ void kimage_free_multikernel(struct kimage *image)
 	/* Load-time buffers were kept as the source for each spawn */
 	kimage_file_post_load_cleanup(image);
 
-	if (instance) {
-		if (instance->kimage == image) {
-			/* No kernel left to read the ring */
-			instance->ipi_data = NULL;
-			instance->kimage = NULL;
-			mk_instance_set_state(instance, MK_STATE_READY);
-		}
-		mk_instance_put(instance);
-		image->mk_instance = NULL;
+	if (instance->kimage == image) {
+		/* No kernel left to read the ring */
+		instance->ipi_data = NULL;
+		instance->kimage = NULL;
+		mk_instance_set_state(instance, MK_STATE_READY);
 	}
+	mk_instance_put(instance);
+	image->mk_instance = NULL;
 }
 
 void kimage_free(struct kimage *image)
@@ -1196,21 +1194,6 @@ void kimage_update_compat_pointers(struct kimage *new_image, int type)
 		kexec_image = new_image;
 	}
 	mutex_unlock(&kexec_image_mutex);
-}
-
-int kimage_get_all_by_type(int type, struct kimage **images, int max_count)
-{
-	struct kimage *image;
-	int count = 0;
-
-	mutex_lock(&kexec_image_mutex);
-	list_for_each_entry(image, &kexec_image_list, list) {
-		if (image->type == type && count < max_count) {
-			images[count++] = image;
-		}
-	}
-	mutex_unlock(&kexec_image_mutex);
-	return count;
 }
 
 void kimage_list_lock(void)

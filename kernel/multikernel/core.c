@@ -1506,9 +1506,6 @@ void mk_instance_mem_free(struct mk_instance *instance, void *virt_addr, size_t 
  */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align)
 {
-	if (!image || !image->mk_instance)
-		return NULL;
-
 	return mk_instance_mem_alloc(image->mk_instance, size, align);
 }
 
@@ -1520,9 +1517,6 @@ void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align)
  */
 void mk_kimage_free(struct kimage *image, void *virt_addr, size_t size)
 {
-	if (!image || !image->mk_instance)
-		return;
-
 	mk_instance_mem_free(image->mk_instance, virt_addr, size);
 }
 

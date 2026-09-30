@@ -899,13 +899,6 @@ static int kexec_alloc_multikernel(struct kexec_buf *kbuf)
 	pr_info("kexec_alloc_multikernel: called for segment size=0x%lx, buf_min=0x%lx, buf_max=0x%lx, align=0x%lx\n",
 		kbuf->memsz, kbuf->buf_min, kbuf->buf_max, kbuf->buf_align);
 
-	/* Check if this is a multikernel image with an associated instance */
-	if (!kbuf->image->mk_instance || kbuf->image->type != KEXEC_TYPE_MULTIKERNEL) {
-		pr_info("kexec_alloc_multikernel: not a multikernel image (mk_instance=%p, type=%d)\n",
-			kbuf->image->mk_instance, kbuf->image->type);
-		return -EPERM;
-	}
-
 	/* Allocate from the multikernel instance pool using the proper API */
 	virt_addr = mk_kimage_alloc(kbuf->image, kbuf->memsz, kbuf->buf_align);
 	if (!virt_addr) {

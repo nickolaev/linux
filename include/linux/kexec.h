@@ -442,7 +442,7 @@ struct kimage {
 	/* Multikernel unique ID (0 = current kernel, >0 = multikernel images) */
 	int mk_id;
 
-	/* Multikernel instance cross-reference */
+	/* Set for the image's lifetime exactly when type is KEXEC_TYPE_MULTIKERNEL */
 	struct mk_instance *mk_instance;
 };
 
@@ -485,7 +485,7 @@ bool kexec_load_permitted(int kexec_image_type);
 #define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_UPDATE_ELFCOREHDR | KEXEC_CRASH_HOTPLUG_SUPPORT)
 #else
 #define KEXEC_FLAGS    (KEXEC_ON_CRASH | KEXEC_PRESERVE_CONTEXT | KEXEC_UPDATE_ELFCOREHDR | \
-			KEXEC_CRASH_HOTPLUG_SUPPORT | KEXEC_MULTIKERNEL)
+			KEXEC_CRASH_HOTPLUG_SUPPORT)
 #endif
 
 /* List of defined/legal kexec file flags */
@@ -566,7 +566,6 @@ extern struct kimage *kimage_find_by_type(int type);
 extern void kimage_add_to_list(struct kimage *image);
 extern void kimage_remove_from_list(struct kimage *image);
 extern void kimage_update_compat_pointers(struct kimage *new_image, int type);
-extern int kimage_get_all_by_type(int type, struct kimage **images, int max_count);
 extern void kimage_list_lock(void);
 extern void kimage_list_unlock(void);
 extern void kimage_list_multikernel_images(void);
