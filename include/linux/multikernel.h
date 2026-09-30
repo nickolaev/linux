@@ -550,8 +550,7 @@ extern struct mk_instance *host_instance;
  * Used by instance management to track both resource hierarchy and pool chunks.
  */
 struct mk_memory_region {
-	struct resource res;            /* The actual resource */
-	struct gen_pool_chunk *chunk;   /* Associated gen_pool chunk */
+	struct resource res;            /* The actual resource, one instance pool chunk */
 	struct list_head list;          /* List entry for management */
 };
 
@@ -897,6 +896,12 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 				  int node);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);
+int mk_instance_begin_memory_removal(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size);
+void mk_instance_abort_memory_removal(struct mk_instance *instance,
+				      phys_addr_t phys_addr, size_t size);
+void mk_instance_finish_memory_removal(struct mk_instance *instance,
+				       phys_addr_t phys_addr, size_t size);
 int mk_instance_add_pci_device(struct mk_instance *instance,
 			       u16 domain, u8 bus, u8 devfn);
 int mk_instance_remove_pci_device(struct mk_instance *instance,

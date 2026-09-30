@@ -1518,27 +1518,35 @@ int mk_send_mem_remove(int instance_id, u64 start_pfn, u64 nr_pages)
 		goto out;
 	}
 
+	/* Before the running kernel gives the memory up, not after */
+	ret = mk_instance_begin_memory_removal(target_instance, PFN_PHYS(start_pfn),
+					       PFN_PHYS(nr_pages));
+	if (ret)
+		goto out;
+
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_REMOVE, start_pfn);
 	if (!pending) {
 		ret = -ENOMEM;
-		goto out;
+		goto abort;
 	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_REMOVE,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		goto out;
+		goto abort;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		goto out;
+		goto abort;
 
-	/* Update root kernel's view of instance memory after successful IPI */
-	ret = mk_instance_remove_memory_region(target_instance,
-					       PFN_PHYS(start_pfn),
-					       PFN_PHYS(nr_pages));
+	mk_instance_finish_memory_removal(target_instance, PFN_PHYS(start_pfn),
+					  PFN_PHYS(nr_pages));
+	goto out;
+abort:
+	mk_instance_abort_memory_removal(target_instance, PFN_PHYS(start_pfn),
+					 PFN_PHYS(nr_pages));
 out:
 	mk_instance_put(target_instance);
 	return ret;

@@ -335,7 +335,10 @@ cleanup:
  * multikernel_destroy_instance_pool() - Destroy an instance memory pool
  * @pool_handle: Handle returned by multikernel_create_instance_pool()
  *
- * Frees all memory associated with the instance pool back to the main pool
+ * Frees the memory of every chunk the instance still owns back to the main
+ * pool. Nothing may be allocated from the pool any more, so a chunk with no
+ * space left is one whose region left the instance: its memory went back
+ * then, and only the reservation holding it is dropped.
  */
 void multikernel_destroy_instance_pool(void *pool_handle)
 {
@@ -345,9 +348,14 @@ void multikernel_destroy_instance_pool(void *pool_handle)
 	if (!instance_pool)
 		return;
 
-	/* Free all chunks back to main pool */
 	list_for_each_entry(chunk, &instance_pool->chunks, next_chunk) {
-		multikernel_free(chunk->start_addr, chunk->end_addr - chunk->start_addr + 1);
+		size_t size = chunk->end_addr - chunk->start_addr + 1;
+
+		if (!atomic_long_read(&chunk->avail)) {
+			gen_pool_free(instance_pool, chunk->start_addr, size);
+			continue;
+		}
+		multikernel_free(chunk->start_addr, size);
 		pr_debug("Freed instance pool chunk: 0x%lx-0x%lx\n",
 			 chunk->start_addr, chunk->end_addr);
 	}
@@ -416,6 +424,63 @@ size_t multikernel_instance_pool_avail(void *pool_handle)
 	return gen_pool_avail(instance_pool);
 }
 
+/*
+ * Every region of an instance is one chunk of its instance pool, which is
+ * where its kernel image and control block are allocated from. A region that
+ * leaves the instance keeps its chunk, reserved in full, since a gen_pool
+ * cannot give a chunk back.
+ */
+static int mk_instance_pool_add(struct mk_instance *instance, phys_addr_t phys_addr,
+				size_t size, int node)
+{
+	if (!instance->instance_pool) {
+		instance->instance_pool = gen_pool_create(PAGE_SHIFT, -1);
+		if (!instance->instance_pool)
+			return -ENOMEM;
+	}
+
+	if (gen_pool_add(instance->instance_pool, phys_addr, size, node))
+		return -ENOMEM;
+	instance->pool_size += size;
+	return 0;
+}
+
+/* gen_pool algorithm: all of the chunk that starts at *data, or nothing */
+static unsigned long mk_whole_chunk_algo(unsigned long *map, unsigned long size,
+					 unsigned long start, unsigned int nr,
+					 void *data, struct gen_pool *pool,
+					 unsigned long start_addr)
+{
+	if (start_addr != *(unsigned long *)data || nr != size)
+		return size;
+	return bitmap_find_next_zero_area(map, size, 0, nr, 0) ? size : 0;
+}
+
+/* Reserve a region's whole chunk, or fail if anything is allocated in it */
+static int mk_instance_pool_reserve(struct mk_instance *instance,
+				    phys_addr_t phys_addr, size_t size)
+{
+	unsigned long start = phys_addr;
+
+	if (gen_pool_alloc_algo(instance->instance_pool, size,
+				mk_whole_chunk_algo, &start) != start)
+		return -EBUSY;
+	instance->pool_size -= size;
+	return 0;
+}
+
+static struct mk_memory_region *mk_instance_find_region(struct mk_instance *instance,
+							phys_addr_t phys_addr, size_t size)
+{
+	struct mk_memory_region *region;
+
+	list_for_each_entry(region, &instance->memory_regions, list)
+		if (region->res.start == phys_addr &&
+		    resource_size(&region->res) == size)
+			return region;
+	return NULL;
+}
+
 /**
  * mk_instance_add_memory_region() - Add a memory region to an instance
  * @instance: Target instance
@@ -461,13 +526,21 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 	region->res.start = phys_addr;
 	region->res.end = phys_addr + size - 1;
 	region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
-	region->chunk = NULL;  /* For overlay-added regions */
 
 	parent = mk_pool_chunk_resource(phys_addr);
 	ret = parent ? insert_resource(parent, &region->res) : -ENODEV;
 	if (ret) {
 		pr_err("Failed to insert resource for instance %d region %d: %d\n",
 		       instance->id, instance->region_count, ret);
+		kfree(region->res.name);
+		kfree(region);
+		multikernel_free(phys_addr, size);
+		return ret;
+	}
+
+	ret = mk_instance_pool_add(instance, phys_addr, size, node);
+	if (ret) {
+		remove_resource(&region->res);
 		kfree(region->res.name);
 		kfree(region);
 		multikernel_free(phys_addr, size);
@@ -485,25 +558,81 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 	return 0;
 }
 
-/* Does [phys_addr, phys_addr+size) back a segment of the loaded image? */
-static bool mk_range_backs_kimage(struct mk_instance *instance,
-				  phys_addr_t phys_addr, size_t size)
+/**
+ * mk_instance_begin_memory_removal() - Take a region away from the instance pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ *
+ * Reserves the region's chunk so nothing more is allocated from it. Follow
+ * with mk_instance_finish_memory_removal(), or with
+ * mk_instance_abort_memory_removal() if the region has to stay.
+ *
+ * Returns: 0 on success, -ENOENT if no region matches exactly, -EBUSY if the
+ * instance's kernel image or control block lives in it
+ */
+int mk_instance_begin_memory_removal(struct mk_instance *instance,
+				     phys_addr_t phys_addr, size_t size)
 {
-	struct kimage *image = instance->kimage;
-	unsigned long i;
-
-	if (!image)
-		return false;
-
-	for (i = 0; i < image->nr_segments; i++) {
-		unsigned long start = image->segment[i].mem;
-		unsigned long end = start + image->segment[i].memsz;
-
-		if (phys_addr < end && start < phys_addr + size)
-			return true;
+	if (!mk_instance_find_region(instance, phys_addr, size)) {
+		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
+			(unsigned long long)phys_addr,
+			(unsigned long long)(phys_addr + size - 1),
+			instance->id, instance->name);
+		return -ENOENT;
 	}
 
-	return false;
+	if (mk_instance_pool_reserve(instance, phys_addr, size)) {
+		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): its kernel image or control block lives there\n",
+		       (unsigned long long)phys_addr,
+		       (unsigned long long)(phys_addr + size - 1),
+		       instance->id, instance->name);
+		return -EBUSY;
+	}
+	return 0;
+}
+
+/**
+ * mk_instance_abort_memory_removal() - Give a region back to the instance pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ */
+void mk_instance_abort_memory_removal(struct mk_instance *instance,
+				      phys_addr_t phys_addr, size_t size)
+{
+	gen_pool_free(instance->instance_pool, phys_addr, size);
+	instance->pool_size += size;
+}
+
+/**
+ * mk_instance_finish_memory_removal() - Hand a region back to the multikernel pool
+ * @instance: Target instance
+ * @phys_addr: Physical address of the memory region
+ * @size: Size of the memory region
+ *
+ * The region must have been through mk_instance_begin_memory_removal().
+ */
+void mk_instance_finish_memory_removal(struct mk_instance *instance,
+				       phys_addr_t phys_addr, size_t size)
+{
+	struct mk_memory_region *region;
+
+	region = mk_instance_find_region(instance, phys_addr, size);
+	list_del(&region->list);
+	if (region->res.parent)
+		remove_resource(&region->res);
+
+	multikernel_free(phys_addr, size);
+
+	kfree(region->res.name);
+	kfree(region);
+	instance->region_count--;
+
+	pr_info("Removed memory region 0x%llx-0x%llx (%zu MB) from instance %d (%s)\n",
+		(unsigned long long)phys_addr,
+		(unsigned long long)(phys_addr + size - 1),
+		size >> 20, instance->id, instance->name);
 }
 
 /**
@@ -512,61 +641,22 @@ static bool mk_range_backs_kimage(struct mk_instance *instance,
  * @phys_addr: Physical address of the memory region
  * @size: Size of the memory region
  *
- * Removes a memory region from the instance's memory_regions list and
- * frees it back to the main multikernel pool. Used for non-running instances
- * where we only need to track memory deallocation without performing memory
- * hotplug operations.
+ * For instances not running a kernel, where no hotplug is involved.
  *
- * Returns: 0 on success, -ENOENT if region not found
+ * Returns: 0 on success, or an error from mk_instance_begin_memory_removal()
  */
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size)
 {
-	struct mk_memory_region *region, *tmp;
-	bool found = false;
+	int ret;
 
 	if (!instance)
 		return -EINVAL;
 
-	if (mk_range_backs_kimage(instance, phys_addr, size)) {
-		pr_err("Refusing to remove 0x%llx-0x%llx from instance %d (%s): the loaded kernel image lives there\n",
-		       (unsigned long long)phys_addr,
-		       (unsigned long long)(phys_addr + size - 1),
-		       instance->id, instance->name);
-		return -EBUSY;
-	}
-
-	list_for_each_entry_safe(region, tmp, &instance->memory_regions, list) {
-		if (region->res.start == phys_addr &&
-		    resource_size(&region->res) == size) {
-			list_del(&region->list);
-			if (region->res.parent)
-				remove_resource(&region->res);
-
-			multikernel_free(phys_addr, size);
-
-			kfree(region->res.name);
-			kfree(region);
-			instance->region_count--;
-			found = true;
-
-			pr_info("Removed memory region 0x%llx-0x%llx (%zu MB) from instance %d (%s)\n",
-				(unsigned long long)phys_addr,
-				(unsigned long long)(phys_addr + size - 1),
-				size >> 20, instance->id, instance->name);
-			break;
-		}
-	}
-
-	if (!found) {
-		pr_warn("Memory region 0x%llx-0x%llx not found in instance %d (%s)\n",
-			(unsigned long long)phys_addr,
-			(unsigned long long)(phys_addr + size - 1),
-			instance->id, instance->name);
-		return -ENOENT;
-	}
-
-	return 0;
+	ret = mk_instance_begin_memory_removal(instance, phys_addr, size);
+	if (!ret)
+		mk_instance_finish_memory_removal(instance, phys_addr, size);
+	return ret;
 }
 
 /**
