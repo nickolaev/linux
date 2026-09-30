@@ -444,10 +444,6 @@ struct kimage {
 
 	/* Multikernel instance cross-reference */
 	struct mk_instance *mk_instance;
-
-	/* Multikernel manifest page and message ring (physical addresses) */
-	phys_addr_t mk_manifest;
-	phys_addr_t mk_ipi;
 };
 
 /* kexec interface functions */

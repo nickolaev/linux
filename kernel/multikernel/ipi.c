@@ -117,28 +117,6 @@ void multikernel_unregister_handler(struct mk_ipi_handler *handler)
 }
 EXPORT_SYMBOL(multikernel_unregister_handler);
 
-/*
- * An instance's IPI area is allocated when its image is loaded; the
- * instance pointer is filled in lazily on first use.
- */
-static struct mk_shared_data *mk_instance_ipi_area(struct mk_instance *instance)
-{
-	struct mk_shared_data *ipi_data;
-
-	if (instance->ipi_data)
-		return instance->ipi_data;
-
-	if (!instance->kimage || !instance->kimage->mk_ipi)
-		return NULL;
-
-	ipi_data = phys_to_virt(instance->kimage->mk_ipi);
-	if (cmpxchg(&instance->ipi_data, NULL, ipi_data) == NULL)
-		pr_info("Initialized IPI ring buffer for instance %d: phys=0x%llx\n",
-			instance->id, (unsigned long long)instance->kimage->mk_ipi);
-
-	return instance->ipi_data;
-}
-
 /**
  * mk_arm_force_halt - Post the force-halt marker for an instance
  * @instance: Instance about to be NMIed
@@ -153,7 +131,7 @@ static struct mk_shared_data *mk_instance_ipi_area(struct mk_instance *instance)
  */
 int mk_arm_force_halt(struct mk_instance *instance)
 {
-	struct mk_shared_data *ipi_data = mk_instance_ipi_area(instance);
+	struct mk_shared_data *ipi_data = READ_ONCE(instance->ipi_data);
 
 	if (!ipi_data)
 		return -ENODEV;
@@ -180,6 +158,7 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 {
 	struct mk_ipi_data *slot;
 	struct mk_instance *instance = mk_instance_find(instance_id);
+	struct mk_shared_data *ipi_data;
 	unsigned int head, next_head, tail;
 	mk_phys_cpu_t target;
 
@@ -199,7 +178,9 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		return -ENODEV;
 	}
 
-	if (!mk_instance_ipi_area(instance)) {
+	/* The ring lives as long as the instance, which is pinned here */
+	ipi_data = READ_ONCE(instance->ipi_data);
+	if (!ipi_data) {
 		pr_err("Multikernel IPI buffer not available for instance %d\n", instance_id);
 		mk_instance_put(instance);
 		return -ENODEV;
@@ -207,9 +188,9 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 
 	/* Try to enqueue the message in the ring buffer */
 	do {
-		head = mk_ring_idx(atomic_read(&instance->ipi_data->ring.head));
+		head = mk_ring_idx(atomic_read(&ipi_data->ring.head));
 		next_head = mk_ring_idx(head + 1);
-		tail = mk_ring_idx(atomic_read(&instance->ipi_data->ring.tail));
+		tail = mk_ring_idx(atomic_read(&ipi_data->ring.tail));
 
 		/* Check if ring buffer is full */
 		if (next_head == tail) {
@@ -226,10 +207,10 @@ int multikernel_send_ipi_data(int instance_id, void *data, size_t data_size, uns
 		}
 
 		/* Try to claim this slot atomically */
-	} while (atomic_cmpxchg(&instance->ipi_data->ring.head, head, next_head) != head);
+	} while (atomic_cmpxchg(&ipi_data->ring.head, head, next_head) != head);
 
 	/* We've claimed slot 'head', now fill it */
-	slot = &instance->ipi_data->ring.entries[head];
+	slot = &ipi_data->ring.entries[head];
 
 	slot->sender_cpu = arch_cpu_physical_id(smp_processor_id());
 	slot->type = type;

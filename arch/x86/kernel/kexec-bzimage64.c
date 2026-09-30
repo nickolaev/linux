@@ -311,13 +311,13 @@ static void setup_multikernel(const struct kimage *image,
 	struct setup_data *sd = (void *)params + setup_data_offset;
 	struct mk_setup_data *mk = (void *)sd + sizeof(*sd);
 
-	if (image->type != KEXEC_TYPE_MULTIKERNEL || !image->mk_manifest)
+	if (image->type != KEXEC_TYPE_MULTIKERNEL)
 		return;
 
 	sd->type = SETUP_MULTIKERNEL;
 	sd->len = sizeof(struct mk_setup_data);
 
-	mk->fdt_addr = image->mk_manifest;
+	mk->fdt_addr = image->mk_instance->manifest_phys;
 	mk->fdt_size = MK_MANIFEST_SIZE;
 
 	sd->next = params->hdr.setup_data;

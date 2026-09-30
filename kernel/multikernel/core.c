@@ -165,6 +165,52 @@ static void mk_instance_track_dump(struct mk_instance *instance,
 		atomic_dec(&mk_dump_backups);
 }
 
+/**
+ * mk_instance_alloc_boot_pages() - Allocate the pages a spawn boots with
+ * @instance: Host-side instance being loaded
+ *
+ * The manifest page and the IPI ring live as long as the instance, across
+ * loads, unloads and re-spawns. Allocating them again is a no-op.
+ *
+ * Returns 0 on success, -ENOMEM on failure.
+ */
+int mk_instance_alloc_boot_pages(struct mk_instance *instance)
+{
+	struct page *manifest, *ring;
+	unsigned int ring_order = get_order(sizeof(struct mk_shared_data));
+
+	if (instance->manifest_phys)
+		return 0;
+
+	manifest = alloc_pages(GFP_KERNEL | __GFP_ZERO, get_order(MK_MANIFEST_SIZE));
+	if (!manifest)
+		return -ENOMEM;
+	ring = alloc_pages(GFP_KERNEL | __GFP_ZERO, ring_order);
+	if (!ring) {
+		__free_pages(manifest, get_order(MK_MANIFEST_SIZE));
+		return -ENOMEM;
+	}
+
+	instance->ipi_phys = page_to_phys(ring);
+	instance->ipi_pages = PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
+	instance->manifest_phys = page_to_phys(manifest);
+	return 0;
+}
+
+static void mk_instance_free_boot_pages(struct mk_instance *instance)
+{
+	if (!instance->manifest_phys)
+		return;
+
+	__free_pages(phys_to_page(instance->ipi_phys),
+		     get_order(sizeof(struct mk_shared_data)));
+	__free_pages(phys_to_page(instance->manifest_phys),
+		     get_order(MK_MANIFEST_SIZE));
+	instance->ipi_data = NULL;
+	instance->ipi_phys = 0;
+	instance->manifest_phys = 0;
+}
+
 static void mk_instance_release(struct kref *kref)
 {
 	struct mk_instance *instance = container_of(kref, struct mk_instance, refcount);
@@ -176,6 +222,7 @@ static void mk_instance_release(struct kref *kref)
 	mk_instance_return_pci_devices(instance);
 	mk_instance_return_platform_devices(instance);
 	mk_instance_free_memory(instance);
+	mk_instance_free_boot_pages(instance);
 
 	mk_instance_track_dump(instance, instance->state, MK_STATE_READY);
 	kfree(instance->host_tree);

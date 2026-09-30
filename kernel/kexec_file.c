@@ -406,7 +406,6 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 #endif
 	if (instance) {
 		int mk_id = KEXEC_GET_MK_ID(flags);
-		struct page *fdt_page;
 
 		image->type = KEXEC_TYPE_MULTIKERNEL;
 
@@ -416,34 +415,9 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
 
-		fdt_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
-				       get_order(MK_MANIFEST_SIZE));
-		if (!fdt_page) {
-			pr_err("Failed to allocate FDT pages for multikernel kimage\n");
-			ret = -ENOMEM;
+		ret = mk_instance_alloc_boot_pages(instance);
+		if (ret)
 			goto out_free_image;
-		}
-		image->mk_manifest = page_to_phys(fdt_page);
-
-		{
-			struct page *ipi_page;
-			unsigned int order;
-			size_t ipi_buffer_size;
-
-			ipi_buffer_size = sizeof(struct mk_shared_data);
-			order = get_order(ipi_buffer_size);
-			ipi_page = alloc_pages(GFP_KERNEL | __GFP_ZERO, order);
-			if (!ipi_page) {
-				pr_err("Failed to allocate %zu bytes (order %u) for IPI buffer\n",
-				       ipi_buffer_size, order);
-				ret = -ENOMEM;
-				goto out_free_image;
-			}
-			image->mk_ipi = page_to_phys(ipi_page);
-
-			pr_info("Allocated IPI ring buffer: phys=0x%llx, size=%zu bytes (order %u)\n",
-				(unsigned long long)image->mk_ipi, ipi_buffer_size, order);
-		}
 	}
 
 	ret = kimage_file_prepare_segments(image, kernel_fd, initrd_fd,
@@ -640,6 +614,7 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
 		/* Publish only a complete image to exec, unload and IPI */
 		image->mk_instance->kimage = image;
+		image->mk_instance->ipi_data = phys_to_virt(image->mk_instance->ipi_phys);
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
 		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */

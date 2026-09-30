@@ -665,10 +665,20 @@ struct mk_instance {
 	int platform_device_count;           /* Number of platform devices */
 	bool platform_devices_valid;         /* Whether platform device list is valid */
 
-	/* IPI communication buffer */
+	/*
+	 * IPI communication buffer. ipi_data is set only while the ring can
+	 * be addressed: always for this kernel's own records, and on the host
+	 * while an image is loaded for the instance.
+	 */
 	struct mk_shared_data *ipi_data; /* IPI shared memory buffer (virtual address) */
 	phys_addr_t ipi_phys;           /* IPI buffer physical address */
 	u32 ipi_pages;                  /* IPI buffer size in pages */
+	/*
+	 * Host side only: the page the instance's boot tree is written to at
+	 * each exec. It and the IPI ring are allocated on the first load and
+	 * freed with the instance; a zero here means the host owns neither.
+	 */
+	phys_addr_t manifest_phys;
 	/*
 	 * On a spawn's record of its host: the physical address of the
 	 * host's pool wake slot, where the host's CPUs park. A backup
@@ -846,6 +856,7 @@ struct mk_instance *mk_instance_find_by_name(const char *name);
  * Returns the instance pointer for convenience.
  */
 struct mk_instance *mk_instance_get(struct mk_instance *instance);
+int mk_instance_alloc_boot_pages(struct mk_instance *instance);
 
 /**
  * mk_halt_to_pool() - Halt this spawn kernel, returning its CPUs to the pool

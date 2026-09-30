@@ -593,8 +593,8 @@ static void kimage_free_cma(struct kimage *image)
 
 /*
  * Release what a multikernel image holds: its segments in the instance pool,
- * its load-time buffers, its manifest and IPI pages, and its reference on the
- * instance. Also unwinds a load that failed before the image was published.
+ * its load-time buffers and its reference on the instance. Also unwinds a
+ * load that failed before the image was published.
  */
 void kimage_free_multikernel(struct kimage *image)
 {
@@ -610,31 +610,13 @@ void kimage_free_multikernel(struct kimage *image)
 
 	if (instance) {
 		if (instance->kimage == image) {
-			/*
-			 * The ring is freed below. Drop the instance's pointer
-			 * to it first, or the next message sent to this
-			 * instance lands in pages the allocator has already
-			 * handed to someone else.
-			 */
+			/* No kernel left to read the ring */
 			instance->ipi_data = NULL;
-			instance->ipi_phys = 0;
 			instance->kimage = NULL;
 			mk_instance_set_state(instance, MK_STATE_READY);
 		}
 		mk_instance_put(instance);
 		image->mk_instance = NULL;
-	}
-
-	if (image->mk_manifest) {
-		__free_pages(phys_to_page(image->mk_manifest),
-			     get_order(MK_MANIFEST_SIZE));
-		image->mk_manifest = 0;
-	}
-
-	if (image->mk_ipi) {
-		__free_pages(phys_to_page(image->mk_ipi),
-			     get_order(sizeof(struct mk_shared_data)));
-		image->mk_ipi = 0;
 	}
 }
 
@@ -1769,21 +1751,6 @@ int multikernel_kexec_by_id(int mk_id)
 		pr_warn("Manifest finalization failed: %d\n", rc);
 	else
 		pr_info("Manifest finalized for multikernel instance\n");
-
-	/*
-	 * Point at the ring this image actually carries. Every load
-	 * allocates a new one and publishes it through KHO, so the spawn
-	 * kernel maps whatever the image says - while the host would
-	 * otherwise keep using the pointer it cached on its first send,
-	 * which after a re-load belongs to nobody. The two then never see
-	 * each other's messages.
-	 */
-	if (mk_image->mk_ipi) {
-		instance->ipi_phys = mk_image->mk_ipi;
-		instance->ipi_data = phys_to_virt(mk_image->mk_ipi);
-		instance->ipi_pages =
-			PAGE_ALIGN(sizeof(struct mk_shared_data)) >> PAGE_SHIFT;
-	}
 
 	/*
 	 * Start the instance with an empty ring. It outlives the kernel
