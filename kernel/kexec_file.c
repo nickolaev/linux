@@ -389,8 +389,10 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 	bool kexec_on_panic = flags & KEXEC_FILE_ON_CRASH;
 
 	image = do_kimage_alloc_init();
-	if (!image)
+	if (!image) {
+		mk_instance_put(instance);
 		return -ENOMEM;
+	}
 
 	kexec_file_dbg_print = !!(flags & KEXEC_FILE_DEBUG);
 	image->file_mode = 1;
@@ -413,9 +415,6 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 
 		image->mk_instance = instance;
 		image->mk_id = mk_id;
-		instance->kimage = image;
-
-		pr_info("Associated kimage with multikernel instance %d\n", mk_id);
 
 		fdt_page = alloc_pages(GFP_KERNEL | __GFP_ZERO,
 				       get_order(MK_MANIFEST_SIZE));
@@ -438,7 +437,7 @@ kimage_file_alloc_init(struct kimage **rimage, int kernel_fd,
 				pr_err("Failed to allocate %zu bytes (order %u) for IPI buffer\n",
 				       ipi_buffer_size, order);
 				ret = -ENOMEM;
-				goto out_free_fdt;
+				goto out_free_image;
 			}
 			image->mk_ipi = page_to_phys(ipi_page);
 
@@ -478,25 +477,9 @@ out_free_control_pages:
 	kimage_free_page_list(&image->control_pages);
 out_free_post_load_bufs:
 	kimage_file_post_load_cleanup(image);
-out_free_fdt:
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		if (image->mk_ipi) {
-			unsigned int order = get_order(sizeof(struct mk_shared_data));
-			__free_pages(phys_to_page(image->mk_ipi), order);
-			image->mk_ipi = 0;
-		}
-		if (image->mk_manifest) {
-			__free_pages(phys_to_page(image->mk_manifest),
-				     get_order(MK_MANIFEST_SIZE));
-			image->mk_manifest = 0;
-		}
-		if (image->mk_instance) {
-			image->mk_instance->kimage = NULL;
-			mk_instance_put(image->mk_instance);
-			image->mk_instance = NULL;
-		}
-	}
 out_free_image:
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kimage_free_multikernel(image);
 	kfree(image);
 	return ret;
 }
@@ -517,6 +500,10 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 
 	/* Make sure we have a legal set of flags */
 	if (flags != (flags & KEXEC_FILE_FLAGS))
+		return -EINVAL;
+
+	/* A multikernel image is never a crash kernel */
+	if ((flags & KEXEC_MULTIKERNEL) && (flags & KEXEC_FILE_ON_CRASH))
 		return -EINVAL;
 
 	image = NULL;
@@ -589,16 +576,11 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		}
 	}
 
+	/* Consumes the instance reference, on failure too */
 	ret = kimage_file_alloc_init(&image, kernel_fd, initrd_fd, cmdline_ptr,
 				     cmdline_len, flags, instance);
-	if (ret) {
-		if (instance) {
-			mk_instance_put(instance);
-			instance = NULL;
-		}
+	if (ret)
 		goto out;
-	}
-	instance = NULL;
 
 #ifdef CONFIG_CRASH_HOTPLUG
 	if ((flags & KEXEC_FILE_ON_CRASH) && arch_crash_hotplug_support(image, flags))
@@ -656,6 +638,8 @@ SYSCALL_DEFINE5(kexec_file_load, int, kernel_fd, int, initrd_fd,
 		kimage_file_post_load_cleanup(image);
 
 	if (image && image->type == KEXEC_TYPE_MULTIKERNEL) {
+		/* Publish only a complete image to exec, unload and IPI */
+		image->mk_instance->kimage = image;
 		mk_instance_set_state(image->mk_instance, MK_STATE_LOADED);
 		kimage_add_to_list(image);
 		image = NULL; /* Don't free the new image */

@@ -591,6 +591,53 @@ static void kimage_free_cma(struct kimage *image)
 
 }
 
+/*
+ * Release what a multikernel image holds: its segments in the instance pool,
+ * its load-time buffers, its manifest and IPI pages, and its reference on the
+ * instance. Also unwinds a load that failed before the image was published.
+ */
+void kimage_free_multikernel(struct kimage *image)
+{
+	struct mk_instance *instance = image->mk_instance;
+	unsigned long i;
+
+	for (i = 0; i < image->nr_segments; i++)
+		mk_kimage_free(image, phys_to_virt(image->segment[i].mem),
+			       image->segment[i].memsz);
+
+	/* Load-time buffers were kept as the source for each spawn */
+	kimage_file_post_load_cleanup(image);
+
+	if (instance) {
+		if (instance->kimage == image) {
+			/*
+			 * The ring is freed below. Drop the instance's pointer
+			 * to it first, or the next message sent to this
+			 * instance lands in pages the allocator has already
+			 * handed to someone else.
+			 */
+			instance->ipi_data = NULL;
+			instance->ipi_phys = 0;
+			instance->kimage = NULL;
+			mk_instance_set_state(instance, MK_STATE_READY);
+		}
+		mk_instance_put(instance);
+		image->mk_instance = NULL;
+	}
+
+	if (image->mk_manifest) {
+		__free_pages(phys_to_page(image->mk_manifest),
+			     get_order(MK_MANIFEST_SIZE));
+		image->mk_manifest = 0;
+	}
+
+	if (image->mk_ipi) {
+		__free_pages(phys_to_page(image->mk_ipi),
+			     get_order(sizeof(struct mk_shared_data)));
+		image->mk_ipi = 0;
+	}
+}
+
 void kimage_free(struct kimage *image)
 {
 	kimage_entry_t *ptr, entry;
@@ -606,46 +653,9 @@ void kimage_free(struct kimage *image)
 	else if (image == kexec_crash_image)
 		kimage_update_compat_pointers(NULL, KEXEC_TYPE_CRASH);
 
-	if (image->type == KEXEC_TYPE_MULTIKERNEL) {
-		unsigned long i;
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		kimage_free_multikernel(image);
 
-		for (i = 0; i < image->nr_segments; i++) {
-			void *virt_addr = phys_to_virt(image->segment[i].mem);
-
-			mk_kimage_free(image, virt_addr, image->segment[i].memsz);
-		}
-
-		/* Load-time buffers were kept as the source for each spawn */
-		kimage_file_post_load_cleanup(image);
-
-		if (image->mk_instance) {
-			/*
-			 * The ring is freed below. Drop the instance's pointer
-			 * to it first, or the next message sent to this
-			 * instance lands in pages the allocator has already
-			 * handed to someone else.
-			 */
-			image->mk_instance->ipi_data = NULL;
-			image->mk_instance->ipi_phys = 0;
-			image->mk_instance->kimage = NULL;
-			mk_instance_set_state(image->mk_instance, MK_STATE_READY);
-			mk_instance_put(image->mk_instance);
-			image->mk_instance = NULL;
-		}
-
-		if (image->mk_manifest) {
-			__free_pages(phys_to_page(image->mk_manifest),
-				     get_order(MK_MANIFEST_SIZE));
-			image->mk_manifest = 0;
-		}
-
-		if (image->mk_ipi) {
-			size_t ipi_buffer_size = sizeof(struct mk_shared_data);
-			unsigned int order = get_order(ipi_buffer_size);
-			__free_pages(phys_to_page(image->mk_ipi), order);
-			image->mk_ipi = 0;
-		}
-	}
 #ifdef CONFIG_CRASH_DUMP
 	if (image->vmcoreinfo_data_copy) {
 		crash_update_vmcoreinfo_safecopy(NULL);
