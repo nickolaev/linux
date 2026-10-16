@@ -516,8 +516,9 @@ int mk_pciback_lend(struct mk_instance *instance)
 	return 0;
 }
 
+/* Answers reach a spawn's front end from its first bus scan, at subsys_initcall */
 static int __init mk_pciback_init(void)
 {
 	return mk_register_msg_handler(MK_MSG_PCI, mk_pciback_msg_handler, NULL);
 }
-fs_initcall(mk_pciback_init);
+arch_initcall(mk_pciback_init);

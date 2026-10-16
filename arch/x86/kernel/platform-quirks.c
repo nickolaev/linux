@@ -196,6 +196,14 @@ void __init x86_early_init_platform_quirks(void)
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
 #ifdef CONFIG_PCI
 		x86_init.pci.init = pci_multikernel_init;
+		x86_init.pci.arch_init = pci_multikernel_arch_init;
+		/*
+		 * Config space is reached through the kernel that lent the
+		 * devices. The 0xCF8 ports, ECAM and the PCI BIOS are the
+		 * host's: no early quirk or probe of ours may touch them.
+		 */
+		pci_probe &= ~(PCI_PROBE_BIOS | PCI_PROBE_CONF1 |
+			       PCI_PROBE_CONF2 | PCI_PROBE_MMCONF);
 #endif
 #endif
 		x86_init.mpparse.early_parse_smp_cfg = x86_init_noop;
