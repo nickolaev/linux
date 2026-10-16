@@ -177,6 +177,7 @@ void generic_multikernel_interrupt(void);
 
 /* Drain the message ring where the doorbell interrupt cannot be taken */
 void mk_ipi_poll(void);
+bool mk_ipi_in_drain(void);
 
 struct mk_instance;
 int multikernel_send_ipi_data_to(struct mk_instance *instance, void *data,
@@ -346,6 +347,18 @@ int mk_send_message(int instance_id, u32 msg_type, u32 subtype,
 struct mk_instance;
 int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
 		       void *payload, u32 payload_len);
+
+/*
+ * A request that waits for its answer by polling the ring, so it works
+ * with interrupts off. The caller puts @seq, from mk_request_seq(), in
+ * its payload; the handler of the answer gives it back to
+ * mk_request_answer(), which copies the answer in and ends the wait.
+ */
+u64 mk_request_seq(void);
+int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
+		    void *payload, u32 payload_len, void *answer, u32 answer_len,
+		    unsigned int timeout_us);
+void mk_request_answer(u64 seq, const void *answer, u32 answer_len);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type

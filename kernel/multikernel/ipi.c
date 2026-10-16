@@ -19,6 +19,7 @@ static struct mk_ipi_handler *mk_handlers;
 static raw_spinlock_t mk_handlers_lock = __RAW_SPIN_LOCK_UNLOCKED(mk_handlers_lock);
 
 static DEFINE_RAW_SPINLOCK(mk_drain_lock);
+static DEFINE_PER_CPU(bool, mk_draining);
 
 static void mk_ipi_drain_ring(void);
 
@@ -341,8 +342,21 @@ static void multikernel_interrupt_handler(void)
 	 * matters: a poller that is just leaving may not look again.
 	 */
 	raw_spin_lock_irqsave(&mk_drain_lock, flags);
+	this_cpu_write(mk_draining, true);
 	mk_ipi_drain_ring();
+	this_cpu_write(mk_draining, false);
 	raw_spin_unlock_irqrestore(&mk_drain_lock, flags);
+}
+
+/**
+ * mk_ipi_in_drain - Whether this CPU is running a message handler
+ *
+ * A handler that polled the ring for an answer would wait for the drain
+ * lock it already holds.
+ */
+bool mk_ipi_in_drain(void)
+{
+	return this_cpu_read(mk_draining);
 }
 
 /**

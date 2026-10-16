@@ -10,6 +10,8 @@
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/ktime.h>
 #include <linux/multikernel.h>
 
 /* Pending message tracking for request-response pattern */
@@ -260,6 +262,107 @@ int mk_send_message_to(struct mk_instance *instance, u32 msg_type, u32 subtype,
 				 payload, payload_len);
 }
 EXPORT_SYMBOL(mk_send_message_to);
+
+/* On the requester's stack until the answer is in, or given up on */
+struct mk_sync_request {
+	struct list_head list;
+	u64 seq;
+	void *answer;
+	u32 answer_len;
+	bool done;
+};
+
+static LIST_HEAD(mk_sync_requests);
+static DEFINE_RAW_SPINLOCK(mk_sync_requests_lock);
+static atomic64_t mk_sync_seq;
+
+u64 mk_request_seq(void)
+{
+	return atomic64_inc_return(&mk_sync_seq);
+}
+EXPORT_SYMBOL_GPL(mk_request_seq);
+
+/**
+ * mk_request_sync - Send a request to an instance and wait for its answer
+ * @to: Instance to ask, a reference held by the caller
+ * @msg_type: Message type
+ * @subtype: Message subtype
+ * @seq: Value from mk_request_seq(), also carried in @payload
+ * @payload: Request
+ * @payload_len: Length of @payload
+ * @answer: Where the answer is copied
+ * @answer_len: Size of @answer
+ * @timeout_us: How long to wait
+ *
+ * Callable with interrupts off: the doorbell may never be taken here, so
+ * the wait drains the ring itself. Not from a message handler, which
+ * already holds the drain.
+ *
+ * Returns 0 once the answer is in @answer, -ETIMEDOUT, or another
+ * negative error code if the request could not be sent.
+ */
+int mk_request_sync(struct mk_instance *to, u32 msg_type, u32 subtype, u64 seq,
+		    void *payload, u32 payload_len, void *answer, u32 answer_len,
+		    unsigned int timeout_us)
+{
+	struct mk_sync_request r = {
+		.seq = seq,
+		.answer = answer,
+		.answer_len = answer_len,
+	};
+	ktime_t deadline;
+	int ret;
+
+	if (WARN_ON_ONCE(mk_ipi_in_drain()))
+		return -EDEADLK;
+
+	scoped_guard(raw_spinlock_irqsave, &mk_sync_requests_lock)
+		list_add(&r.list, &mk_sync_requests);
+
+	ret = mk_send_message_to(to, msg_type, subtype, payload, payload_len);
+	deadline = ktime_add_us(ktime_get(), timeout_us);
+	/* Pairs with mk_request_answer(): the answer is copied in before done */
+	while (!ret && !smp_load_acquire(&r.done)) {
+		mk_ipi_poll();
+		if (ktime_after(ktime_get(), deadline))
+			ret = -ETIMEDOUT;
+		else
+			udelay(1);
+	}
+
+	/* Off the list before the stack frame goes: a late answer finds nothing */
+	scoped_guard(raw_spinlock_irqsave, &mk_sync_requests_lock)
+		list_del(&r.list);
+
+	return r.done ? 0 : ret;
+}
+EXPORT_SYMBOL_GPL(mk_request_sync);
+
+/**
+ * mk_request_answer - Hand an answer to the request waiting for it
+ * @seq: The request's sequence number
+ * @answer: The answer
+ * @answer_len: Its length
+ *
+ * Called from the handler of the answer message. An answer nobody waits
+ * for any more is dropped.
+ */
+void mk_request_answer(u64 seq, const void *answer, u32 answer_len)
+{
+	struct mk_sync_request *r;
+
+	guard(raw_spinlock_irqsave)(&mk_sync_requests_lock);
+
+	list_for_each_entry(r, &mk_sync_requests, list) {
+		if (r->seq != seq)
+			continue;
+		memcpy(r->answer, answer, min(answer_len, r->answer_len));
+		/* The answer must be visible to a waiter that sees done */
+		smp_store_release(&r->done, true);
+		return;
+	}
+}
+EXPORT_SYMBOL_GPL(mk_request_answer);
 
 /**
  * mk_register_msg_handler - Register handler for specific message type
