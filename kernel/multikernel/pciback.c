@@ -13,7 +13,15 @@
  * config mechanism such as the 0xCF8 port pair.
  *
  * Only config space goes this way. BARs, DMA and MSIs stay direct, so
- * none of this is on the data path of a running device.
+ * none of this is on the data path of a running device, provided its
+ * interrupts are masked in its MSI-X table rather than in config space,
+ * which is why a function without MSI-X is not lent.
+ *
+ * Writes are filtered, after xen-pciback: the instance owns what the
+ * function does, while the lending kernel keeps what places it on the
+ * fabric. BARs stay where they were assigned and only appear to size,
+ * the header outside the Command register and a few scratch fields is
+ * read only, and SR-IOV is not offered.
  *
  * Requests are answered from the doorbell interrupt, which is what lets
  * an instance wait for the answer with interrupts off. A kernel that is
@@ -23,6 +31,7 @@
 
 #define pr_fmt(fmt) "mk_pciback: " fmt
 
+#include <linux/moduleparam.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
@@ -31,11 +40,30 @@
 
 #include "internal.h"
 
+#undef MODULE_PARAM_PREFIX
+#define MODULE_PARAM_PREFIX "multikernel."
+
+static bool mk_pciback_allow_plain_msi;
+module_param_named(pci_allow_plain_msi, mk_pciback_allow_plain_msi, bool, 0644);
+MODULE_PARM_DESC(pci_allow_plain_msi,
+		 "Lend PCI functions without MSI-X, whose interrupt masking then goes over the ring");
+
+/* Bits of the Command register an instance may change */
+#define MK_PCIBACK_CMD	(PCI_COMMAND_IO | PCI_COMMAND_MEMORY |		\
+			 PCI_COMMAND_MASTER | PCI_COMMAND_PARITY |	\
+			 PCI_COMMAND_SERR | PCI_COMMAND_INTX_DISABLE)
+
+/* Bit of the ROM BAR in mk_pciback_dev.sizing, after the six BARs */
+#define MK_PCIBACK_ROM	PCI_STD_NUM_BARS
+
 /* A function an instance may reach, while the instance runs */
 struct mk_pciback_dev {
 	struct list_head list;
+	refcount_t ref;
 	struct mk_instance *instance;
 	struct pci_dev *pdev;
+	unsigned long sizing;	/* BARs written with something else than their value */
+	u16 sriov;		/* SR-IOV capability, or 0 */
 };
 
 static LIST_HEAD(mk_pciback_devs);
@@ -105,21 +133,165 @@ static int mk_pciback_write(struct pci_dev *pdev, int where, int size, u32 val)
 	}
 }
 
-static void mk_pciback_do(struct pci_dev *pdev, u32 subtype,
+/* The BAR, or MK_PCIBACK_ROM, that a dword of the header is, or -1 */
+static int mk_pciback_bar_slot(const struct pci_dev *pdev, int reg)
+{
+	if (pdev->hdr_type != PCI_HEADER_TYPE_NORMAL)
+		return -1;
+	if (reg >= PCI_BASE_ADDRESS_0 && reg <= PCI_BASE_ADDRESS_5)
+		return (reg - PCI_BASE_ADDRESS_0) / 4;
+	if (reg == PCI_ROM_ADDRESS)
+		return MK_PCIBACK_ROM;
+	return -1;
+}
+
+/* Zero for a BAR the function does not implement */
+static u64 mk_pciback_size_mask(const struct resource *res)
+{
+	return res->flags ? ~(resource_size(res) - 1) : 0;
+}
+
+/*
+ * What a BAR reads back while it is being sized: the size of the
+ * resource this kernel found behind it, with the type bits of @cur.
+ */
+static u32 mk_pciback_bar_sized(const struct pci_dev *pdev, int slot, u32 cur)
+{
+	u64 mask;
+	int i;
+
+	if (slot == MK_PCIBACK_ROM)
+		return mk_pciback_size_mask(&pdev->resource[PCI_ROM_RESOURCE]) &
+		       PCI_ROM_ADDRESS_MASK;
+
+	/* The upper half of a 64-bit BAR sizes with its lower half */
+	for (i = 0; i < slot; i++) {
+		if (!(pdev->resource[i].flags & IORESOURCE_MEM_64))
+			continue;
+		if (++i == slot)
+			return upper_32_bits(mk_pciback_size_mask(&pdev->resource[i - 1]));
+	}
+
+	mask = mk_pciback_size_mask(&pdev->resource[slot]);
+	if (!mask)
+		return 0;
+	if (cur & PCI_BASE_ADDRESS_SPACE_IO)
+		return ((u32)mask & PCI_BASE_ADDRESS_IO_MASK) |
+		       (cur & ~PCI_BASE_ADDRESS_IO_MASK);
+	return ((u32)mask & PCI_BASE_ADDRESS_MEM_MASK) |
+	       (cur & ~PCI_BASE_ADDRESS_MEM_MASK);
+}
+
+/* The bits of a dword, outside the BARs, that an instance may write */
+static u32 mk_pciback_wmask(const struct mk_pciback_dev *d, int reg)
+{
+	if (reg >= PCI_STD_HEADER_SIZEOF) {
+		if (d->sriov && reg >= d->sriov &&
+		    reg < d->sriov + PCI_EXT_CAP_SRIOV_SIZEOF)
+			return 0;
+		return ~0U;
+	}
+
+	switch (reg) {
+	case PCI_COMMAND:
+		/* Status is write-one-to-clear, and only the function's own */
+		return MK_PCIBACK_CMD | 0xffff0000;
+	case PCI_CACHE_LINE_SIZE:
+		/* And the latency timer next to it */
+		return 0x0000ffff;
+	case PCI_INTERRUPT_LINE:
+		return 0x000000ff;
+	}
+	return 0;
+}
+
+static int mk_pciback_filtered_read(struct mk_pciback_dev *d, int where,
+				    int size, u32 *val)
+{
+	int slot = mk_pciback_bar_slot(d->pdev, where & ~3);
+	int ret;
+
+	ret = mk_pciback_read(d->pdev, where, size, val);
+	if (!ret && size == 4 && slot >= 0 && test_bit(slot, &d->sizing))
+		*val = mk_pciback_bar_sized(d->pdev, slot, *val);
+	return ret;
+}
+
+/*
+ * A BAR is never written. Sizing writes all ones and then puts back what
+ * was there, so anything but the BAR's value starts a sizing, which the
+ * value ends. Placement is the lending kernel's.
+ */
+static int mk_pciback_bar_write(struct mk_pciback_dev *d, int where, int size,
+				u32 val, int slot)
+{
+	u32 cur;
+	int ret;
+
+	if (size != 4)
+		return PCIBIOS_SUCCESSFUL;
+
+	ret = mk_pciback_read(d->pdev, where, 4, &cur);
+	if (ret)
+		return ret;
+
+	if (val == cur)
+		clear_bit(slot, &d->sizing);
+	else
+		set_bit(slot, &d->sizing);
+	return PCIBIOS_SUCCESSFUL;
+}
+
+/* A write to what is not the instance's own is dropped, as if read only */
+static int mk_pciback_filtered_write(struct mk_pciback_dev *d, int where,
+				     int size, u32 val)
+{
+	u32 all = size == 4 ? ~0U : (1U << (size * 8)) - 1;
+	int slot = mk_pciback_bar_slot(d->pdev, where & ~3);
+	u32 mask, cur;
+	int ret;
+
+	if (slot >= 0)
+		return mk_pciback_bar_write(d, where, size, val, slot);
+
+	mask = (mk_pciback_wmask(d, where & ~3) >> ((where & 3) * 8)) & all;
+	if (!mask)
+		return PCIBIOS_SUCCESSFUL;
+
+	if (mask != all) {
+		ret = mk_pciback_read(d->pdev, where, size, &cur);
+		if (ret)
+			return ret;
+		val = (val & mask) | (cur & ~mask);
+	}
+	return mk_pciback_write(d->pdev, where, size, val);
+}
+
+static void mk_pciback_do(struct mk_pciback_dev *d, u32 subtype,
 			  struct mk_pci_cfg_payload *ack)
 {
 	if (!mk_pciback_valid(ack)) {
 		ack->result = PCIBIOS_BAD_REGISTER_NUMBER;
 	} else if (subtype == MK_PCI_CFG_READ) {
-		ack->result = mk_pciback_read(pdev, ack->where, ack->size,
-					      &ack->val);
+		ack->result = mk_pciback_filtered_read(d, ack->where, ack->size,
+						       &ack->val);
 	} else {
-		ack->result = mk_pciback_write(pdev, ack->where, ack->size,
-					       ack->val);
+		ack->result = mk_pciback_filtered_write(d, ack->where,
+							ack->size, ack->val);
 	}
 
 	if (subtype == MK_PCI_CFG_READ && ack->result)
 		ack->val = ~0U;
+}
+
+static void mk_pciback_put(struct mk_pciback_dev *d)
+{
+	if (!refcount_dec_and_test(&d->ref))
+		return;
+	pm_runtime_put(&d->pdev->dev);
+	pci_dev_put(d->pdev);
+	mk_instance_put(d->instance);
+	kfree(d);
 }
 
 static void mk_pciback_answer(struct mk_instance *instance,
@@ -140,7 +312,6 @@ static void mk_pciback_work_fn(struct work_struct *work)
 	struct mk_pci_cfg_payload *ack = &w->req;
 	struct mk_instance *instance;
 	struct mk_pciback_dev *d;
-	struct pci_dev *pdev = NULL;
 
 	instance = mk_instance_find(ack->sender_instance_id);
 	if (!instance)
@@ -150,12 +321,12 @@ static void mk_pciback_work_fn(struct work_struct *work)
 		d = mk_pciback_find(instance->id, ack->domain, ack->bus,
 				    ack->devfn);
 		if (d)
-			pdev = pci_dev_get(d->pdev);
+			refcount_inc(&d->ref);
 	}
 
-	if (pdev) {
-		mk_pciback_do(pdev, w->subtype, ack);
-		pci_dev_put(pdev);
+	if (d) {
+		mk_pciback_do(d, w->subtype, ack);
+		mk_pciback_put(d);
 	} else {
 		ack->result = PCIBIOS_DEVICE_NOT_FOUND;
 		ack->val = ~0U;
@@ -199,7 +370,7 @@ static void mk_pciback_request(const struct mk_pci_cfg_payload *req,
 		return;
 	}
 
-	mk_pciback_do(d->pdev, subtype, &ack);
+	mk_pciback_do(d, subtype, &ack);
 	mk_pciback_answer(d->instance, &ack);
 }
 
@@ -244,6 +415,16 @@ int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
 		return -ENODEV;
 	}
 
+	if (!pdev->msix_cap && !mk_pciback_allow_plain_msi) {
+		pr_err("Instance %d: %s has no MSI-X, so masking its interrupts would go over the ring (multikernel.pci_allow_plain_msi=1 allows it)\n",
+		       instance->id, pci_name(pdev));
+		pci_dev_put(pdev);
+		return -EOPNOTSUPP;
+	}
+	if (!pdev->msix_cap)
+		pr_warn("Instance %d: %s has no MSI-X, its interrupt masking goes over the ring\n",
+			instance->id, pci_name(pdev));
+
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
 	if (!d) {
 		pci_dev_put(pdev);
@@ -253,7 +434,9 @@ int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
 	/* Config cycles to a function in D3cold come back as all ones */
 	pm_runtime_get_sync(&pdev->dev);
 
+	refcount_set(&d->ref, 1);
 	d->pdev = pdev;
+	d->sriov = pci_find_ext_capability(pdev, PCI_EXT_CAP_ID_SRIOV);
 	d->instance = instance;
 	mk_instance_get(instance);
 
@@ -266,12 +449,8 @@ static void mk_pciback_free(struct list_head *gone)
 {
 	struct mk_pciback_dev *d, *tmp;
 
-	list_for_each_entry_safe(d, tmp, gone, list) {
-		pm_runtime_put(&d->pdev->dev);
-		pci_dev_put(d->pdev);
-		mk_instance_put(d->instance);
-		kfree(d);
-	}
+	list_for_each_entry_safe(d, tmp, gone, list)
+		mk_pciback_put(d);
 }
 
 /**
