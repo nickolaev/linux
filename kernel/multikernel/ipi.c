@@ -410,5 +410,17 @@ bool mk_has_pending_shutdown(void)
 	if (!mk_self->ipi_data)
 		return mk_manifest_phys() != 0;
 
-	return READ_ONCE(mk_self->ipi_data->force_halt);
+	return mk_force_halt_armed();
+}
+
+/**
+ * mk_force_halt_armed - Check the force-halt marker alone
+ *
+ * Unlike mk_has_pending_shutdown(), never true for a kernel without a
+ * ring, so it can be tested on NMIs that a local source may own.
+ */
+bool mk_force_halt_armed(void)
+{
+	return mk_self && mk_self->ipi_data &&
+	       READ_ONCE(mk_self->ipi_data->force_halt);
 }

@@ -993,6 +993,7 @@ bool multikernel_allow_emergency_restart(void);
 int multikernel_halt_by_id(int mk_id);
 int multikernel_force_halt_by_id(int mk_id);
 bool mk_has_pending_shutdown(void);
+bool mk_force_halt_armed(void);
 bool mk_crash_notes_wanted(void);
 
 /* Instance lookup and reference counting */
