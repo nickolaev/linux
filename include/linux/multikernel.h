@@ -1012,6 +1012,8 @@ int mk_pcifront_init(void);
 int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       unsigned int devfn, int where, int size, u32 *val,
 		       bool write);
+u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus, u64 *size);
+void mk_pcifront_host_fenced(void);
 #else
 static inline int mk_pcifront_init(void)
 {
@@ -1022,6 +1024,14 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 				     u32 *val, bool write)
 {
 	return -ENODEV;
+}
+static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus,
+				   u64 *size)
+{
+	return 0;
+}
+static inline void mk_pcifront_host_fenced(void)
+{
 }
 #endif
 

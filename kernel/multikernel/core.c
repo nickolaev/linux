@@ -1962,10 +1962,13 @@ int multikernel_force_halt_by_id(int mk_id)
 	 * fence, so a baseline cannot claim a machine with a CPU still
 	 * running the dead host.
 	 */
-	if (instance == host_instance)
+	if (instance == host_instance) {
 		ret = mk_confirm_fenced(instance, targets);
-	else
+		if (!ret)
+			mk_pcifront_host_fenced();
+	} else {
 		mk_instance_settle_halted(instance);
+	}
 
 	mk_cpu_set_free(targets);
 	mk_instance_put(instance);

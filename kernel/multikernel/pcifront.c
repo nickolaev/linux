@@ -18,6 +18,17 @@
  * touched to probe, reset, power manage and recover a device, and a
  * running device costs no requests at all: its BARs, its DMA and its
  * MSI-X vectors are direct.
+ *
+ * A spawn outlives a host that crashes. Its devices keep running, but a
+ * dead host answers nothing: a request that times out fails like an
+ * access to an absent function, and nothing more. Whether the host is
+ * dead is not decided here. User space decides, and acts on it by
+ * fencing the host; once the fence has confirmed every CPU of the host
+ * parked, accesses go straight to the ECAM window of the bus, the reg of
+ * its node, which is mapped at boot and unused until then, or fail at
+ * once where there is none. That is safe only because a fenced host no
+ * longer generates config cycles itself; the 0xCF8 ports, which other
+ * surviving kernels may use, are never touched.
  */
 
 #define pr_fmt(fmt) "mk_pcifront: " fmt
@@ -26,6 +37,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 
 #include "internal.h"
@@ -37,18 +49,24 @@ struct mk_pcifront_bus {
 	struct list_head list;
 	u16 domain;
 	u8 busnr;
+	phys_addr_t ecam_phys;
+	void __iomem *ecam;	/* For when the host is fenced, or NULL */
 };
 
 /* Only added to, before anything can look */
 static LIST_HEAD(mk_pcifront_buses);
+
+static bool mk_pcifront_direct_access;
 
 static struct mk_pcifront_bus *mk_pcifront_of(struct pci_bus *bus)
 {
 	return pci_host_bridge_priv(to_pci_host_bridge(bus->bridge));
 }
 
-static int mk_pcifront_access(struct mk_pcifront_bus *fb, unsigned int devfn,
-			      int where, int size, u32 *val, u32 subtype)
+/* One request to the host. Returns 0 once it answered, with @result set */
+static int mk_pcifront_ask(struct mk_pcifront_bus *fb, unsigned int devfn,
+			   int where, int size, u32 *val, u32 subtype,
+			   int *result)
 {
 	struct mk_pci_cfg_payload req = {
 		.seq = mk_request_seq(),
@@ -66,18 +84,85 @@ static int mk_pcifront_access(struct mk_pcifront_bus *fb, unsigned int devfn,
 	ret = mk_request_sync(host_instance, MK_MSG_PCI, subtype, req.seq,
 			      &req, sizeof(req), &ack, sizeof(ack),
 			      MK_PCIFRONT_TIMEOUT_US);
-	if (ret) {
-		pr_err_ratelimited("%04x:%02x:%02x.%x: no answer for config offset %#x: %d\n",
-				   fb->domain, fb->busnr, PCI_SLOT(devfn),
-				   PCI_FUNC(devfn), where, ret);
+	if (ret)
+		return ret;
+
+	if (subtype == MK_PCI_CFG_READ)
+		*val = ack.val;
+	*result = ack.result;
+	return 0;
+}
+
+static int mk_pcifront_direct(struct mk_pcifront_bus *fb, unsigned int devfn,
+			      int where, int size, u32 *val, u32 subtype)
+{
+	void __iomem *addr;
+
+	if (!fb->ecam) {
 		if (subtype == MK_PCI_CFG_READ)
 			*val = ~0U;
 		return PCIBIOS_DEVICE_NOT_FOUND;
 	}
 
+	addr = fb->ecam + (devfn << 12) + where;
+	if (subtype == MK_PCI_CFG_READ) {
+		if (size == 1)
+			*val = readb(addr);
+		else if (size == 2)
+			*val = readw(addr);
+		else
+			*val = readl(addr);
+	} else {
+		if (size == 1)
+			writeb(*val, addr);
+		else if (size == 2)
+			writew(*val, addr);
+		else
+			writel(*val, addr);
+	}
+	return PCIBIOS_SUCCESSFUL;
+}
+
+/**
+ * mk_pcifront_host_fenced - The host can no longer touch config space
+ *
+ * Called once a fence has confirmed every CPU of the host parked. From
+ * then on this kernel reaches the config space of its devices itself.
+ */
+void mk_pcifront_host_fenced(void)
+{
+	struct mk_pcifront_bus *fb;
+	bool direct = false;
+
+	if (READ_ONCE(mk_pcifront_direct_access) ||
+	    list_empty(&mk_pcifront_buses))
+		return;
+	WRITE_ONCE(mk_pcifront_direct_access, true);
+
+	list_for_each_entry(fb, &mk_pcifront_buses, list)
+		direct |= !!fb->ecam;
+	pr_info("Host fenced: config space is reached %s\n",
+		direct ? "directly through ECAM" : "nowhere");
+}
+
+static int mk_pcifront_access(struct mk_pcifront_bus *fb, unsigned int devfn,
+			      int where, int size, u32 *val, u32 subtype)
+{
+	int result, ret;
+
+	if (READ_ONCE(mk_pcifront_direct_access))
+		return mk_pcifront_direct(fb, devfn, where, size, val, subtype);
+
+	ret = mk_pcifront_ask(fb, devfn, where, size, val, subtype, &result);
+	if (!ret)
+		return result;
+
+	pr_err_ratelimited("%04x:%02x:%02x.%x: no answer for config offset %#x: %d\n",
+			   fb->domain, fb->busnr, PCI_SLOT(devfn),
+			   PCI_FUNC(devfn), where, ret);
 	if (subtype == MK_PCI_CFG_READ)
-		*val = ack.val;
-	return ack.result;
+		*val = ~0U;
+	return PCIBIOS_DEVICE_NOT_FOUND;
 }
 
 static int mk_pcifront_read(struct pci_bus *bus, unsigned int devfn,
@@ -125,6 +210,49 @@ int mk_pcifront_config(unsigned int domain, unsigned int bus,
 	if (!write)
 		*val = ~0U;
 	return -ENODEV;
+}
+
+/**
+ * mk_pcifront_ecam - The ECAM window of a bus of this kernel's tree
+ * @domain: PCI domain
+ * @bus: Bus number
+ * @size: Set to the window's size
+ *
+ * Passed on to the tree of an instance of this kernel, for when both its
+ * host and this kernel are fenced.
+ *
+ * Returns: the window's physical address, or 0 if the tree has none
+ */
+u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus, u64 *size)
+{
+	struct mk_pcifront_bus *fb;
+
+	list_for_each_entry(fb, &mk_pcifront_buses, list) {
+		if (fb->domain == domain && fb->busnr == bus && fb->ecam) {
+			*size = SZ_1M;
+			return fb->ecam_phys;
+		}
+	}
+	return 0;
+}
+
+/* Mapped now: nothing can be mapped under the PCI core's lock, where it is used */
+static void __init mk_pcifront_map_ecam(struct device_node *np,
+					struct mk_pcifront_bus *fb)
+{
+	struct resource ecam;
+
+	if (of_address_to_resource(np, 0, &ecam))
+		return;
+
+	if (resource_size(&ecam) < SZ_1M) {
+		pr_warn("%pOF: ECAM window %pR is too small\n", np, &ecam);
+		return;
+	}
+
+	fb->ecam = ioremap(ecam.start, SZ_1M);
+	if (fb->ecam)
+		fb->ecam_phys = ecam.start;
 }
 
 static struct pci_ops mk_pcifront_ops = {
@@ -197,6 +325,7 @@ static int __init mk_pcifront_add_bus(struct device_node *np)
 	fb = pci_host_bridge_priv(bridge);
 	fb->domain = domain;
 	fb->busnr = range[0];
+	mk_pcifront_map_ecam(np, fb);
 
 	bus_res->start = range[0];
 	bus_res->end = range[1];

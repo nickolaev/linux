@@ -157,8 +157,13 @@ same address in every kernel. The unit address of a device is
 in the first cell as the binding prescribes, so ``pci_set_of_node()`` finds
 it by devfn under its bus. ``ranges`` uses the standard 7-cell PCI encoding
 and holds the windows of the bridge above the bus, or of the host bridge
-for a root bus, which cover the BARs of every device on it. ``reg`` is the
-ECAM window of the bus.
+for a root bus, which cover the BARs of every device on it.
+
+``reg`` is the ECAM window of the bus, as in the generic ECAM host bridge
+binding. A spawn kernel does not use it while the kernel that lent the
+devices is alive: it reaches their config space through that kernel, over
+the message ring, and goes to the window only once it has fenced that
+kernel.
 
 Platform devices stay under ``/resources/devices`` as nodes with
 ``device-type = "platform"`` and ``device-name`` or ``acpi-hid``.
@@ -207,7 +212,8 @@ everything else read the tree through the usual ``of_*`` helpers.
 What a spawn does with its tree:
 
 * creates a PCI root bus per ``multikernel,pci-host-bridge`` node, with
-  the node's bus range, windows and ECAM;
+  the node's bus range and windows, whose config space it asks the host
+  for;
 * probes a PCI slot only when the bus's node has a child at that devfn,
   which admits nothing else on the shared fabric, and registers a
   platform device only when a ``/resources/devices`` node names it;

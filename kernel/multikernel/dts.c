@@ -1176,9 +1176,14 @@ static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
 	}
 }
 
-/* The ECAM window of a bus, so a spawn kernel can reach it directly */
+/*
+ * The ECAM window of a bus, for a spawn kernel to reach it directly once
+ * this kernel is lost. A spawn passes on the window it was given.
+ */
 static u64 mk_dt_bus_ecam(struct pci_bus *bus, u64 *size)
 {
+	if (mk_manifest_phys())
+		return mk_pcifront_ecam(pci_domain_nr(bus), bus->number, size);
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 	struct pci_mmcfg_region *cfg;
 
