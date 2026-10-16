@@ -1735,40 +1735,7 @@ int multikernel_kexec_by_id(int mk_id)
 	else
 		pr_info("Manifest finalized for multikernel instance\n");
 
-	/*
-	 * Start the instance with an empty ring. It outlives the kernel
-	 * that was using it, so a new instance would otherwise inherit that
-	 * kernel's indices and any slot it left half written - which stalls
-	 * the reader, since an unpublished slot means "the sender is still
-	 * filling this one". Anything left in there was addressed to a
-	 * kernel that is gone.
-	 */
-	if (instance->ipi_data)
-		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
-
-	/*
-	 * Same for the other direction: whatever the halted instance left
-	 * queued for us is addressed from a kernel that no longer exists,
-	 * and a slot it claimed but never published stalls our ring for
-	 * good.
-	 */
-	mk_ipi_ring_drop_pending();
-
-	rc = mk_pciback_lend(instance);
-	if (rc) {
-		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
-		       mk_id, rc);
-		goto unlock;
-	}
-
-	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
-	if (rc == 0) {
-		rc = mk_instance_set_kexec_active(mk_image->mk_id);
-		if (rc)
-			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
-	} else {
-		mk_pciback_unlend(instance);
-	}
+	rc = mk_instance_start(instance, mk_image, cpu);
 
 unlock:
 	kexec_unlock();

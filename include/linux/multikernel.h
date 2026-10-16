@@ -971,13 +971,9 @@ enum mk_instance_state mk_string_to_state(const char *str);
  * and the kexec multikernel system.
  */
 
-/**
- * mk_instance_set_kexec_active() - Mark instance as active for kexec
- * @mk_id: Multikernel ID from kexec system
- *
- * Returns 0 on success, negative error code on failure.
- */
-int mk_instance_set_kexec_active(int mk_id);
+struct kimage;
+int mk_instance_start(struct mk_instance *instance, struct kimage *image,
+		      int cpu);
 
 /*
  * The declarations below are referenced from always-built code (kexec,

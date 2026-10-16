@@ -408,20 +408,58 @@ struct mk_instance *mk_instance_find(int mk_id)
 	return instance;
 }
 
-int mk_instance_set_kexec_active(int mk_id)
+/**
+ * mk_instance_start - Start an instance from its freshly copied image
+ * @instance: The instance, not running
+ * @image: Its kernel image, ready to boot
+ * @cpu: Logical CPU it boots on
+ *
+ * Gives the instance what it reaches from its first instruction on, its
+ * rings and the config space of its PCI functions, then starts it. What
+ * it was given is taken back when it leaves MK_STATE_ACTIVE, see
+ * mk_instance_set_state(), or here if it never gets there.
+ *
+ * Returns 0 once the instance runs, or a negative error code.
+ */
+int mk_instance_start(struct mk_instance *instance, struct kimage *image,
+		      int cpu)
 {
-	struct mk_instance *instance;
+	int ret;
 
-	instance = mk_instance_find(mk_id);
-	if (!instance) {
-		pr_err("No sysfs instance found for multikernel ID %d\n", mk_id);
-		return -ENOENT;
+	/*
+	 * Start the instance with an empty ring. It outlives the kernel
+	 * that was using it, so a new instance would otherwise inherit that
+	 * kernel's indices and any slot it left half written - which stalls
+	 * the reader, since an unpublished slot means "the sender is still
+	 * filling this one". Anything left in there was addressed to a
+	 * kernel that is gone.
+	 */
+	if (instance->ipi_data)
+		memset(instance->ipi_data, 0, sizeof(*instance->ipi_data));
+
+	/*
+	 * Same for the other direction: whatever the halted instance left
+	 * queued for us is addressed from a kernel that no longer exists,
+	 * and a slot it claimed but never published stalls our ring for
+	 * good.
+	 */
+	mk_ipi_ring_drop_pending();
+
+	ret = mk_pciback_lend(instance);
+	if (ret) {
+		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
+		       instance->id, ret);
+		return ret;
+	}
+
+	ret = mk_arch_spawn_instance(image, instance, cpu);
+	if (ret) {
+		mk_pciback_unlend(instance);
+		return ret;
 	}
 
 	mk_instance_set_state(instance, MK_STATE_ACTIVE);
-	mk_instance_put(instance);
-	pr_info("Multikernel instance %d is now active\n", mk_id);
-
+	pr_info("Multikernel instance %d is now active\n", instance->id);
 	return 0;
 }
 
