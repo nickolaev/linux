@@ -290,6 +290,17 @@ struct mk_mem_resource_payload {
 #define MK_MEM_DMA32            0x04
 #define MK_MEM_HIGHMEM          0x08
 
+/*
+ * A PCI bus as a root bus of another kernel: its windows as the cells of
+ * a devicetree "ranges" property, and the base of its 1MB ECAM window.
+ */
+#define MK_PCI_BUS_MAX_WINDOWS	16
+struct mk_pci_bus_desc {
+	u64 ecam;               /* 0 if none */
+	u32 nr_ranges;          /* Cells used in ranges */
+	__be32 ranges[MK_PCI_BUS_MAX_WINDOWS * 7];
+};
+
 /* PCI device resource operations */
 struct mk_device_resource_payload {
 	u16 domain;             /* PCI domain */
@@ -298,6 +309,10 @@ struct mk_device_resource_payload {
 	u32 flags;              /* Device flags */
 	char driver_override[64]; /* Target driver name for binding */
 	int sender_instance_id; /* Sender instance ID for ACK */
+	/* Device add to a running instance, which may lack the function and its bus */
+	u16 vendor;
+	u16 device;
+	struct mk_pci_bus_desc bus_desc;
 };
 
 /* Device flags */
@@ -1009,8 +1024,10 @@ int mk_pcifront_init(void);
 int mk_pcifront_config(unsigned int domain, unsigned int bus,
 		       unsigned int devfn, int where, int size, u32 *val,
 		       bool write);
-u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus, u64 *size);
+u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus);
 void mk_pcifront_host_fenced(void);
+int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
+			     u16 device, const struct mk_pci_bus_desc *desc);
 #else
 static inline int mk_pcifront_init(void)
 {
@@ -1022,10 +1039,15 @@ static inline int mk_pcifront_config(unsigned int domain, unsigned int bus,
 {
 	return -ENODEV;
 }
-static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus,
-				   u64 *size)
+static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
 {
 	return 0;
+}
+static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
+					   u16 vendor, u16 device,
+					   const struct mk_pci_bus_desc *desc)
+{
+	return -ENODEV;
 }
 static inline void mk_pcifront_host_fenced(void)
 {

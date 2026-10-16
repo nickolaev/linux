@@ -159,6 +159,11 @@ it by devfn under its bus. ``ranges`` uses the standard 7-cell PCI encoding
 and holds the windows of the bridge above the bus, or of the host bridge
 for a root bus, which cover the BARs of every device on it.
 
+A PCI function handed to a running spawn comes with the same description
+of its bus, and the spawn adds the nodes it would have booted with: the
+device under its bus, and the bus as a root bus of its own when the
+spawn has none.
+
 ``reg`` is the ECAM window of the bus, as in the generic ECAM host bridge
 binding. A spawn kernel does not use it while the kernel that lent the
 devices is alive: it reaches their config space through that kernel, over

@@ -811,6 +811,9 @@ struct mk_device_hotplug_work {
 	char driver_override[64];
 	int sender_instance_id;
 	u32 operation;
+	u16 vendor;
+	u16 device;
+	struct mk_pci_bus_desc bus_desc;
 };
 
 static void mk_device_add_work_fn(struct work_struct *work)
@@ -819,8 +822,15 @@ static void mk_device_add_work_fn(struct work_struct *work)
 	struct mk_resource_ack ack;
 	int ret, ack_ret;
 
-	ret = mk_do_device_add(hp_work->domain, hp_work->bus, hp_work->devfn,
-			       hp_work->driver_override, hp_work->flags);
+	ret = 0;
+	if (mk_manifest_phys())
+		ret = mk_pcifront_add_function(hp_work->domain, hp_work->bus,
+					       hp_work->devfn, hp_work->vendor,
+					       hp_work->device, &hp_work->bus_desc);
+	if (!ret)
+		ret = mk_do_device_add(hp_work->domain, hp_work->bus,
+				       hp_work->devfn, hp_work->driver_override,
+				       hp_work->flags);
 
 	ack.operation = hp_work->operation;
 	ack.result = ret;
@@ -885,6 +895,9 @@ static int mk_handle_device_add(struct mk_device_resource_payload *payload, u32 
 	strscpy(hp_work->driver_override, payload->driver_override, sizeof(hp_work->driver_override));
 	hp_work->sender_instance_id = payload->sender_instance_id;
 	hp_work->operation = MK_RES_DEVICE_ADD;
+	hp_work->vendor = payload->vendor;
+	hp_work->device = payload->device;
+	hp_work->bus_desc = payload->bus_desc;
 	schedule_work(&hp_work->work);
 
 	return 0;
@@ -1580,6 +1593,7 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	};
 	struct mk_pending_msg *pending;
 	struct mk_instance *target_instance;
+	struct pci_dev *pdev;
 	int ret;
 	u32 resource_id;
 
@@ -1610,6 +1624,17 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	ret = mk_pciback_lend_one(target_instance, domain, bus, devfn);
 	if (ret)
 		goto out;
+
+	/* It may not have the function in its tree, nor even its bus */
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (!pdev) {
+		ret = -ENODEV;
+		goto unlend;
+	}
+	payload.vendor = pdev->vendor;
+	payload.device = pdev->device;
+	mk_pci_bus_describe(pdev->bus, &payload.bus_desc);
+	pci_dev_put(pdev);
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
 	if (!pending) {

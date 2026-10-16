@@ -1036,8 +1036,6 @@ static int mk_dt_emit_aliases(struct mk_instance *instance, void *fdt)
 }
 
 #ifdef CONFIG_PCI
-#define MK_PCI_BRIDGE_MAX_WINDOWS 16
-
 /* phys.hi of a PCI unit address: bbbbbbbb dddddfff 00000000 */
 static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
 {
@@ -1116,12 +1114,7 @@ static u32 mk_dt_window_flags(const struct resource *res)
 	return hi;
 }
 
-struct mk_dt_ranges {
-	fdt32_t cells[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
-	int nr;
-};
-
-static void mk_dt_add_window(struct mk_dt_ranges *ranges,
+static void mk_dt_add_window(struct mk_pci_bus_desc *desc,
 			     const struct resource *res, resource_size_t offset)
 {
 	u64 pci_addr = res->start - offset;
@@ -1133,13 +1126,13 @@ static void mk_dt_add_window(struct mk_dt_ranges *ranges,
 		return;
 	if (!size || (res->flags & IORESOURCE_UNSET))
 		return;
-	if (ranges->nr + 7 > ARRAY_SIZE(ranges->cells)) {
+	if (desc->nr_ranges + 7 > ARRAY_SIZE(desc->ranges)) {
 		pr_warn("A PCI bus has more than %d windows, rest not described\n",
-			MK_PCI_BRIDGE_MAX_WINDOWS);
+			MK_PCI_BUS_MAX_WINDOWS);
 		return;
 	}
 
-	c = &ranges->cells[ranges->nr];
+	c = &desc->ranges[desc->nr_ranges];
 	c[0] = cpu_to_fdt32(mk_dt_window_flags(res));
 	c[1] = cpu_to_fdt32(upper_32_bits(pci_addr));
 	c[2] = cpu_to_fdt32(lower_32_bits(pci_addr));
@@ -1147,7 +1140,7 @@ static void mk_dt_add_window(struct mk_dt_ranges *ranges,
 	c[4] = cpu_to_fdt32(lower_32_bits(res->start));
 	c[5] = cpu_to_fdt32(upper_32_bits(size));
 	c[6] = cpu_to_fdt32(lower_32_bits(size));
-	ranges->nr += 7;
+	desc->nr_ranges += 7;
 }
 
 /*
@@ -1155,7 +1148,7 @@ static void mk_dt_add_window(struct mk_dt_ranges *ranges,
  * the bridge above it otherwise. Either covers the BARs of every device
  * on it.
  */
-static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
+static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
 {
 	struct resource_entry *entry;
 	struct pci_bus_region region;
@@ -1164,7 +1157,7 @@ static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
 	if (pci_is_root_bus(bus)) {
 		resource_list_for_each_entry(entry,
 					     &pci_find_host_bridge(bus)->windows)
-			mk_dt_add_window(ranges, entry->res, entry->offset);
+			mk_dt_add_window(desc, entry->res, entry->offset);
 		return;
 	}
 
@@ -1172,7 +1165,7 @@ static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
 		if (!res || !res->flags)
 			continue;
 		pcibios_resource_to_bus(bus, &region, res);
-		mk_dt_add_window(ranges, res, res->start - region.start);
+		mk_dt_add_window(desc, res, res->start - region.start);
 	}
 }
 
@@ -1180,10 +1173,10 @@ static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
  * The ECAM window of a bus, for a spawn kernel to reach it directly once
  * this kernel is lost. A spawn passes on the window it was given.
  */
-static u64 mk_dt_bus_ecam(struct pci_bus *bus, u64 *size)
+static u64 mk_dt_bus_ecam(struct pci_bus *bus)
 {
 	if (mk_manifest_phys())
-		return mk_pcifront_ecam(pci_domain_nr(bus), bus->number, size);
+		return mk_pcifront_ecam(pci_domain_nr(bus), bus->number);
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 	struct pci_mmcfg_region *cfg;
 
@@ -1191,19 +1184,32 @@ static u64 mk_dt_bus_ecam(struct pci_bus *bus, u64 *size)
 	if (!cfg)
 		return 0;
 
-	*size = SZ_1M;
 	return cfg->address + ((u64)bus->number << 20);
 #else
 	return 0;
 #endif
 }
 
+/**
+ * mk_pci_bus_describe - What a kernel needs to make @bus a root bus of its own
+ * @bus: A bus of this kernel
+ * @desc: Filled with the windows of @bus and its ECAM window
+ *
+ * The same description goes into an instance's boot tree and into the
+ * message that hands it a device on a bus it did not boot with.
+ */
+void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
+{
+	memset(desc, 0, sizeof(*desc));
+	desc->ecam = mk_dt_bus_ecam(bus);
+	mk_dt_bus_windows(bus, desc);
+}
+
 static int mk_dt_emit_one_bus(struct mk_instance *instance,
 			      struct pci_bus *bus, void *fdt)
 {
-	struct mk_dt_ranges *ranges;
+	struct mk_pci_bus_desc *desc;
 	fdt32_t bus_range[2];
-	u64 ecam_base, ecam_size = 0;
 	char name[16];
 	int ret;
 
@@ -1211,8 +1217,7 @@ static int mk_dt_emit_one_bus(struct mk_instance *instance,
 
 	ret = fdt_begin_node(fdt, name);
 	if (!ret)
-		ret = fdt_property_string(fdt, "compatible",
-					  "multikernel,pci-host-bridge");
+		ret = fdt_property_string(fdt, "compatible", MK_PCI_HOST_BRIDGE);
 	if (!ret)
 		ret = fdt_property_string(fdt, "device_type", "pci");
 	if (!ret)
@@ -1231,27 +1236,23 @@ static int mk_dt_emit_one_bus(struct mk_instance *instance,
 	if (ret)
 		return ret;
 
-	ecam_base = mk_dt_bus_ecam(bus, &ecam_size);
-	if (ecam_base) {
+	desc = kmalloc_obj(*desc, GFP_KERNEL);
+	if (!desc)
+		return -FDT_ERR_NOSPACE;
+	mk_pci_bus_describe(bus, desc);
+	if (desc->ecam) {
 		fdt32_t reg[4];
 
-		reg[0] = cpu_to_fdt32(upper_32_bits(ecam_base));
-		reg[1] = cpu_to_fdt32(lower_32_bits(ecam_base));
-		reg[2] = cpu_to_fdt32(upper_32_bits(ecam_size));
-		reg[3] = cpu_to_fdt32(lower_32_bits(ecam_size));
+		reg[0] = cpu_to_fdt32(upper_32_bits(desc->ecam));
+		reg[1] = cpu_to_fdt32(lower_32_bits(desc->ecam));
+		reg[2] = cpu_to_fdt32(upper_32_bits(SZ_1M));
+		reg[3] = cpu_to_fdt32(lower_32_bits(SZ_1M));
 		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
-		if (ret)
-			return ret;
 	}
-
-	ranges = kzalloc(sizeof(*ranges), GFP_KERNEL);
-	if (!ranges)
-		return -FDT_ERR_NOSPACE;
-	mk_dt_bus_windows(bus, ranges);
-	if (ranges->nr)
-		ret = fdt_property(fdt, "ranges", ranges->cells,
-				   ranges->nr * sizeof(fdt32_t));
-	kfree(ranges);
+	if (!ret && desc->nr_ranges)
+		ret = fdt_property(fdt, "ranges", desc->ranges,
+				   desc->nr_ranges * sizeof(fdt32_t));
+	kfree(desc);
 	if (ret)
 		return ret;
 
