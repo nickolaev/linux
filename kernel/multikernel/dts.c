@@ -1044,33 +1044,19 @@ static u32 mk_dt_pci_phys_hi(u8 bus, u8 devfn)
 	return (u32)bus << 16 | (u32)devfn << 8;
 }
 
-/*
- * The path of a device's node in the tree this kernel generates: the
- * host bridge of its root bus, then one node per bridge on the way
- * down, as pci_set_of_node() expects to find a device under its bus.
- */
+/* The node of a bus in the tree this kernel generates: one per bus number */
+static int mk_dt_pci_bus_name(char *buf, size_t size, u16 domain, u8 bus)
+{
+	return scnprintf(buf, size, "pci@%x,%x", domain, bus);
+}
+
 static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,
 			       size_t size)
 {
-	struct pci_bus *bus = pci_find_bus(dev->domain, dev->bus);
-	u8 devfns[8];
-	int depth = 0, pos, i;
+	int pos;
 
-	if (!bus)
-		return -ENODEV;
-
-	while (bus->parent) {
-		if (depth == ARRAY_SIZE(devfns))
-			return -E2BIG;
-		devfns[depth++] = bus->self->devfn;
-		bus = bus->parent;
-	}
-
-	pos = scnprintf(buf, size, "/pci@%llx",
-			(unsigned long long)bus->busn_res.start);
-	for (i = depth - 1; i >= 0; i--)
-		pos += scnprintf(buf + pos, size - pos, "/pci@%x,%x",
-				 PCI_SLOT(devfns[i]), PCI_FUNC(devfns[i]));
+	pos = scnprintf(buf, size, "/");
+	pos += mk_dt_pci_bus_name(buf + pos, size - pos, dev->domain, dev->bus);
 	scnprintf(buf + pos, size - pos, "/pci@%x,%x", dev->slot, dev->func);
 	return 0;
 }
@@ -1082,31 +1068,14 @@ static int mk_dt_emit_pci_reg(void *fdt, u8 bus, u8 devfn)
 	return fdt_property(fdt, "reg", reg, sizeof(reg));
 }
 
-/* The bus directly below @parent on the way to bus @busnr, or NULL */
-static struct pci_bus *mk_dt_bus_toward(struct pci_bus *parent, u16 domain,
-					u8 busnr)
+/* The instance's devices on @bus, as leaves of its node */
+static int mk_dt_emit_pci_devices(struct mk_instance *instance,
+				  struct pci_bus *bus, void *fdt)
 {
-	struct pci_bus *bus = pci_find_bus(domain, busnr);
-
-	while (bus && bus->parent != parent)
-		bus = bus->parent;
-	return bus;
-}
-
-/*
- * Describe what @instance owns below @bus: its devices on this bus as
- * leaves, and one bridge node, recursed into, per child bus that leads
- * to a device further down. The topology comes from the bus structures,
- * which outlive a leaf device that has been detached from this kernel.
- */
-static int mk_dt_emit_pci_bus(struct mk_instance *instance,
-			      struct pci_bus *bus, void *fdt)
-{
-	struct pci_bus *children[16];
 	struct mk_pci_device *dev;
 	u16 domain = pci_domain_nr(bus);
 	char name[16];
-	int nr = 0, i, ret;
+	int ret;
 
 	list_for_each_entry(dev, &instance->pci_devices, list) {
 		if (dev->domain != domain || dev->bus != bus->number)
@@ -1121,53 +1090,6 @@ static int mk_dt_emit_pci_bus(struct mk_instance *instance,
 			ret = fdt_property_u32(fdt, "vendor-id", dev->vendor);
 		if (!ret)
 			ret = fdt_property_u32(fdt, "device-id", dev->device);
-		if (!ret)
-			ret = fdt_end_node(fdt);
-		if (ret)
-			return ret;
-	}
-
-	list_for_each_entry(dev, &instance->pci_devices, list) {
-		struct pci_bus *child;
-		fdt32_t bus_range[2];
-
-		if (dev->domain != domain || dev->bus == bus->number)
-			continue;
-
-		child = mk_dt_bus_toward(bus, domain, dev->bus);
-		if (!child || !child->self)
-			continue;
-		for (i = 0; i < nr; i++)
-			if (children[i] == child)
-				break;
-		if (i < nr)
-			continue;
-		if (nr == ARRAY_SIZE(children)) {
-			pr_warn("Bus %04x:%02x has more than %zu child buses in use, rest not described\n",
-				domain, bus->number, ARRAY_SIZE(children));
-			break;
-		}
-		children[nr++] = child;
-
-		snprintf(name, sizeof(name), "pci@%x,%x",
-			 PCI_SLOT(child->self->devfn), PCI_FUNC(child->self->devfn));
-		bus_range[0] = cpu_to_fdt32(child->busn_res.start);
-		bus_range[1] = cpu_to_fdt32(child->busn_res.end);
-		ret = fdt_begin_node(fdt, name);
-		if (!ret)
-			ret = fdt_property_string(fdt, "device_type", "pci");
-		if (!ret)
-			ret = fdt_property_u32(fdt, "#address-cells", 3);
-		if (!ret)
-			ret = fdt_property_u32(fdt, "#size-cells", 2);
-		if (!ret)
-			ret = mk_dt_emit_pci_reg(fdt, bus->number,
-						 child->self->devfn);
-		if (!ret)
-			ret = fdt_property(fdt, "bus-range", bus_range,
-					   sizeof(bus_range));
-		if (!ret)
-			ret = mk_dt_emit_pci_bus(instance, child, fdt);
 		if (!ret)
 			ret = fdt_end_node(fdt);
 		if (ret)
@@ -1194,55 +1116,93 @@ static u32 mk_dt_window_flags(const struct resource *res)
 	return hi;
 }
 
-static struct pci_bus *mk_dt_root_bus_of(u32 domain, u32 busn)
-{
-	struct pci_bus *bus;
+struct mk_dt_ranges {
+	fdt32_t cells[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
+	int nr;
+};
 
-	list_for_each_entry(bus, &pci_root_buses, node) {
-		if (pci_domain_nr(bus) == domain &&
-		    bus->busn_res.start <= busn && busn <= bus->busn_res.end)
-			return bus;
+static void mk_dt_add_window(struct mk_dt_ranges *ranges,
+			     const struct resource *res, resource_size_t offset)
+{
+	u64 pci_addr = res->start - offset;
+	u64 size = resource_size(res);
+	fdt32_t *c;
+
+	if (resource_type(res) != IORESOURCE_IO &&
+	    resource_type(res) != IORESOURCE_MEM)
+		return;
+	if (!size || (res->flags & IORESOURCE_UNSET))
+		return;
+	if (ranges->nr + 7 > ARRAY_SIZE(ranges->cells)) {
+		pr_warn("A PCI bus has more than %d windows, rest not described\n",
+			MK_PCI_BRIDGE_MAX_WINDOWS);
+		return;
 	}
 
-	return NULL;
+	c = &ranges->cells[ranges->nr];
+	c[0] = cpu_to_fdt32(mk_dt_window_flags(res));
+	c[1] = cpu_to_fdt32(upper_32_bits(pci_addr));
+	c[2] = cpu_to_fdt32(lower_32_bits(pci_addr));
+	c[3] = cpu_to_fdt32(upper_32_bits(res->start));
+	c[4] = cpu_to_fdt32(lower_32_bits(res->start));
+	c[5] = cpu_to_fdt32(upper_32_bits(size));
+	c[6] = cpu_to_fdt32(lower_32_bits(size));
+	ranges->nr += 7;
 }
 
 /*
- * The ECAM window covering the bridge's bus range, so a spawn kernel can
- * generate config cycles without the MCFG table only ACPI provides.
- * This kernel's own window came either from its ACPI or from the tree
- * that spawned it, so the description propagates down spawn chains.
+ * What @bus decodes: the windows of its host bridge for a root bus, of
+ * the bridge above it otherwise. Either covers the BARs of every device
+ * on it.
  */
-static u64 mk_dt_bridge_ecam(struct pci_bus *root, u64 *size)
+static void mk_dt_bus_windows(struct pci_bus *bus, struct mk_dt_ranges *ranges)
+{
+	struct resource_entry *entry;
+	struct pci_bus_region region;
+	struct resource *res;
+
+	if (pci_is_root_bus(bus)) {
+		resource_list_for_each_entry(entry,
+					     &pci_find_host_bridge(bus)->windows)
+			mk_dt_add_window(ranges, entry->res, entry->offset);
+		return;
+	}
+
+	pci_bus_for_each_resource(bus, res) {
+		if (!res || !res->flags)
+			continue;
+		pcibios_resource_to_bus(bus, &region, res);
+		mk_dt_add_window(ranges, res, res->start - region.start);
+	}
+}
+
+/* The ECAM window of a bus, so a spawn kernel can reach it directly */
+static u64 mk_dt_bus_ecam(struct pci_bus *bus, u64 *size)
 {
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 	struct pci_mmcfg_region *cfg;
 
-	cfg = pci_mmconfig_lookup(pci_domain_nr(root), root->busn_res.start);
-	if (!cfg || cfg->end_bus < root->busn_res.end)
+	cfg = pci_mmconfig_lookup(pci_domain_nr(bus), bus->number);
+	if (!cfg)
 		return 0;
 
-	*size = (u64)(root->busn_res.end - root->busn_res.start + 1) << 20;
-	return cfg->address + ((u64)root->busn_res.start << 20);
+	*size = SZ_1M;
+	return cfg->address + ((u64)bus->number << 20);
 #else
 	return 0;
 #endif
 }
 
-static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
-				      struct pci_bus *root, void *fdt)
+static int mk_dt_emit_one_bus(struct mk_instance *instance,
+			      struct pci_bus *bus, void *fdt)
 {
-	struct pci_host_bridge *bridge = pci_find_host_bridge(root);
-	fdt32_t ranges[MK_PCI_BRIDGE_MAX_WINDOWS * 7];
+	struct mk_dt_ranges *ranges;
 	fdt32_t bus_range[2];
-	struct resource_entry *entry;
 	u64 ecam_base, ecam_size = 0;
 	char name[16];
-	int cells = 0;
 	int ret;
 
-	snprintf(name, sizeof(name), "pci@%llx",
-		 (unsigned long long)root->busn_res.start);
+	mk_dt_pci_bus_name(name, sizeof(name), pci_domain_nr(bus), bus->number);
 
 	ret = fdt_begin_node(fdt, name);
 	if (!ret)
@@ -1256,17 +1216,17 @@ static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
 		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	if (!ret)
 		ret = fdt_property_u32(fdt, "linux,pci-domain",
-				       pci_domain_nr(root));
+				       pci_domain_nr(bus));
 	if (ret)
 		return ret;
 
-	bus_range[0] = cpu_to_fdt32(root->busn_res.start);
-	bus_range[1] = cpu_to_fdt32(root->busn_res.end);
+	bus_range[0] = cpu_to_fdt32(bus->number);
+	bus_range[1] = cpu_to_fdt32(bus->number);
 	ret = fdt_property(fdt, "bus-range", bus_range, sizeof(bus_range));
 	if (ret)
 		return ret;
 
-	ecam_base = mk_dt_bridge_ecam(root, &ecam_size);
+	ecam_base = mk_dt_bus_ecam(bus, &ecam_size);
 	if (ecam_base) {
 		fdt32_t reg[4];
 
@@ -1279,39 +1239,18 @@ static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
 			return ret;
 	}
 
-	resource_list_for_each_entry(entry, &bridge->windows) {
-		const struct resource *res = entry->res;
-		u64 pci_addr, size;
+	ranges = kzalloc(sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
+		return -FDT_ERR_NOSPACE;
+	mk_dt_bus_windows(bus, ranges);
+	if (ranges->nr)
+		ret = fdt_property(fdt, "ranges", ranges->cells,
+				   ranges->nr * sizeof(fdt32_t));
+	kfree(ranges);
+	if (ret)
+		return ret;
 
-		if (resource_type(res) != IORESOURCE_IO &&
-		    resource_type(res) != IORESOURCE_MEM)
-			continue;
-
-		if (cells + 7 > ARRAY_SIZE(ranges)) {
-			pr_warn("Host bridge %s has more than %d windows, rest not described\n",
-				name, MK_PCI_BRIDGE_MAX_WINDOWS);
-			break;
-		}
-
-		pci_addr = res->start - entry->offset;
-		size = resource_size(res);
-		ranges[cells++] = cpu_to_fdt32(mk_dt_window_flags(res));
-		ranges[cells++] = cpu_to_fdt32(upper_32_bits(pci_addr));
-		ranges[cells++] = cpu_to_fdt32(lower_32_bits(pci_addr));
-		ranges[cells++] = cpu_to_fdt32(upper_32_bits(res->start));
-		ranges[cells++] = cpu_to_fdt32(lower_32_bits(res->start));
-		ranges[cells++] = cpu_to_fdt32(upper_32_bits(size));
-		ranges[cells++] = cpu_to_fdt32(lower_32_bits(size));
-	}
-
-	if (cells) {
-		ret = fdt_property(fdt, "ranges", ranges,
-				   cells * sizeof(fdt32_t));
-		if (ret)
-			return ret;
-	}
-
-	ret = mk_dt_emit_pci_bus(instance, root, fdt);
+	ret = mk_dt_emit_pci_devices(instance, bus, fdt);
 	if (ret)
 		return ret;
 
@@ -1319,42 +1258,37 @@ static int mk_dt_emit_one_host_bridge(struct mk_instance *instance,
 }
 
 /*
- * mk_dt_emit_host_bridges() - Describe the root buses under an instance's devices
+ * mk_dt_emit_host_bridges() - Describe the buses of an instance's devices
  *
  * A spawn kernel boots without ACPI, so nothing tells it where its PCI
- * root buses are or which windows they decode; this kernel knows both
- * exactly. One node per distinct root bus:
+ * devices are or which windows they decode; this kernel knows both
+ * exactly. The instance sees each bus that holds a device of its own as
+ * a root bus with only those devices on it, and nothing of the bridges
+ * above: they are this kernel's. One node per bus:
  *
- *   pci@4f {
+ *   pci@0,9 {
  *       compatible = "multikernel,pci-host-bridge";
  *       device_type = "pci";
  *       #address-cells = <3>;
  *       #size-cells = <2>;
  *       linux,pci-domain = <0>;
- *       bus-range = <0x4f 0x50>;
- *       reg = <ecam.hi ecam.lo size.hi size.lo>;	(when known)
+ *       bus-range = <0x9 0x9>;
  *       ranges = <flags pci.hi pci.lo cpu.hi cpu.lo size.hi size.lo ...>;
- *       pci@2,7 {				a bridge on the way down
- *           device_type = "pci";
- *           #address-cells = <3>;
- *           #size-cells = <2>;
+ *       pci@0,0 {				a device the instance owns
  *           reg = <phys.hi 0 0 0 0>;
- *           bus-range = <0x50 0x50>;
- *           pci@0,0 {				a device the instance owns
- *               reg = <phys.hi 0 0 0 0>;
- *               vendor-id = <0x1af4>;
- *               device-id = <0x1041>;
- *           };
+ *           vendor-id = <0x1af4>;
+ *           device-id = <0x1041>;
  *       };
  *   };
  *
  * This is the devicetree PCI bus binding, with a device under the bus
  * it sits on, so the tree can be handed to the OF core as is and
- * pci_set_of_node() will find each device by its unit address.
+ * pci_set_of_node() will find each device by its unit address. Bus,
+ * device and function numbers are the real ones.
  */
 static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 {
-	struct pci_bus *roots[8];
+	struct pci_bus *buses[32];
 	struct mk_pci_device *pci_dev;
 	int nr = 0, i, ret;
 
@@ -1362,31 +1296,31 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 		return 0;
 
 	list_for_each_entry(pci_dev, &instance->pci_devices, list) {
-		struct pci_bus *root;
+		struct pci_bus *bus;
 
-		root = mk_dt_root_bus_of(pci_dev->domain, pci_dev->bus);
-		if (!root) {
-			pr_warn("No root bus covers %04x:%02x, device %04x:%02x:%02x.%x not reachable in the instance\n",
+		bus = pci_find_bus(pci_dev->domain, pci_dev->bus);
+		if (!bus) {
+			pr_warn("No bus %04x:%02x, device %04x:%02x:%02x.%x not reachable in the instance\n",
 				pci_dev->domain, pci_dev->bus, pci_dev->domain,
 				pci_dev->bus, pci_dev->slot, pci_dev->func);
 			continue;
 		}
 
 		for (i = 0; i < nr; i++)
-			if (roots[i] == root)
+			if (buses[i] == bus)
 				break;
 		if (i < nr)
 			continue;
-		if (nr == ARRAY_SIZE(roots)) {
-			pr_warn("Instance %s spans more than %zu root buses, rest not described\n",
-				instance->name, ARRAY_SIZE(roots));
+		if (nr == ARRAY_SIZE(buses)) {
+			pr_warn("Instance %s spans more than %zu buses, rest not described\n",
+				instance->name, ARRAY_SIZE(buses));
 			break;
 		}
-		roots[nr++] = root;
+		buses[nr++] = bus;
 	}
 
 	for (i = 0; i < nr; i++) {
-		ret = mk_dt_emit_one_host_bridge(instance, roots[i], fdt);
+		ret = mk_dt_emit_one_bus(instance, buses[i], fdt);
 		if (ret)
 			return ret;
 	}
