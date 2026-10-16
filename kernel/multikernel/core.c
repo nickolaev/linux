@@ -363,6 +363,10 @@ void mk_instance_set_state(struct mk_instance *instance,
 
 	instance->state = state;
 	mk_instance_track_dump(instance, old_state, state);
+
+	/* Whatever stopped it, its functions are no longer its to reach */
+	if (old_state == MK_STATE_ACTIVE)
+		mk_pciback_unlend(instance);
 	pr_debug("Instance %d (%s) state: %s -> %s\n",
 		 instance->id, instance->name,
 		 mk_state_to_string(old_state),

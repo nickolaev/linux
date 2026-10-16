@@ -1606,22 +1606,27 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		goto out;
 	}
 
+	/* The instance probes the function as soon as it hears of it */
+	ret = mk_pciback_lend_one(target_instance, domain, bus, devfn);
+	if (ret)
+		goto out;
+
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_DEVICE_ADD, resource_id);
 	if (!pending) {
 		ret = -ENOMEM;
-		goto out;
+		goto unlend;
 	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_DEVICE_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);
-		goto out;
+		goto unlend;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
-		goto out;
+		goto unlend;
 
 	ret = mk_instance_add_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {
@@ -1631,7 +1636,11 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 	pr_info("Multikernel hotplug: Device %04x:%02x:%02x.%x successfully added to instance %d\n",
 		domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), instance_id);
 
-	ret = 0;
+	mk_instance_put(target_instance);
+	return 0;
+
+unlend:
+	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
 out:
 	mk_instance_put(target_instance);
 	return ret;
@@ -1699,6 +1708,8 @@ int mk_send_device_remove(int instance_id, u16 domain, u8 bus, u8 devfn)
 	ret = mk_msg_pending_wait(pending, 10000);
 	if (ret < 0)
 		goto out;
+
+	mk_pciback_unlend_one(target_instance, domain, bus, devfn);
 
 	ret = mk_instance_remove_pci_device(target_instance, domain, bus, devfn);
 	if (ret < 0) {

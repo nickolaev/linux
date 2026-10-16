@@ -1754,11 +1754,20 @@ int multikernel_kexec_by_id(int mk_id)
 	 */
 	mk_ipi_ring_drop_pending();
 
+	rc = mk_pciback_lend(instance);
+	if (rc) {
+		pr_err("Instance %d: its PCI functions cannot be lent: %d\n",
+		       mk_id, rc);
+		goto unlock;
+	}
+
 	rc = mk_arch_spawn_instance(mk_image, instance, cpu);
 	if (rc == 0) {
 		rc = mk_instance_set_kexec_active(mk_image->mk_id);
 		if (rc)
 			pr_warn("Failed to set instance %d as active: %d\n", mk_image->mk_id, rc);
+	} else {
+		mk_pciback_unlend(instance);
 	}
 
 unlock:

@@ -200,6 +200,7 @@ void mk_ipi_ring_drop_pending(void);
 #define MK_MSG_SYSTEM       0x3000
 #define MK_MSG_USER         0x4000
 #define MK_MSG_NETWORK      0x5000
+#define MK_MSG_PCI          0x6000
 
 /* I/O interrupt forwarding subtypes */
 #define MK_IO_IRQ_FORWARD   (MK_MSG_IO + 1)
@@ -226,6 +227,11 @@ void mk_ipi_ring_drop_pending(void);
 /* Network/vsock subtypes */
 #define MK_NET_VSOCK_PKT    (MK_MSG_NETWORK + 1)  /* vsock packet */
 #define MK_NET_DATA_READY   (MK_MSG_NETWORK + 2)  /* Data available notification */
+
+/* PCI config space of a lent function, served by the kernel that lent it */
+#define MK_PCI_CFG_READ     (MK_MSG_PCI + 1)
+#define MK_PCI_CFG_WRITE    (MK_MSG_PCI + 2)
+#define MK_PCI_CFG_ACK      (MK_MSG_PCI + 3)  /* Answer to either */
 
 /**
  * Core message structure
@@ -303,6 +309,19 @@ struct mk_resource_ack {
 	u32 operation;          /* Original operation (MK_RES_CPU_ADD, etc.) */
 	u32 result;             /* Result code: 0 = success, negative = error */
 	u64 resource_id;        /* Physical CPU ID, memory PFN, etc. */
+};
+
+/* PCI config space access, request and answer */
+struct mk_pci_cfg_payload {
+	u64 seq;                /* From mk_request_seq(), echoed in the answer */
+	int sender_instance_id;
+	u16 domain;
+	u8 bus;
+	u8 devfn;
+	u16 where;              /* Offset in config space */
+	u8 size;                /* 1, 2 or 4 bytes */
+	u32 val;                /* Value written, or read in the answer */
+	int result;             /* Answer: PCIBIOS_* */
 };
 
 /* Shutdown request payload */
@@ -981,6 +1000,33 @@ struct mk_instance *mk_instance_find(int mk_id);
 void mk_instance_put(struct mk_instance *instance);
 void mk_instance_set_state(struct mk_instance *instance,
 			   enum mk_instance_state state);
+
+/* Config space of the PCI functions lent to a running instance */
+#ifdef CONFIG_PCI
+int mk_pciback_lend(struct mk_instance *instance);
+void mk_pciback_unlend(struct mk_instance *instance);
+int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
+			u8 devfn);
+void mk_pciback_unlend_one(struct mk_instance *instance, u16 domain, u8 bus,
+			   u8 devfn);
+#else
+static inline int mk_pciback_lend(struct mk_instance *instance)
+{
+	return 0;
+}
+static inline void mk_pciback_unlend(struct mk_instance *instance)
+{
+}
+static inline int mk_pciback_lend_one(struct mk_instance *instance, u16 domain,
+				      u8 bus, u8 devfn)
+{
+	return 0;
+}
+static inline void mk_pciback_unlend_one(struct mk_instance *instance,
+					 u16 domain, u8 bus, u8 devfn)
+{
+}
+#endif
 
 /* Kimage-based access to the instance memory pool */
 void *mk_kimage_alloc(struct kimage *image, size_t size, size_t align);
