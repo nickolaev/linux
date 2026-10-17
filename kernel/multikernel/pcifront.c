@@ -28,7 +28,9 @@
  * its node, which is mapped at boot and unused until then, or fail at
  * once where there is none. That is safe only because a fenced host no
  * longer generates config cycles itself; the 0xCF8 ports, which other
- * surviving kernels may use, are never touched.
+ * surviving kernels may use, are never touched. With the host's filter
+ * gone, only the functions of this kernel's tree answer: a scan finds
+ * neither the bridges above nor the functions beside them.
  */
 
 #define pr_fmt(fmt) "mk_pcifront: " fmt
@@ -52,6 +54,7 @@ struct mk_pcifront_bus {
 	u8 busnr;
 	phys_addr_t ecam_phys;
 	void __iomem *ecam;	/* For when the host is fenced, or NULL */
+	DECLARE_BITMAP(devfns, 256);	/* The functions of this kernel's tree */
 };
 
 /*
@@ -103,7 +106,7 @@ static int mk_pcifront_direct(struct mk_pcifront_bus *fb, unsigned int devfn,
 {
 	void __iomem *addr;
 
-	if (!fb->ecam) {
+	if (!fb->ecam || !test_bit(devfn, fb->devfns)) {
 		if (subtype == MK_PCI_CFG_READ)
 			*val = ~0U;
 		return PCIBIOS_DEVICE_NOT_FOUND;
@@ -319,9 +322,10 @@ static int mk_pcifront_add_bus(struct device_node *np)
 	struct pci_host_bridge *bridge;
 	struct resource_entry *entry;
 	struct mk_pcifront_bus *fb;
+	struct device_node *child;
 	struct resource *bus_res;
 	u32 domain = 0, range[2];
-	int ret;
+	int devfn, ret;
 
 	of_property_read_u32(np, "linux,pci-domain", &domain);
 	if (of_property_read_u32_array(np, "bus-range", range, 2)) {
@@ -340,6 +344,11 @@ static int mk_pcifront_add_bus(struct device_node *np)
 	fb->domain = domain;
 	fb->busnr = range[0];
 	mk_pcifront_map_ecam(np, fb);
+	for_each_child_of_node(np, child) {
+		devfn = of_pci_get_devfn(child);
+		if (devfn >= 0)
+			set_bit(devfn, fb->devfns);
+	}
 
 	bus_res->start = range[0];
 	bus_res->end = range[1];
@@ -517,6 +526,7 @@ static int mk_pcifront_scan_function(u16 domain, u8 busnr, u8 devfn)
 	if (!bus)
 		return -ENODEV;
 
+	set_bit(devfn, mk_pcifront_of(bus)->devfns);
 	pdev = pci_scan_single_device(bus, devfn);
 	if (!pdev)
 		return -ENODEV;
