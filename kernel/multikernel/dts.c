@@ -1205,6 +1205,26 @@ void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc)
 	mk_dt_bus_windows(bus, desc);
 }
 
+/* The reg and ranges of a bus node, from mk_pci_bus_describe() */
+static int mk_dt_emit_bus_desc(void *fdt, const struct mk_pci_bus_desc *desc)
+{
+	int ret = 0;
+
+	if (desc->ecam) {
+		fdt32_t reg[4];
+
+		reg[0] = cpu_to_fdt32(upper_32_bits(desc->ecam));
+		reg[1] = cpu_to_fdt32(lower_32_bits(desc->ecam));
+		reg[2] = cpu_to_fdt32(upper_32_bits(SZ_1M));
+		reg[3] = cpu_to_fdt32(lower_32_bits(SZ_1M));
+		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
+	}
+	if (!ret && desc->nr_ranges)
+		ret = fdt_property(fdt, "ranges", desc->ranges,
+				   desc->nr_ranges * sizeof(fdt32_t));
+	return ret;
+}
+
 static int mk_dt_emit_one_bus(struct mk_instance *instance,
 			      struct pci_bus *bus, void *fdt)
 {
@@ -1240,18 +1260,7 @@ static int mk_dt_emit_one_bus(struct mk_instance *instance,
 	if (!desc)
 		return -FDT_ERR_NOSPACE;
 	mk_pci_bus_describe(bus, desc);
-	if (desc->ecam) {
-		fdt32_t reg[4];
-
-		reg[0] = cpu_to_fdt32(upper_32_bits(desc->ecam));
-		reg[1] = cpu_to_fdt32(lower_32_bits(desc->ecam));
-		reg[2] = cpu_to_fdt32(upper_32_bits(SZ_1M));
-		reg[3] = cpu_to_fdt32(lower_32_bits(SZ_1M));
-		ret = fdt_property(fdt, "reg", reg, sizeof(reg));
-	}
-	if (!ret && desc->nr_ranges)
-		ret = fdt_property(fdt, "ranges", desc->ranges,
-				   desc->nr_ranges * sizeof(fdt32_t));
+	ret = mk_dt_emit_bus_desc(fdt, desc);
 	kfree(desc);
 	if (ret)
 		return ret;
@@ -1332,6 +1341,66 @@ static int mk_dt_emit_host_bridges(struct mk_instance *instance, void *fdt)
 	}
 
 	return 0;
+}
+
+static int mk_dt_emit_bus_tree(struct pci_bus *bus, void *fdt,
+			       struct mk_pci_bus_desc *desc)
+{
+	struct pci_bus *child;
+	char name[16];
+	int ret;
+
+	mk_dt_pci_bus_name(name, sizeof(name), pci_domain_nr(bus), bus->number);
+	mk_pci_bus_describe(bus, desc);
+	ret = fdt_begin_node(fdt, name);
+	if (!ret)
+		ret = mk_dt_emit_bus_desc(fdt, desc);
+	if (!ret)
+		ret = fdt_end_node(fdt);
+
+	list_for_each_entry(child, &bus->children, node) {
+		if (ret)
+			break;
+		ret = mk_dt_emit_bus_tree(child, fdt, desc);
+	}
+	return ret;
+}
+
+/**
+ * mk_dt_emit_pci_buses() - Describe every PCI bus of this kernel
+ * @fdt: An open node to add the description under
+ *
+ * A backup that outlives this kernel takes functions it did not boot
+ * with, on buses it has never seen, once nobody is left to describe
+ * them. So each bus is described up front, with the reg and ranges its
+ * node would carry in a boot tree, and no compatible: these are not
+ * buses of the backup until it takes a function on one.
+ *
+ *   multikernel,pci-buses {
+ *       pci@0,4 { reg = <...>; ranges = <...>; };
+ *   };
+ *
+ * Returns: 0 or a libfdt error
+ */
+int mk_dt_emit_pci_buses(void *fdt)
+{
+	struct mk_pci_bus_desc *desc;
+	struct pci_bus *bus = NULL;
+	int ret;
+
+	desc = kmalloc_obj(*desc, GFP_KERNEL);
+	if (!desc)
+		return -FDT_ERR_NOSPACE;
+
+	ret = fdt_begin_node(fdt, "multikernel,pci-buses");
+	pci_lock_rescan_remove();
+	while (!ret && (bus = pci_find_next_bus(bus)))
+		ret = mk_dt_emit_bus_tree(bus, fdt, desc);
+	pci_unlock_rescan_remove();
+	if (!ret)
+		ret = fdt_end_node(fdt);
+	kfree(desc);
+	return ret;
 }
 #else /* !CONFIG_PCI */
 static int mk_dt_pci_node_path(const struct mk_pci_device *dev, char *buf,

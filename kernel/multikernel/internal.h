@@ -102,10 +102,15 @@ phys_addr_t mk_manifest_phys(void);
 struct pci_bus;
 #ifdef CONFIG_PCI
 void mk_pci_bus_describe(struct pci_bus *bus, struct mk_pci_bus_desc *desc);
+int mk_dt_emit_pci_buses(void *fdt);
 #else
 static inline void mk_pci_bus_describe(struct pci_bus *bus,
 				       struct mk_pci_bus_desc *desc)
 {
+}
+static inline int mk_dt_emit_pci_buses(void *fdt)
+{
+	return 0;
 }
 #endif
 

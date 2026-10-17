@@ -311,8 +311,12 @@ static int mk_manifest_chosen(void *fdt, void *data)
 	if (ret)
 		return ret;
 
-	/* A node's properties precede its subnodes: the host tree closes /chosen */
-	return mk_manifest_add_host_tree(fdt, ctx->instance);
+	/* A node's properties precede its subnodes: those close /chosen */
+	ret = mk_manifest_add_host_tree(fdt, ctx->instance);
+	/* A backup, which user space arms with a host tree, takes over buses */
+	if (!ret && ctx->instance->host_tree)
+		ret = mk_dt_emit_pci_buses(fdt);
+	return ret;
 }
 
 /**
