@@ -1608,6 +1608,11 @@ int mk_send_device_add(int instance_id, u16 domain, u8 bus, u8 devfn,
 		if (mk_pool)
 			return mk_pool_device_remove(domain, bus, devfn,
 						     driver_override, flags);
+		if (mk_manifest_phys()) {
+			ret = mk_pcifront_adopt_function(domain, bus, devfn);
+			if (ret)
+				return ret;
+		}
 		return mk_do_device_add(domain, bus, devfn, driver_override, flags);
 	}
 

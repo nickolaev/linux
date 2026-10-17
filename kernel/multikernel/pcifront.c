@@ -31,6 +31,11 @@
  * surviving kernels may use, are never touched. With the host's filter
  * gone, only the functions of this kernel's tree answer: a scan finds
  * neither the bridges above nor the functions beside them.
+ *
+ * Once the host is fenced, nobody is left to hand this kernel a
+ * function, so it takes the host's functions itself, as the host
+ * described them when it booted this kernel: their IDs in the host tree
+ * user space wrote, their buses in multikernel,pci-buses.
  */
 
 #define pr_fmt(fmt) "mk_pcifront: " fmt
@@ -595,6 +600,115 @@ int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 		ret = mk_pcifront_scan_function(domain, bus, devfn);
 unlock:
 	pci_unlock_rescan_remove();
+	return ret;
+}
+
+/* The IDs of a function, from the host tree user space armed this kernel with */
+static int mk_pcifront_host_ids(u16 domain, u8 bus, u8 devfn, u16 *vendor,
+				u16 *device)
+{
+	struct device_node *devices, *np;
+	const char *id;
+	char want[16];
+	u32 v, d;
+	int ret = -ENOENT;
+
+	devices = of_find_node_by_path("/chosen/multikernel,host-tree/devices");
+	if (!devices)
+		return -ENOENT;
+
+	snprintf(want, sizeof(want), "%04x:%02x:%02x.%x", domain, bus,
+		 PCI_SLOT(devfn), PCI_FUNC(devfn));
+	for_each_child_of_node(devices, np) {
+		if (of_property_read_string(np, "pci-id", &id) || strcmp(id, want))
+			continue;
+		if (!of_property_read_u32(np, "vendor-id", &v) &&
+		    !of_property_read_u32(np, "device-id", &d)) {
+			*vendor = v;
+			*device = d;
+			ret = 0;
+		}
+		of_node_put(np);
+		break;
+	}
+	of_node_put(devices);
+	return ret;
+}
+
+/* A bus as the host described it in multikernel,pci-buses */
+static int mk_pcifront_host_bus(u16 domain, u8 bus, struct mk_pci_bus_desc *desc)
+{
+	struct device_node *np;
+	const __be32 *ranges;
+	char path[48];
+	u32 reg[4];
+	int len;
+
+	snprintf(path, sizeof(path), "/chosen/multikernel,pci-buses/pci@%x,%x",
+		 domain, bus);
+	np = of_find_node_by_path(path);
+	if (!np)
+		return -ENOENT;
+
+	memset(desc, 0, sizeof(*desc));
+	if (!of_property_read_u32_array(np, "reg", reg, 4))
+		desc->ecam = (u64)reg[0] << 32 | reg[1];
+	ranges = of_get_property(np, "ranges", &len);
+	if (ranges) {
+		desc->nr_ranges = min_t(u32, len / sizeof(*ranges),
+					ARRAY_SIZE(desc->ranges));
+		memcpy(desc->ranges, ranges, desc->nr_ranges * sizeof(*ranges));
+	}
+	of_node_put(np);
+	return 0;
+}
+
+/**
+ * mk_pcifront_adopt_function - Take a function of the fenced host
+ * @domain: PCI domain
+ * @bus: Bus number
+ * @devfn: Device and function
+ *
+ * Before the fence the function is the host's, and its config space is
+ * out of reach: only the host may lend it.
+ *
+ * Returns: 0 once the function is on a bus of this kernel, -EPERM while
+ * the host is not fenced, -ENOENT when the host did not describe it, or
+ * another -errno
+ */
+int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
+{
+	struct mk_pci_bus_desc *desc;
+	struct pci_dev *pdev;
+	u16 vendor, device;
+	int ret;
+
+	pdev = pci_get_domain_bus_and_slot(domain, bus, devfn);
+	if (pdev) {
+		pci_dev_put(pdev);
+		return 0;
+	}
+	if (!READ_ONCE(mk_pcifront_direct_access))
+		return -EPERM;
+
+	ret = mk_pcifront_host_ids(domain, bus, devfn, &vendor, &device);
+	if (ret) {
+		pr_err("%04x:%02x:%02x.%x is not in the host tree\n", domain,
+		       bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
+		return ret;
+	}
+
+	desc = kmalloc_obj(*desc, GFP_KERNEL);
+	if (!desc)
+		return -ENOMEM;
+	ret = mk_pcifront_host_bus(domain, bus, desc);
+	if (ret)
+		pr_err("Bus %04x:%02x was not described by the host\n", domain,
+		       bus);
+	else
+		ret = mk_pcifront_add_function(domain, bus, devfn, vendor,
+					       device, desc);
+	kfree(desc);
 	return ret;
 }
 

@@ -1028,6 +1028,7 @@ u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus);
 void mk_pcifront_host_fenced(void);
 int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 			     u16 device, const struct mk_pci_bus_desc *desc);
+int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn);
 #else
 static inline int mk_pcifront_init(void)
 {
@@ -1046,6 +1047,10 @@ static inline u64 mk_pcifront_ecam(unsigned int domain, unsigned int bus)
 static inline int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn,
 					   u16 vendor, u16 device,
 					   const struct mk_pci_bus_desc *desc)
+{
+	return -ENODEV;
+}
+static inline int mk_pcifront_adopt_function(u16 domain, u8 bus, u8 devfn)
 {
 	return -ENODEV;
 }
