@@ -1279,7 +1279,7 @@ void __ref vmemmap_free(unsigned long start, unsigned long end,
 	remove_pagetable(start, end, false, altmap);
 }
 
-static void __meminit
+void __meminit
 kernel_physical_mapping_remove(unsigned long start, unsigned long end)
 {
 	start = (unsigned long)__va(start);
