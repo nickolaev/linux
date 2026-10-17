@@ -582,9 +582,17 @@ int mk_pcifront_add_function(u16 domain, u8 bus, u8 devfn, u16 vendor,
 
 	if (new_bus)
 		ret = mk_pcifront_add_bus(bus_np);
+	of_node_put(bus_np);
+	if (ret)
+		goto unlock;
+
+	/* A bus scan skips the slot of a function 0 that is not ours */
+	pbus = pci_find_bus(domain, bus);
+	pdev = pbus ? pci_get_slot(pbus, devfn) : NULL;
+	if (pdev)
+		pci_dev_put(pdev);
 	else
 		ret = mk_pcifront_scan_function(domain, bus, devfn);
-	of_node_put(bus_np);
 unlock:
 	pci_unlock_rescan_remove();
 	return ret;
