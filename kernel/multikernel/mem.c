@@ -525,7 +525,7 @@ int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
 
 	region->res.start = phys_addr;
 	region->res.end = phys_addr + size - 1;
-	region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+	region->res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
 
 	parent = mk_pool_chunk_resource(phys_addr);
 	ret = parent ? insert_resource(parent, &region->res) : -ENODEV;

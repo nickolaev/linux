@@ -1232,7 +1232,7 @@ static int mk_instance_transfer_memory(struct mk_instance *instance, u64 size,
 
 		region->res.start = chunk->start_addr;
 		region->res.end = chunk->end_addr;
-		region->res.flags = IORESOURCE_SYSTEM_RAM | IORESOURCE_BUSY;
+		region->res.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
 
 		parent = mk_pool_chunk_resource(chunk->start_addr);
 		ret = parent ? insert_resource(parent, &region->res) : -ENODEV;
