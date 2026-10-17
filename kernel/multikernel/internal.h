@@ -65,10 +65,6 @@ bool mk_root_has_pci_device(u16 domain, u8 bus, u8 devfn);
 int mk_root_add_pci_device(u16 domain, u8 bus, u8 devfn, const char *alias);
 int mk_root_del_pci_device(u16 domain, u8 bus, u8 devfn);
 
-/* contig.c */
-struct page *mk_alloc_contig_pages(unsigned long nr_pages, int node);
-void mk_free_contig_pages(struct page *pages, unsigned long nr_pages);
-
 /* baseline.c */
 int mk_baseline_validate_and_initialize(const void *fdt, size_t fdt_size);
 

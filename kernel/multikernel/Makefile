@@ -3,7 +3,7 @@
 # Makefile for multikernel support
 #
 
-obj-y += core.o cpuset.o mem.o contig.o kernfs.o dts.o instance_dt.o manifest.o ipi.o messaging.o overlay.o hotplug.o baseline.o
+obj-y += core.o cpuset.o mem.o kernfs.o dts.o instance_dt.o manifest.o ipi.o messaging.o overlay.o hotplug.o baseline.o
 obj-$(CONFIG_OF) += of_devices.o
 obj-$(CONFIG_PCI) += pciback.o
 ifdef CONFIG_PCI

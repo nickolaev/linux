@@ -1344,6 +1344,7 @@ void mk_instance_free_memory(struct mk_instance *instance)
 		}
 
 		if (instance->ctrl_va) {
+			mk_pool_unmap(instance->ctrl_phys, MK_CTRL_BLOCK_SIZE);
 			mk_instance_mem_free(instance, instance->ctrl_va,
 					 MK_CTRL_BLOCK_SIZE);
 			instance->ctrl_va = NULL;
@@ -1456,6 +1457,10 @@ void *mk_instance_ctrl_alloc(struct mk_instance *instance, size_t size,
 		if (!va) {
 			pr_err("Failed to allocate control block for instance %d\n",
 			       instance->id);
+			return NULL;
+		}
+		if (mk_pool_map(virt_to_phys(va), MK_CTRL_BLOCK_SIZE)) {
+			mk_instance_mem_free(instance, va, MK_CTRL_BLOCK_SIZE);
 			return NULL;
 		}
 

@@ -1032,6 +1032,26 @@ struct mk_ident_pgtable {
 
 void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt);
 
+/* Host-owned pool memory, mapped back for this kernel to use */
+static void *mk_pool_ctrl_alloc(size_t size)
+{
+	phys_addr_t phys = multikernel_alloc(size, NUMA_NO_NODE);
+
+	if (!phys)
+		return NULL;
+	if (mk_pool_map(phys, size)) {
+		multikernel_free(phys, size);
+		return NULL;
+	}
+	return __va(phys);
+}
+
+static void mk_pool_ctrl_free(phys_addr_t phys, size_t size)
+{
+	mk_pool_unmap(phys, size);
+	multikernel_free(phys, size);
+}
+
 static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 {
 	unsigned long *page;
@@ -1039,14 +1059,10 @@ static unsigned long *mk_alloc_pgtable_page(struct mk_ident_pgtable *pgt)
 	if (pgt->next_page >= MK_CTRL_PGTABLE_PAGES)
 		return NULL;
 
-	if (pgt->instance) {
+	if (pgt->instance)
 		page = mk_instance_ctrl_alloc(pgt->instance, PAGE_SIZE, PAGE_SIZE);
-	} else {
-		/* Host-owned page table: allocate from the main pool */
-		phys_addr_t phys = multikernel_alloc(PAGE_SIZE, NUMA_NO_NODE);
-
-		page = phys ? __va(phys) : NULL;
-	}
+	else
+		page = mk_pool_ctrl_alloc(PAGE_SIZE);
 
 	if (page) {
 		memset(page, 0, PAGE_SIZE);
@@ -1428,13 +1444,12 @@ static int __mk_pool_park_setup(void)
 	mk_pool->arch.pgt = pgt;
 	mk_pool->arch.cr3 = mk_get_identity_cr3(pgt);
 
-	phys = multikernel_alloc(PAGE_SIZE, NUMA_NO_NODE);
-	if (!phys) {
+	mk_pool->arch.park_va = mk_pool_ctrl_alloc(PAGE_SIZE);
+	if (!mk_pool->arch.park_va) {
 		rc = -ENOMEM;
 		goto err_pgt;
 	}
-	mk_pool->arch.park_va = __va(phys);
-	mk_pool->arch.park_phys = phys;
+	mk_pool->arch.park_phys = __pa(mk_pool->arch.park_va);
 
 	memcpy(mk_pool->arch.park_va, mk_pool_park_start, size);
 
@@ -1449,14 +1464,14 @@ static int __mk_pool_park_setup(void)
 	if (rc)
 		goto err_page;
 
-	phys = multikernel_alloc(ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE),
-				 NUMA_NO_NODE);
-	if (!phys) {
+	mk_pool->arch.slot = mk_pool_ctrl_alloc(ALIGN(sizeof(struct mk_spawn_context),
+						      PAGE_SIZE));
+	if (!mk_pool->arch.slot) {
 		rc = -ENOMEM;
 		goto err_page;
 	}
+	phys = __pa(mk_pool->arch.slot);
 	mk_pool->arch.slot_phys = phys;
-	mk_pool->arch.slot = __va(phys);
 	memset(mk_pool->arch.slot, 0, sizeof(*mk_pool->arch.slot));
 	mk_pool->arch.slot->self_phys = phys;
 	/*
@@ -1472,7 +1487,7 @@ static int __mk_pool_park_setup(void)
 	return 0;
 
 err_page:
-	multikernel_free(mk_pool->arch.park_phys, PAGE_SIZE);
+	mk_pool_ctrl_free(mk_pool->arch.park_phys, PAGE_SIZE);
 	mk_pool->arch.park_va = NULL;
 	mk_pool->arch.park_phys = 0;
 err_pgt:
@@ -1480,6 +1495,17 @@ err_pgt:
 	mk_pool->arch.pgt = NULL;
 	mk_pool->arch.cr3 = 0;
 	return rc;
+}
+
+int mk_arch_pool_map(phys_addr_t start, size_t size)
+{
+	init_memory_mapping(start, start + size, PAGE_KERNEL);
+	return 0;
+}
+
+void mk_arch_pool_unmap(phys_addr_t start, size_t size)
+{
+	kernel_physical_mapping_remove(start, start + size);
 }
 
 int mk_arch_pool_chunk_added(phys_addr_t start, size_t size)
@@ -1651,14 +1677,14 @@ int mk_pool_park_teardown(void)
 	if (!mk_pool_cpus_returned())
 		return -EBUSY;
 
-	multikernel_free(mk_pool->arch.slot_phys,
-			 ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
+	mk_pool_ctrl_free(mk_pool->arch.slot_phys,
+			  ALIGN(sizeof(struct mk_spawn_context), PAGE_SIZE));
 	mk_pool->arch.slot = NULL;
 	mk_pool->arch.slot_phys = 0;
 
 	/* Hand the page back as ordinary pool memory, not as code */
 	WARN_ON_ONCE(set_memory_nx((unsigned long)mk_pool->arch.park_va, 1));
-	multikernel_free(mk_pool->arch.park_phys, PAGE_SIZE);
+	mk_pool_ctrl_free(mk_pool->arch.park_phys, PAGE_SIZE);
 	mk_pool->arch.park_va = NULL;
 	mk_pool->arch.park_phys = 0;
 
@@ -1763,7 +1789,7 @@ void mk_free_identity_pgtable(struct mk_ident_pgtable *pgt)
 			continue;
 		/* Instance page tables live in the control block */
 		if (!pgt->instance)
-			multikernel_free(virt_to_phys(pgt->pages[i]), PAGE_SIZE);
+			mk_pool_ctrl_free(virt_to_phys(pgt->pages[i]), PAGE_SIZE);
 	}
 
 	kfree(pgt);
