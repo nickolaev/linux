@@ -383,9 +383,68 @@ static int mk_online_memory_block_movable(struct memory_block *mem, void *arg)
 	return device_online(&mem->dev);
 }
 
-static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_type)
+/*
+ * Whole memory blocks are added with their memmap on the memory itself,
+ * so that a small kernel can take on far more memory than its own RAM
+ * has room to describe; the parts of blocks at either end of a range are
+ * added in subsections.
+ */
+struct mk_mem_piece {
+	u64 start;
+	u64 size;
+	bool blocks;
+};
+
+static int mk_mem_pieces(u64 start, u64 size, struct mk_mem_piece *piece)
+{
+	const u64 block = memory_block_size_bytes();
+	const u64 end = start + size;
+	const u64 mid_start = min(ALIGN(start, block), end);
+	const u64 mid_end = max(ALIGN_DOWN(end, block), mid_start);
+	int n = 0;
+
+	if (mid_start > start)
+		piece[n++] = (struct mk_mem_piece){ start, mid_start - start, false };
+	if (mid_end > mid_start)
+		piece[n++] = (struct mk_mem_piece){ mid_start, mid_end - mid_start, true };
+	if (end > mid_end)
+		piece[n++] = (struct mk_mem_piece){ mid_end, end - mid_end, false };
+	return n;
+}
+
+static int mk_mem_piece_add(int nid, const struct mk_mem_piece *piece)
 {
 	int ret;
+
+	if (!piece->blocks)
+		return add_and_online_subsections(nid, piece->start, piece->size,
+						  MMOP_ONLINE_MOVABLE,
+						  mk_mem_resource_name);
+
+	ret = add_memory_driver_managed(nid, piece->start, piece->size,
+					mk_mem_resource_name,
+					MHP_MEMMAP_ON_MEMORY);
+	if (ret < 0)
+		return ret;
+
+	ret = walk_memory_blocks(piece->start, piece->size, NULL,
+				 mk_online_memory_block_movable);
+	if (ret < 0)
+		offline_and_remove_memory(piece->start, piece->size);
+	return ret;
+}
+
+static int mk_mem_piece_remove(const struct mk_mem_piece *piece)
+{
+	if (piece->blocks)
+		return offline_and_remove_memory(piece->start, piece->size);
+	return offline_and_remove_subsections(piece->start, piece->size);
+}
+
+static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_type)
+{
+	struct mk_mem_piece piece[3];
+	int ret, i, n;
 	int nid;
 	u64 phys_addr;
 	u64 size;
@@ -411,15 +470,9 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 		phys_addr, phys_addr + size - 1, size >> 20,
 		(int)numa_node, mem_type);
 
-	if (!IS_ALIGNED(phys_addr, memory_block_size_bytes())) {
-		pr_err("Multikernel hotplug: Memory address 0x%llx not aligned to block size 0x%lx\n",
-		       phys_addr, memory_block_size_bytes());
-		return -EINVAL;
-	}
-
-	if (!IS_ALIGNED(size, memory_block_size_bytes())) {
-		pr_err("Multikernel hotplug: Memory size 0x%llx not aligned to block size 0x%lx\n",
-		       size, memory_block_size_bytes());
+	if (!IS_ALIGNED(phys_addr | size, MHP_SUBSECTIONS_ALIGN)) {
+		pr_err("Multikernel hotplug: Memory 0x%llx+0x%llx not aligned to 0x%lx\n",
+		       phys_addr, size, MHP_SUBSECTIONS_ALIGN);
 		return -EINVAL;
 	}
 
@@ -433,22 +486,16 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 		}
 	}
 
-	ret = add_memory_driver_managed(nid, phys_addr, size,
-					mk_mem_resource_name,
-					MHP_MEMMAP_ON_MEMORY);
-	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to add memory at 0x%llx: %d\n",
-		       phys_addr, ret);
-		return ret;
-	}
-
-	ret = walk_memory_blocks(phys_addr, size, NULL,
-				 mk_online_memory_block_movable);
-	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to online memory at 0x%llx: %d\n",
-		       phys_addr, ret);
-		offline_and_remove_memory(phys_addr, size);
-		return ret;
+	n = mk_mem_pieces(phys_addr, size, piece);
+	for (i = 0; i < n; i++) {
+		ret = mk_mem_piece_add(nid, &piece[i]);
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: Failed to add memory at 0x%llx: %d\n",
+			       piece[i].start, ret);
+			while (i--)
+				mk_mem_piece_remove(&piece[i]);
+			return ret;
+		}
 	}
 
 	/* Track the operation for potential rollback */
@@ -472,7 +519,9 @@ static int mk_do_mem_add(u64 start_pfn, u64 nr_pages, u32 numa_node, u32 mem_typ
 
 static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 {
-	int ret;
+	struct mk_mem_piece piece[3];
+	struct page *page;
+	int ret, i, n, nid;
 	u64 phys_addr;
 	u64 size;
 	struct mk_hotplug_op *op;
@@ -483,23 +532,27 @@ static int mk_do_mem_remove(u64 start_pfn, u64 nr_pages)
 	pr_info("Multikernel hotplug: Removing memory 0x%llx-0x%llx (%llu MB)\n",
 		phys_addr, phys_addr + size - 1, size >> 20);
 
-	if (!IS_ALIGNED(phys_addr, memory_block_size_bytes())) {
-		pr_err("Multikernel hotplug: Memory address 0x%llx not aligned to block size 0x%lx\n",
-		       phys_addr, memory_block_size_bytes());
+	if (!IS_ALIGNED(phys_addr | size, MHP_SUBSECTIONS_ALIGN)) {
+		pr_err("Multikernel hotplug: Memory 0x%llx+0x%llx not aligned to 0x%lx\n",
+		       phys_addr, size, MHP_SUBSECTIONS_ALIGN);
 		return -EINVAL;
 	}
 
-	if (!IS_ALIGNED(size, memory_block_size_bytes())) {
-		pr_err("Multikernel hotplug: Memory size 0x%llx not aligned to block size 0x%lx\n",
-		       size, memory_block_size_bytes());
+	page = pfn_to_online_page(start_pfn);
+	if (!page)
 		return -EINVAL;
-	}
+	nid = page_to_nid(page);
 
-	ret = offline_and_remove_memory(phys_addr, size);
-	if (ret < 0) {
-		pr_err("Multikernel hotplug: Failed to remove memory at 0x%llx: %d\n",
-		       phys_addr, ret);
-		return ret;
+	n = mk_mem_pieces(phys_addr, size, piece);
+	for (i = 0; i < n; i++) {
+		ret = mk_mem_piece_remove(&piece[i]);
+		if (ret < 0) {
+			pr_err("Multikernel hotplug: Failed to remove memory at 0x%llx: %d\n",
+			       piece[i].start, ret);
+			while (i--)
+				mk_mem_piece_add(nid, &piece[i]);
+			return ret;
+		}
 	}
 
 	/* Track the operation for potential rollback */
