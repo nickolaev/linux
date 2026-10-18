@@ -958,8 +958,8 @@ int mk_instance_transfer_cpus(struct mk_instance *instance,
 			       const struct mk_cpu_set *cpus);
 int mk_instance_return_cpus(struct mk_instance *instance,
 			     const struct mk_cpu_set *cpus);
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
-				  int node);
+int mk_instance_add_memory_region(struct mk_instance *instance,
+				  phys_addr_t phys_addr, size_t size);
 int mk_instance_remove_memory_region(struct mk_instance *instance,
 				     phys_addr_t phys_addr, size_t size);
 int mk_instance_begin_memory_removal(struct mk_instance *instance,

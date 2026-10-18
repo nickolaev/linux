@@ -65,6 +65,52 @@ phys_addr_t multikernel_alloc(size_t size, int node)
 	return (phys_addr_t)addr;
 }
 
+/* gen_pool_fixed_alloc() applies its offset to every chunk it tries */
+static unsigned long mk_pool_algo_at(unsigned long *map, unsigned long size,
+				     unsigned long start, unsigned int nr,
+				     void *data, struct gen_pool *pool,
+				     unsigned long start_addr)
+{
+	unsigned long addr = *(unsigned long *)data;
+	unsigned long bit;
+
+	if (addr < start_addr)
+		return size;
+	bit = (addr - start_addr) >> pool->min_alloc_order;
+	if (bit >= size || bitmap_find_next_zero_area(map, size, bit, nr, 0) != bit)
+		return size;
+	return bit;
+}
+
+/**
+ * multikernel_alloc_at() - Allocate a given range from the multikernel pool
+ * @addr: physical address of the range, page aligned
+ * @size: size of the range, page aligned
+ *
+ * Returns the NUMA node the range is on, or a negative error code: -EBUSY
+ * if any of the range is not free pool memory.
+ */
+static int multikernel_alloc_at(phys_addr_t addr, size_t size)
+{
+	unsigned long start = addr;
+	int nid;
+
+	if (!mk_pool)
+		return -ENODEV;
+	if (!size || !PAGE_ALIGNED(addr) || !PAGE_ALIGNED(size))
+		return -EINVAL;
+
+	guard(mutex)(&mk_pool->mem_lock);
+	for_each_online_node(nid) {
+		struct gen_pool *pool = mk_pool->node_pools[nid];
+
+		if (pool && gen_pool_alloc_algo(pool, size, mk_pool_algo_at,
+						&start) == start)
+			return nid;
+	}
+	return -EBUSY;
+}
+
 /**
  * multikernel_free() - Free memory back to the multikernel pool
  * @addr: physical address to free
@@ -486,29 +532,30 @@ static struct mk_memory_region *mk_instance_find_region(struct mk_instance *inst
 /**
  * mk_instance_add_memory_region() - Add a memory region to an instance
  * @instance: Target instance
- * @size: Size of the memory region to allocate
- * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
+ * @phys_addr: Physical address of the region, page aligned
+ * @size: Size of the region, page aligned
  *
- * Allocates memory from the main multikernel pool and adds it to the
- * instance's memory_regions list. Used for non-running instances where
- * we only need to track memory allocation without performing memory
- * hotplug operations.
+ * Takes the region out of the main multikernel pool and adds it to the
+ * instance's memory_regions list. The region is the one the instance's
+ * kernel is told to add, so no other instance can be given it.
  *
- * Returns: 0 on success, negative error code on failure
+ * Returns: 0 on success, -EBUSY if the region is not free pool memory, or
+ * another negative error code
  */
-int mk_instance_add_memory_region(struct mk_instance *instance, size_t size,
-				  int node)
+int mk_instance_add_memory_region(struct mk_instance *instance,
+				  phys_addr_t phys_addr, size_t size)
 {
 	struct mk_memory_region *region;
 	struct resource *parent;
-	phys_addr_t phys_addr;
-	int ret;
+	int node, ret;
 
-	phys_addr = multikernel_alloc(size, node);
-	if (!phys_addr) {
-		pr_err("Failed to allocate %zu bytes from multikernel pool for instance %d\n",
-		       size, instance->id);
-		return -ENOMEM;
+	node = multikernel_alloc_at(phys_addr, size);
+	if (node < 0) {
+		pr_err("Failed to take 0x%llx-0x%llx from multikernel pool for instance %d: %d\n",
+		       (unsigned long long)phys_addr,
+		       (unsigned long long)(phys_addr + size - 1),
+		       instance->id, node);
+		return node;
 	}
 
 	region = kzalloc(sizeof(*region), GFP_KERNEL);

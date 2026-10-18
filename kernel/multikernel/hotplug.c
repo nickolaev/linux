@@ -1478,8 +1478,9 @@ out:
  *
  * For local instance, executes addition synchronously.
  * For remote instance, sends IPI and waits for ACK response.
- * For instances that are not yet running (MK_STATE_READY/LOADED), adds
- * the memory region to instance's memory_regions list.
+ * The range is taken from the pool for the instance first, so that it
+ * must be free pool memory and no other instance can be given it; for
+ * instances that are not yet running (MK_STATE_READY/LOADED), that is all.
  *
  * Returns: 0 on success, negative error code on failure
  */
@@ -1505,35 +1506,32 @@ int mk_send_mem_add(int instance_id, u64 start_pfn, u64 nr_pages,
 	if (!target_instance)
 		return -ENODEV;
 
-	/* For non-running instances, allocate memory from pool and add to instance */
-	if (target_instance->state != MK_STATE_ACTIVE) {
-		size_t size;
-
-		size = PFN_PHYS(nr_pages);
-		ret = mk_instance_add_memory_region(target_instance, size,
-						    (int)numa_node);
+	/* Before the running kernel takes the memory on, not after */
+	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(start_pfn),
+					    PFN_PHYS(nr_pages));
+	if (ret || target_instance->state != MK_STATE_ACTIVE)
 		goto out;
-	}
 
 	pending = mk_msg_pending_add(MK_MSG_RESOURCE, MK_RES_MEM_ADD, start_pfn);
 	if (!pending) {
 		ret = -ENOMEM;
-		goto out;
+		goto remove;
 	}
 
 	ret = mk_send_message(instance_id, MK_MSG_RESOURCE, MK_RES_MEM_ADD,
 			      &payload, sizeof(payload));
 	if (ret < 0) {
 		mk_msg_pending_wait(pending, 0);  /* Immediate cleanup */
-		goto out;
+		goto remove;
 	}
 
 	ret = mk_msg_pending_wait(pending, 10000);
-	if (ret < 0)
+	/* Without an answer the kernel may still add it, so it stays its own */
+	if (!ret || ret == -ETIMEDOUT)
 		goto out;
-
-	ret = mk_instance_add_memory_region(target_instance, PFN_PHYS(nr_pages),
-					    (int)numa_node);
+remove:
+	mk_instance_remove_memory_region(target_instance, PFN_PHYS(start_pfn),
+					 PFN_PHYS(nr_pages));
 out:
 	mk_instance_put(target_instance);
 	return ret;
