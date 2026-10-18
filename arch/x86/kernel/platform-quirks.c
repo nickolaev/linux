@@ -151,6 +151,7 @@ void __init x86_early_init_platform_quirks(void)
 	x86_platform.legacy.rtc = 1;
 	x86_platform.legacy.warm_reset = 1;
 	x86_platform.legacy.reserve_bios_regions = 0;
+	x86_platform.legacy.reserve_ram_buffers = 1;
 	x86_platform.legacy.map_isa_ram = 0;
 	x86_platform.legacy.devices.pnpbios = 1;
 
@@ -176,6 +177,12 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.rtc = 0;
 		x86_platform.legacy.warm_reset = 0;
 		x86_platform.legacy.no_bsp_restriction = 1;
+		/*
+		 * The host builds the map from the memory it granted, and
+		 * what lies past each region is RAM that may be moved into
+		 * this kernel later.
+		 */
+		x86_platform.legacy.reserve_ram_buffers = 0;
 		/*
 		 * Set smp_found_config early to prevent acpi_mps_check() from
 		 * disabling the APIC when ACPI is disabled but MPPARSE is not
