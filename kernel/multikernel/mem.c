@@ -9,7 +9,6 @@
 #include <linux/ioport.h>
 #include <linux/kexec.h>
 #include <linux/list.h>
-#include <linux/memory.h>
 #include <linux/memory_hotplug.h>
 #include <linux/mm.h>
 #include <linux/mmzone.h>
@@ -669,60 +668,36 @@ int mk_instance_remove_memory_region(struct mk_instance *instance,
  * (higher addresses are less likely to hold pinned kernel allocations),
  * ZONE_MOVABLE before ZONE_NORMAL.
  */
-struct mk_take_check {
-	struct zone *zone;
-	unsigned long blocks;
-};
-
-/* Removing a range with a missing or foreign block would tear down memory it does not own */
-static int mk_block_takeable(struct memory_block *mem, void *arg)
-{
-	struct mk_take_check *check = arg;
-
-	if (mem->state != MEM_ONLINE || mem->zone != check->zone)
-		return -EBUSY;
-	check->blocks++;
-	return 0;
-}
-
-static bool mk_range_takeable(struct zone *zone, phys_addr_t start, u64 size)
-{
-	struct mk_take_check check = { .zone = zone };
-
-	return !walk_memory_blocks(start, size, &check, mk_block_takeable) &&
-	       check.blocks == size / memory_block_size_bytes();
-}
-
 static int mk_take_from_zone(struct zone *zone, u64 size, phys_addr_t *start)
 {
-	unsigned long block_pages = PHYS_PFN(memory_block_size_bytes());
+	const unsigned long step = PHYS_PFN(MHP_SUBSECTIONS_ALIGN);
 	unsigned long nr_pages = PHYS_PFN(size);
-	unsigned long first = ALIGN(zone->zone_start_pfn, block_pages);
+	unsigned long first = ALIGN(zone->zone_start_pfn, step);
 	unsigned long candidate;
 
 	if (!populated_zone(zone) || zone_end_pfn(zone) < first + nr_pages)
 		return -ENOMEM;
 
-	candidate = ALIGN_DOWN(zone_end_pfn(zone) - nr_pages, block_pages);
+	candidate = ALIGN_DOWN(zone_end_pfn(zone) - nr_pages, step);
 	for (;;) {
-		if (mk_range_takeable(zone, PFN_PHYS(candidate), size) &&
-		    !offline_and_remove_memory(PFN_PHYS(candidate), size)) {
+		if (!offline_and_remove_subsections(PFN_PHYS(candidate), size)) {
 			*start = PFN_PHYS(candidate);
 			return 0;
 		}
-		if (candidate < first + block_pages)
+		if (candidate < first + step)
 			return -ENOMEM;
-		candidate -= block_pages;
+		candidate -= step;
+		cond_resched();
 	}
 }
 
 /**
  * mk_take_memory() - Hot-remove a contiguous range for the pool
- * @size: bytes, a multiple of the memory block size
+ * @size: bytes, a multiple of MHP_SUBSECTIONS_ALIGN
  * @node: NUMA node to take from, or NUMA_NO_NODE for any node
  * @start: physical base of the range taken
  * @nid: node the range was taken from
- * @movable: whether it was ZONE_MOVABLE, for mk_return_memory()
+ * @movable: whether it was ZONE_MOVABLE, to give it back there
  *
  * Returns 0 on success, -ENOMEM when no range of @size could be removed.
  */
@@ -746,35 +721,6 @@ static int mk_take_memory(u64 size, int node, phys_addr_t *start, int *nid,
 		}
 	}
 	return -ENOMEM;
-}
-
-static int mk_online_block(struct memory_block *mem, void *arg)
-{
-	mem->online_type = *(int *)arg;
-	return device_online(&mem->dev);
-}
-
-/**
- * mk_return_memory() - Hand a range taken by mk_take_memory() back
- * @start: physical base of the range
- * @size: bytes
- * @nid: node it was taken from
- * @movable: whether it was ZONE_MOVABLE
- *
- * Re-adds the range as System RAM and onlines it into the zone it
- * left, so the kernel ends up as it was before the pool took it.
- */
-static int mk_return_memory(phys_addr_t start, u64 size, int nid, bool movable)
-{
-	int online_type = movable ? MMOP_ONLINE_MOVABLE : MMOP_ONLINE_KERNEL;
-	int ret;
-
-	lock_device_hotplug();
-	ret = __add_memory(nid, start, size, MHP_NONE);
-	if (!ret)
-		ret = walk_memory_blocks(start, size, &online_type, mk_online_block);
-	unlock_device_hotplug();
-	return ret;
 }
 
 static DEFINE_MUTEX(mk_pool_map_lock);
@@ -811,8 +757,10 @@ void mk_pool_unmap(phys_addr_t start, size_t size)
 
 static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)
 {
-	int ret = mk_return_memory(chunk->res.start, resource_size(&chunk->res),
-				   chunk->node, chunk->movable);
+	int online_type = chunk->movable ? MMOP_ONLINE_MOVABLE : MMOP_ONLINE_KERNEL;
+	int ret = add_and_online_subsections(chunk->node, chunk->res.start,
+					     resource_size(&chunk->res),
+					     online_type, "System RAM");
 
 	if (ret)
 		pr_err("Multikernel pool: %pa-%pa could not be given back to the kernel: %d\n",
@@ -822,7 +770,7 @@ static void mk_pool_chunk_return(struct mk_pool_chunk *chunk)
 
 /**
  * mk_pool_mem_grow() - Take a contiguous chunk out of this kernel for the pool
- * @size: chunk size in bytes, page aligned; rounded up to whole memory blocks
+ * @size: chunk size in bytes, page aligned; rounded up to MHP_SUBSECTIONS_ALIGN
  * @node: NUMA node to allocate from, or NUMA_NO_NODE for any node
  * @out_base: optional output for the physical base of the new chunk
  *
@@ -852,7 +800,7 @@ int mk_pool_mem_grow(size_t size, int node, phys_addr_t *out_base)
 	if (!chunk)
 		return -ENOMEM;
 
-	size = ALIGN(size, memory_block_size_bytes());
+	size = ALIGN(size, MHP_SUBSECTIONS_ALIGN);
 	ret = mk_take_memory(size, node, &start, &chunk->node, &chunk->movable);
 	if (ret) {
 		kfree(chunk);
