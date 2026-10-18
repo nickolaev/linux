@@ -80,6 +80,7 @@ back the pool::
         #address-cells = <2>;
         #size-cells = <2>;
         id = <0>;
+        memory-granule = <0x0 0x400000>;
         resources {
             cpus = <0x0 0x1  0x0 0x2  0x0 0x3>;     /* every pool member */
             cpus-available = <0x0 0x2  0x0 0x3>;    /* the free subset */
@@ -100,6 +101,14 @@ back the pool::
 ``cpus-available`` lists the free ones. There is one ``memory@<base>`` node
 per pool chunk in the standard memory node form. Free pool PCI devices
 appear under their host bridge.
+
+``memory-granule`` is the unit memory moves into or out of the kernel
+reading the tree in: the base and size of a pool chunk, or of memory added
+to or removed from the kernel at run time, are multiples of it. Every
+kernel's own ``/sys/fs/multikernel/device_tree`` carries it, a spawn
+kernel's included, and an instance tree does not, as it describes another
+kernel. It covers whole MAX_PAGE_ORDER blocks, 4M on x86, as the buddy
+allocator merges free pages across them.
 
 The Instance Tree
 =================

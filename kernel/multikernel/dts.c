@@ -20,6 +20,7 @@
 #include <linux/sizes.h>
 #include <linux/pci.h>
 #include <linux/cpumask.h>
+#include <linux/memory_hotplug.h>
 #if defined(CONFIG_X86) && defined(CONFIG_PCI_MMCONFIG)
 #include <asm/pci_x86.h>
 #endif
@@ -1536,6 +1537,10 @@ static int mk_dt_emit_tree(struct mk_instance *instance, void *fdt,
 		ret = fdt_property_u32(fdt, "#size-cells", 2);
 	if (!ret)
 		ret = fdt_property_u32(fdt, "id", instance->id);
+	/* The unit memory moves into or out of this kernel in */
+	if (!ret && instance == mk_self)
+		ret = fdt_property_u64(fdt, "memory-granule",
+				       MHP_SUBSECTIONS_ALIGN);
 	if (!ret)
 		ret = fdt_begin_node(fdt, "resources");
 	if (ret)
