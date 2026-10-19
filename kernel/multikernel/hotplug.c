@@ -767,21 +767,18 @@ static int mk_do_device_add(u16 domain, u8 bus, u8 devfn,
 			}
 		}
 
-		/* device_attach() takes the device lock itself */
-		ret = device_attach(&pdev->dev);
-		if (ret < 0) {
-			pr_err("Multikernel hotplug: Failed to bind device %04x:%02x:%02x.%x: %d\n",
-			       domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
-			pci_dev_put(pdev);
-			return ret;
-		}
+		/*
+		 * Bind as the bus would, so that user space holding drivers
+		 * off with drivers_autoprobe can prepare the device first.
+		 */
+		device_initial_probe(&pdev->dev);
 
-		if (ret == 0)
-			pr_info("Multikernel hotplug: No driver matches device %04x:%02x:%02x.%x\n",
-				domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
-		else
+		if (pdev->dev.driver)
 			pr_info("Multikernel hotplug: Bound device to %s\n",
-				pdev->dev.driver ? pdev->dev.driver->name : "its driver");
+				pdev->dev.driver->name);
+		else
+			pr_info("Multikernel hotplug: No driver bound to device %04x:%02x:%02x.%x\n",
+				domain, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
 	}
 
 	pci_dev_put(pdev);
