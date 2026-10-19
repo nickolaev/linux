@@ -24,6 +24,12 @@
  * the header outside the Command register and a few scratch fields is
  * read only, and SR-IOV is not offered.
  *
+ * A function taken back from an instance, however the instance stopped,
+ * is reset, after xen-pciback too, or has its bus mastering cleared when
+ * it has no reset: whatever the instance left it doing, its DMA into
+ * memory the pool hands out again included, stops here, and the next
+ * kernel to be given it meets it clean.
+ *
  * Requests are answered from the doorbell interrupt, which is what lets
  * an instance wait for the answer with interrupts off. A kernel that is
  * itself an instance reaches config space over the ring too, which it
@@ -431,8 +437,11 @@ static void mk_pciback_free(struct list_head *gone)
 {
 	struct mk_pciback_dev *d, *tmp;
 
-	list_for_each_entry_safe(d, tmp, gone, list)
+	list_for_each_entry_safe(d, tmp, gone, list) {
+		if (pci_reset_function(d->pdev))
+			pci_clear_master(d->pdev);
 		mk_pciback_put(d);
+	}
 }
 
 /**
