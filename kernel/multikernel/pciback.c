@@ -13,9 +13,10 @@
  * config mechanism such as the 0xCF8 port pair.
  *
  * Only config space goes this way. BARs, DMA and MSIs stay direct, so
- * none of this is on the data path of a running device, provided its
- * interrupts are masked in its MSI-X table rather than in config space,
- * which is why a function without MSI-X is not lent.
+ * none of this is on the data path of a running device. The mask bits
+ * of a plain MSI are in config space, but MSI is oneshot safe, so they
+ * are only touched to start and stop an interrupt, to hold off one that
+ * fires again while it is handled, and while it is disabled.
  *
  * Writes are filtered, after xen-pciback: the instance owns what the
  * function does, while the lending kernel keeps what places it on the
@@ -31,7 +32,6 @@
 
 #define pr_fmt(fmt) "mk_pciback: " fmt
 
-#include <linux/moduleparam.h>
 #include <linux/multikernel.h>
 #include <linux/pci.h>
 #include <linux/pm_runtime.h>
@@ -39,14 +39,6 @@
 #include <linux/workqueue.h>
 
 #include "internal.h"
-
-#undef MODULE_PARAM_PREFIX
-#define MODULE_PARAM_PREFIX "multikernel."
-
-static bool mk_pciback_allow_plain_msi;
-module_param_named(pci_allow_plain_msi, mk_pciback_allow_plain_msi, bool, 0644);
-MODULE_PARM_DESC(pci_allow_plain_msi,
-		 "Lend PCI functions without MSI-X, whose interrupt masking then goes over the ring");
 
 /* Bits of the Command register an instance may change */
 #define MK_PCIBACK_CMD	(PCI_COMMAND_IO | PCI_COMMAND_MEMORY |		\
@@ -414,16 +406,6 @@ int mk_pciback_lend_one(struct mk_instance *instance, u16 domain, u8 bus,
 			PCI_FUNC(devfn));
 		return -ENODEV;
 	}
-
-	if (!pdev->msix_cap && !mk_pciback_allow_plain_msi) {
-		pr_err("Instance %d: %s has no MSI-X, so masking its interrupts would go over the ring (multikernel.pci_allow_plain_msi=1 allows it)\n",
-		       instance->id, pci_name(pdev));
-		pci_dev_put(pdev);
-		return -EOPNOTSUPP;
-	}
-	if (!pdev->msix_cap)
-		pr_warn("Instance %d: %s has no MSI-X, its interrupt masking goes over the ring\n",
-			instance->id, pci_name(pdev));
 
 	d = kzalloc(sizeof(*d), GFP_KERNEL);
 	if (!d) {

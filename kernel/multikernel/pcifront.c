@@ -16,8 +16,8 @@
  * The PCI core calls config accessors under its raw lock with interrupts
  * off, so the wait for an answer polls the ring. Config space is only
  * touched to probe, reset, power manage and recover a device, and a
- * running device costs no requests at all: its BARs, its DMA and its
- * MSI-X vectors are direct.
+ * running device costs next to none: its BARs, its DMA and its MSIs
+ * are direct, and only the rare masking of a plain MSI asks.
  *
  * A spawn outlives a host that crashes. Its devices keep running, but a
  * dead host answers nothing: a request that times out fails like an
