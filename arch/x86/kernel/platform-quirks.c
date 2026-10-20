@@ -136,6 +136,17 @@ static void __init multikernel_parse_smp_config(void)
 	 */
 	apic_update_callback(wakeup_secondary_cpu_64, multikernel_wakeup_cpu);
 }
+
+/*
+ * The BIOS areas an MP table would be found in are the host's, and so are
+ * the ACPI tables. ACPI is disabled again here, the last platform hook
+ * before the ACPI tables are looked up, because acpi=force on the command
+ * line has undone the quirk by now.
+ */
+static void __init multikernel_find_mptable(void)
+{
+	disable_acpi();
+}
 #else
 static inline void multikernel_setup_calibration(void)
 {
@@ -200,6 +211,7 @@ void __init x86_early_init_platform_quirks(void)
 		 */
 		x86_init.paging.pagetable_init = multikernel_pagetable_init;
 #endif
+		x86_init.mpparse.find_mptable = multikernel_find_mptable;
 		x86_init.mpparse.parse_smp_cfg = multikernel_parse_smp_config;
 #ifdef CONFIG_PCI
 		x86_init.pci.init = pci_multikernel_init;
