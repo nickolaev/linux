@@ -352,8 +352,14 @@ setup_boot_parameters(struct kimage *image, struct boot_params *params,
 	params->screen_info.ext_mem_k = 0;
 	params->alt_mem_k = 0;
 
-	/* Always fill in RSDP: it is either 0 or a valid value */
-	params->acpi_rsdp_addr = boot_params.acpi_rsdp_addr;
+	/*
+	 * A spawn kernel runs without ACPI: the host's tables describe the
+	 * whole machine, not the instance.
+	 */
+	if (image->type == KEXEC_TYPE_MULTIKERNEL)
+		params->acpi_rsdp_addr = 0;
+	else
+		params->acpi_rsdp_addr = boot_params.acpi_rsdp_addr;
 
 	/* Default APM info */
 	memset(&params->apm_bios_info, 0, sizeof(params->apm_bios_info));
