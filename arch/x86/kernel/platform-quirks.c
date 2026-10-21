@@ -188,6 +188,7 @@ void __init x86_early_init_platform_quirks(void)
 		x86_platform.legacy.rtc = 0;
 		x86_platform.legacy.warm_reset = 0;
 		x86_platform.legacy.no_bsp_restriction = 1;
+		x86_platform.legacy.shared_apic_bus = 1;
 		/*
 		 * The host builds the map from the memory it granted, and
 		 * what lies past each region is RAM that may be moved into

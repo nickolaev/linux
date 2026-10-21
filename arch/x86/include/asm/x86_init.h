@@ -263,6 +263,8 @@ enum x86_legacy_i8042_state {
  * @no_bsp_restriction: if true, skip BSP/crash kernel detection during CPU
  *	topology setup. Used by multikernel spawns that intentionally boot
  *	on non-BSP CPUs and manage CPU resources separately.
+ * @shared_apic_bus: if true, APICs on the bus belong to other kernels too,
+ *	so IPI shorthands, which reach every APIC, must not be used.
  * @devices: legacy x86 devices, refer to struct x86_legacy_devices
  * 	documentation for further details.
  */
@@ -275,6 +277,7 @@ struct x86_legacy_features {
 	int reserve_ram_buffers;
 	int map_isa_ram;
 	int no_bsp_restriction;
+	int shared_apic_bus;
 	struct x86_legacy_devices devices;
 };
 
